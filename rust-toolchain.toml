@@ -1,0 +1,6 @@
+# Exact version pin (audit C4): NOT floating "stable".
+# The toolchain hash feeds engine_fingerprint, so byte-reproducibility requires
+# an exact channel. Bump deliberately (records in an ADR) when the engine moves.
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
