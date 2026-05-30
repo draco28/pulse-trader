@@ -1,0 +1,40 @@
+[package]
+name = "pulse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92.0"
+description = "PulseTrader core engine — domain types, ports, and adapters"
+license = "proprietary"
+publish = false
+
+# bin/lib split (audit C1): main.rs and lib.rs compile as SEPARATE crates.
+# The binary sees only the library's `pub` API (pub fn run), never pub(crate) internals.
+[lib]
+name = "pulse"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pulse"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+anyhow = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
+# unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

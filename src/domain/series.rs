@@ -1,0 +1,183 @@
+//! `CandleSeries` — an ordered run of candles for one (pair, timeframe, version),
+//! plus structural validation that reports gaps without rejecting them (audit C2).
+
+use serde::{Deserialize, Serialize};
+
+use crate::domain::candle::Candle;
+use crate::domain::error::{DataError, ValidationError};
+use crate::domain::pair::Pair;
+use crate::domain::timeframe::Timeframe;
+use crate::domain::version::DataVersion;
+
+/// A reported spacing discontinuity between two adjacent candles.
+///
+/// `validate` returns these through `Ok` — a gap is information, not corruption
+/// (audit C2). The pipeline (WI-02/05) decides whether a gap is acceptable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    /// `open_time` (epoch ms) the next candle was expected at, given the
+    /// preceding candle plus one timeframe duration.
+    pub expected: i64,
+    /// `open_time` (epoch ms) actually found at the discontinuity.
+    pub found: i64,
+}
+
+/// An immutable, ordered run of candles keyed by (pair, timeframe, version).
+///
+/// FR-5: the versioned snapshot shape. Construction does not validate; call
+/// [`CandleSeries::validate`] explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandleSeries {
+    /// The trading pair these candles belong to.
+    pub pair: Pair,
+    /// The candle interval.
+    pub timeframe: Timeframe,
+    /// The snapshot version tag.
+    pub version: DataVersion,
+    /// The candles, expected to be sorted ascending by `open_time`.
+    pub candles: Vec<Candle>,
+}
+
+impl CandleSeries {
+    /// Validate structural soundness and report spacing gaps (audit C2).
+    ///
+    /// Returns `Err(DataError::Validation(..))` only on *structural corruption*:
+    /// candles not strictly increasing by `open_time` (`Unsorted`) or a repeated
+    /// `open_time` (`Duplicate`). For a structurally-sound series it returns
+    /// `Ok(gaps)`: every adjacent pair whose spacing exceeds one timeframe
+    /// duration produces a [`Gap`]. A clean contiguous series yields `Ok(vec![])`;
+    /// a sorted-but-gapped series yields `Ok(non-empty)` — gaps are reported, not
+    /// rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`DataError::Validation`] with [`ValidationError::Unsorted`] if `open_time`
+    /// ever decreases, or [`ValidationError::Duplicate`] on a repeated `open_time`.
+    pub fn validate(&self) -> Result<Vec<Gap>, DataError> {
+        let step = self.timeframe.duration_ms();
+        let mut gaps = Vec::new();
+
+        for window in self.candles.windows(2) {
+            let prev = &window[0];
+            let next = &window[1];
+
+            if next.open_time == prev.open_time {
+                return Err(ValidationError::Duplicate(next.open_time).into());
+            }
+            if next.open_time < prev.open_time {
+                return Err(ValidationError::Unsorted {
+                    earlier: prev.open_time,
+                    later: next.open_time,
+                }
+                .into());
+            }
+
+            let expected = prev.open_time + step;
+            if next.open_time != expected {
+                gaps.push(Gap {
+                    expected,
+                    found: next.open_time,
+                });
+            }
+        }
+
+        Ok(gaps)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{CandleSeries, Gap};
+    use crate::domain::candle::Candle;
+    use crate::domain::error::{DataError, ValidationError};
+    use crate::domain::pair::Pair;
+    use crate::domain::timeframe::Timeframe;
+    use crate::domain::version::DataVersion;
+    use rust_decimal::Decimal;
+
+    fn candle_at(open_time: i64) -> Candle {
+        Candle {
+            open_time,
+            close_time: open_time + 899_999,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+            funding_rate: None,
+        }
+    }
+
+    fn series(open_times: &[i64]) -> CandleSeries {
+        CandleSeries {
+            pair: Pair::new("BTCUSDT"),
+            timeframe: Timeframe::M15,
+            version: DataVersion::new("v1"),
+            candles: open_times.iter().copied().map(candle_at).collect(),
+        }
+    }
+
+    #[test]
+    fn clean_contiguous_series_reports_no_gaps() {
+        let s = series(&[0, 900_000, 1_800_000, 2_700_000]);
+        let gaps = s.validate().expect("clean series validates");
+        assert!(gaps.is_empty(), "expected no gaps, got {gaps:?}");
+    }
+
+    #[test]
+    fn empty_and_single_series_are_clean() {
+        assert!(series(&[]).validate().expect("empty validates").is_empty());
+        assert!(
+            series(&[42])
+                .validate()
+                .expect("single validates")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sorted_but_gapped_series_reports_gaps_not_error() {
+        // Missing the 900_000 bar: jump from 0 to 1_800_000.
+        let s = series(&[0, 1_800_000, 2_700_000]);
+        let gaps = s.validate().expect("gapped series still validates Ok");
+        assert_eq!(
+            gaps,
+            vec![Gap {
+                expected: 900_000,
+                found: 1_800_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_open_time_is_structural_error() {
+        let s = series(&[0, 900_000, 900_000]);
+        let err = s.validate().expect_err("duplicate must reject");
+        assert_eq!(
+            err,
+            DataError::Validation(ValidationError::Duplicate(900_000))
+        );
+    }
+
+    #[test]
+    fn unsorted_open_time_is_structural_error() {
+        let s = series(&[0, 1_800_000, 900_000]);
+        let err = s.validate().expect_err("unsorted must reject");
+        assert_eq!(
+            err,
+            DataError::Validation(ValidationError::Unsorted {
+                earlier: 1_800_000,
+                later: 900_000,
+            })
+        );
+    }
+
+    #[test]
+    fn series_serde_round_trips() {
+        let s = series(&[0, 900_000]);
+        let json = serde_json::to_string(&s).expect("serialize series");
+        let back: CandleSeries = serde_json::from_str(&json).expect("deserialize series");
+        assert_eq!(s, back);
+    }
+}
