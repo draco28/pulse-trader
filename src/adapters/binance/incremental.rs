@@ -306,6 +306,12 @@ where
     C: Clock + Sync,
 {
     let mut candles = fetch_new_klines(source, clock, pair, tf, since_ms).await?;
+    // No newly-closed candles ⇒ a no-op: skip the funding fetch entirely so a
+    // transient funding-endpoint error cannot turn an up-to-date run into a
+    // failure (cross-confirmed by Codex + CodeRabbit). Nothing to stamp anyway.
+    if candles.is_empty() {
+        return Ok(candles);
+    }
     let funding = fetch_new_funding(source, pair, funding_since_ms).await?;
     // Stamp funding on the NEW candles only (WI-02 sparse half-open rule).
     stamp_funding(&mut candles, &funding);
