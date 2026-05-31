@@ -117,7 +117,22 @@ impl RetryPolicy {
     /// Run `op` under the retry policy, retrying retryable failures up to
     /// `max_attempts` total, sleeping with capped full-jitter backoff between
     /// attempts. The final failure maps to a [`DataError`] (AC-5).
-    async fn run<F, Fut>(&self, mut op: F) -> Result<Vec<u8>, DataError>
+    async fn run<F, Fut>(&self, op: F) -> Result<Vec<u8>, DataError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Vec<u8>, TransportError>>,
+    {
+        self.run_structured(op)
+            .await
+            .map_err(TransportError::into_data_error)
+    }
+
+    /// Like [`run`](Self::run) but surfaces the terminal [`TransportError`]
+    /// **structurally** instead of stringifying it into a [`DataError`]. Callers
+    /// that must branch on the HTTP status — e.g. [`BinanceClient::fetch_optional`]
+    /// recovering a `404` as absence — use this so the decision is made on the
+    /// status *code*, not on error-message text (audit C2).
+    async fn run_structured<F, Fut>(&self, mut op: F) -> Result<Vec<u8>, TransportError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<Vec<u8>, TransportError>>,
@@ -130,13 +145,28 @@ impl RetryPolicy {
                     failures += 1;
                     let exhausted = failures >= self.max_attempts;
                     if !err.is_retryable() || exhausted {
-                        return Err(err.into_data_error());
+                        return Err(err);
                     }
                     let ceiling = self.backoff_ceiling(failures);
                     self.sleep(ceiling).await;
                 }
             }
         }
+    }
+}
+
+/// Map a structured transport result to the [`BinanceClient::fetch_optional`]
+/// contract: a `404` **status** is a legitimate absence (`Ok(None)`) the bulk
+/// window disambiguates; any other terminal failure is a real error. Pure so the
+/// 404-vs-error discrimination is unit-tested offline and is decided on the HTTP
+/// status code rather than on a stringified error message.
+fn classify_optional(
+    result: Result<Vec<u8>, TransportError>,
+) -> Result<Option<Vec<u8>>, DataError> {
+    match result {
+        Ok(body) => Ok(Some(body)),
+        Err(TransportError::Status(404)) => Ok(None),
+        Err(other) => Err(other.into_data_error()),
     }
 }
 
@@ -226,23 +256,67 @@ impl BinanceClient {
     ///
     /// [`DataError::Io`] on a non-`404` terminal failure or after retries.
     pub(crate) async fn fetch_optional(&self, url: &str) -> Result<Option<Vec<u8>>, DataError> {
-        match self.policy.run(|| self.transport_get(url)).await {
-            Ok(body) => Ok(Some(body)),
-            // A 404 maps to Io("HTTP status 404") via TransportError; recover it
-            // as a recognizable absence for the window logic.
-            Err(DataError::Io(msg)) if msg.contains("404") => Ok(None),
-            Err(other) => Err(other),
-        }
+        // Decide 404-absence on the HTTP status *code* (via `run_structured`),
+        // NOT by substring-matching a stringified error: a non-404 transport
+        // failure whose message merely contains "404" must not be misread as
+        // absence and silently drop a month's data (CodeRabbit Major).
+        classify_optional(self.policy.run_structured(|| self.transport_get(url)).await)
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{RetryPolicy, TransportError};
+    use super::{RetryPolicy, TransportError, classify_optional};
     use crate::domain::DataError;
     use std::cell::Cell;
     use std::time::Duration;
+
+    // ---- fetch_optional 404 detection is status-typed, not string-matched --
+    //
+    // Regression (CodeRabbit Major): `fetch_optional` previously recovered a 404
+    // absence via `msg.contains("404")` on a stringified error, so a non-404
+    // failure whose message happened to contain "404" was misread as `Ok(None)`
+    // and silently dropped a month. Discrimination now keys on the status code.
+
+    #[test]
+    fn classify_optional_treats_a_404_status_as_absence() {
+        assert!(matches!(
+            classify_optional(Err(TransportError::Status(404))),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn classify_optional_returns_the_body_on_success() {
+        let got = classify_optional(Ok(b"data".to_vec())).expect("ok");
+        assert_eq!(got, Some(b"data".to_vec()));
+    }
+
+    #[test]
+    fn classify_optional_does_not_read_a_404ish_network_message_as_absence() {
+        // A network failure whose message merely contains "404" must surface as
+        // an error, NOT a false absence (the old substring match returned None).
+        let res = classify_optional(Err(TransportError::Network(
+            "connection reset talking to host x404y".into(),
+        )));
+        assert!(
+            matches!(res, Err(DataError::Io(_))),
+            "a non-404 network error must not be classified as absence, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn classify_optional_propagates_non_404_statuses_as_errors() {
+        assert!(matches!(
+            classify_optional(Err(TransportError::Status(500))),
+            Err(DataError::Io(_))
+        ));
+        assert!(matches!(
+            classify_optional(Err(TransportError::Status(403))),
+            Err(DataError::Io(_))
+        ));
+    }
 
     // ---- AC-5: retry classification + bounds ------------------------------
 
