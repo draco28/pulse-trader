@@ -112,6 +112,20 @@ impl CandleStore {
     /// Returns [`DataError`] on validation failure, a same-path-different-content
     /// collision, or any filesystem error.
     pub fn write_snapshot(&self, series: &CandleSeries) -> Result<(), DataError> {
+        // Defense-in-depth (audit C5/C7): the store is content-addressed — the
+        // output path is derived from `series.version`. Re-derive the content
+        // hash and reject a mismatch rather than silently writing under the
+        // caller's (possibly stale) version. Production always re-derives before
+        // calling, so this never fires in normal operation; it guards the latent
+        // invariant.
+        let expected = Self::content_version(&series.pair, series.timeframe, &series.candles);
+        if series.version != expected {
+            return Err(DataError::Parse(format!(
+                "content-version mismatch: series.version is {} but the candles hash to {} \
+                 (the store is content-addressed; re-derive content_version before writing)",
+                series.version, expected
+            )));
+        }
         let path = self.snapshot_path(&series.pair, series.timeframe, &series.version);
         let bytes = self.encode_snapshot(series)?;
 
@@ -219,7 +233,9 @@ impl CandleStore {
                 &format!("rename {} -> {}", tmp.display(), path.display()),
                 &e,
             )
-        })
+        })?;
+        // fsync the parent directory so the HEAD rename is durable (audit C8).
+        fsync_dir(dir)
     }
 
     /// Read the `HEAD` pointer for `(pair, tf)`, the authoritative current
@@ -315,7 +331,25 @@ fn publish_atomically(path: &Path, bytes: &[u8]) -> Result<(), DataError> {
             &e,
         )
     })?;
+    // fsync the parent directory so the rename itself is durable: the temp file's
+    // bytes are already fsynced (`write_temp`), but a power loss before the
+    // directory entry reaches stable storage could lose the rename (audit C8).
+    fsync_dir(dir)?;
     Ok(())
+}
+
+/// fsync a directory so a just-completed `rename` into it is durable.
+///
+/// On macOS, opening the directory and calling `sync_all` is the portable way to
+/// flush the directory entry to stable storage.
+///
+/// # Errors
+///
+/// Returns [`DataError::Io`] if the directory cannot be opened or synced.
+fn fsync_dir(dir: &Path) -> Result<(), DataError> {
+    let file = File::open(dir).map_err(|e| io(&format!("open dir {}", dir.display()), &e))?;
+    file.sync_all()
+        .map_err(|e| io(&format!("fsync dir {}", dir.display()), &e))
 }
 
 /// Write the temp file and fsync it to durable storage (no rename).
@@ -381,14 +415,98 @@ fn io(context: &str, err: &impl std::fmt::Display) -> DataError {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{CandleStore, HEAD_FILE};
-    use crate::domain::{DataVersion, Pair, Timeframe};
+    use super::{CandleStore, HEAD_FILE, fsync_dir};
+    use crate::domain::{DataError, DataVersion, Pair, Timeframe};
     use tempfile::TempDir;
 
     fn store() -> (CandleStore, TempDir) {
         let tmp = TempDir::new().expect("tempdir");
         let store = CandleStore::with_base_dir(tmp.path().to_path_buf());
         (store, tmp)
+    }
+
+    // ---- Durability (CodeRabbit Major): parent dir is fsynced after rename ---
+
+    #[test]
+    fn fsync_dir_oks_a_real_dir_and_errs_on_a_bogus_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        // A real, openable directory fsyncs cleanly.
+        fsync_dir(tmp.path()).expect("fsync of a real dir is Ok");
+        // A nonexistent path cannot be opened ⇒ a DataError (no panic).
+        let bogus = tmp.path().join("does-not-exist");
+        assert!(
+            matches!(fsync_dir(&bogus), Err(DataError::Io(_))),
+            "fsync of a bogus path must be Err(Io), never panic"
+        );
+    }
+
+    #[test]
+    fn head_survives_the_post_rename_durability_path() {
+        // Exercises write_head → fs::rename → fsync_dir(parent): the HEAD must be
+        // readable and round-trip after the durability barrier (no flake).
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        let v = DataVersion::new("cafef00ddeadbeef");
+        store
+            .write_head(&pair, Timeframe::M15, &v)
+            .expect("write HEAD through the fsync-dir path");
+        let read = store
+            .read_head(&pair, Timeframe::M15)
+            .expect("read HEAD ok")
+            .expect("some HEAD");
+        assert_eq!(read, v, "HEAD round-trips after the parent-dir fsync");
+    }
+
+    // ---- Fix 6: write_snapshot enforces the content-version invariant ------
+    //
+    // The store is content-addressed (audit C5/C7): the path is chosen from
+    // `series.version`. Production always re-derives `content_version` before
+    // writing, so a series whose `version` does not match its candles' content
+    // hash is corruption — `write_snapshot` must reject it (not silently write
+    // under the wrong path).
+
+    #[test]
+    fn write_snapshot_rejects_a_version_that_mismatches_the_content_hash() {
+        use crate::domain::{Candle, CandleSeries};
+        use rust_decimal::Decimal;
+
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        let candles = vec![Candle {
+            open_time: 0,
+            close_time: 899_999,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+            funding_rate: None,
+        }];
+
+        // A deliberately WRONG version (not the content hash of `candles`).
+        let bogus = DataVersion::new("deadbeefdeadbeef");
+        let correct = CandleStore::content_version(&pair, Timeframe::M15, &candles);
+        assert_ne!(bogus, correct, "fixture sanity: bogus != content hash");
+
+        let series = CandleSeries {
+            pair: pair.clone(),
+            timeframe: Timeframe::M15,
+            version: bogus.clone(),
+            candles,
+        };
+
+        let err = store
+            .write_snapshot(&series)
+            .expect_err("a content-version mismatch must be rejected");
+        assert!(
+            matches!(err, DataError::Parse(_)),
+            "version-mismatch rejection is a Parse error, got {err:?}"
+        );
+        // No file was written at the (bogus) path.
+        assert!(
+            !store.snapshot_exists(&pair, Timeframe::M15, &bogus),
+            "rejected write must not leave a snapshot on disk"
+        );
     }
 
     // ---- AC-5: HEAD round-trips and is read as the top-up base -------------

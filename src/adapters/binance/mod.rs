@@ -156,6 +156,31 @@ pub fn decode_month(klines_zip: &[u8], funding_zip: Option<&[u8]>) -> Result<Mon
     Ok(MonthData { candles, funding })
 }
 
+/// Resolve the funding events for a **present-klines** month from its fetched
+/// funding archive bytes. `Some(zip)` parses the funding CSV; `None` (a funding
+/// archive 404) is unexpected corruption for a listed USD-M perpetual month, so
+/// it is a retryable ingest error — NOT "no funding events". Pure so the
+/// funding-404 decision is offline-testable without the network.
+///
+/// # Errors
+///
+/// [`DataError::Io`] when the funding archive 404'd (`None`) for a present month;
+/// [`DataError::Parse`]/[`DataError::Io`] if the funding CSV cannot be unzipped
+/// or parsed.
+fn resolve_present_month_funding(
+    funding_zip: Option<&[u8]>,
+    year: i32,
+    month: u32,
+) -> Result<Vec<FundingEvent>, DataError> {
+    match funding_zip {
+        Some(bytes) => parse_funding(&unzip_single_csv(bytes)?),
+        None => Err(DataError::Io(format!(
+            "funding archive absent (404) for present klines month {year:04}-{month:02}: \
+             a listed USD-M perpetual month must have funding"
+        ))),
+    }
+}
+
 /// Verify an archive against its `.CHECKSUM` sidecar body (SHA256), exposed for
 /// fixture-level integrity tests (AC-7). Delegates to [`bulk::verify_checksum`].
 ///
@@ -324,12 +349,14 @@ impl MonthSource for BulkMonthSource {
             };
             let candles = parse_klines(&unzip_single_csv(&klines_zip)?)?;
 
-            // Funding may be independently absent for a present klines month;
-            // treat its 404 as "no funding events", not a month absence.
-            let funding = match self.fetch_verified(&funding_arc).await? {
-                Some(funding_zip) => parse_funding(&unzip_single_csv(&funding_zip)?)?,
-                None => Vec::new(),
-            };
+            // Klines are present, so this is a listed USD-M perpetual month — it
+            // MUST have a funding archive. A 404 here is unexpected corruption,
+            // NOT "no funding": silently substituting `Vec::new()` would persist a
+            // month with all funding_rate absent (weakens audit C2 / C8). The
+            // pure helper turns the funding-404 into a retryable ingest error so
+            // the month is not falsely "Loaded".
+            let funding_zip = self.fetch_verified(&funding_arc).await?;
+            let funding = resolve_present_month_funding(funding_zip.as_deref(), year, month)?;
 
             Ok(MonthOutcome::Loaded(MonthData { candles, funding }))
         }
@@ -339,12 +366,59 @@ impl MonthSource for BulkMonthSource {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{FundingEvent, MonthData, MonthOutcome, MonthSource, ingest_window};
+    use super::{
+        FundingEvent, MonthData, MonthOutcome, MonthSource, ingest_window,
+        resolve_present_month_funding,
+    };
     use crate::domain::DataVersion;
     use crate::domain::{Candle, DataError, Pair, Timeframe};
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::future::Future;
+
+    /// Build an in-memory `.zip` with one named member (test helper).
+    fn make_zip(name: &str, body: &str) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    // ---- Fix 3: present-klines month + funding 404 ⇒ retryable ingest error --
+    //
+    // Mirrors `BulkMonthSource::load_month`: a present-klines month whose funding
+    // archive 404s must NOT silently become empty funding. The 404 (`None`)
+    // surfaces as a retryable `DataError::Io`; valid funding bytes parse cleanly.
+
+    #[test]
+    fn present_month_funding_404_is_a_retryable_error_not_empty() {
+        // Funding archive 404'd (None) for a month whose klines are present.
+        let err = resolve_present_month_funding(None, 2024, 1)
+            .expect_err("funding 404 on a present month must error");
+        assert!(
+            matches!(err, DataError::Io(_)),
+            "funding-404 must be a retryable Io error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn present_month_funding_present_parses_events() {
+        let csv = "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.0001\n";
+        let zip = make_zip("BTCUSDT-fundingRate-2024-01.csv", csv);
+        let events = resolve_present_month_funding(Some(&zip), 2024, 1)
+            .expect("valid funding archive parses");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].calc_time, 0);
+        assert_eq!(events[0].rate, Decimal::new(1, 4));
+    }
 
     fn candle(open_time: i64) -> Candle {
         Candle {

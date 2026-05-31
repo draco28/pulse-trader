@@ -194,9 +194,11 @@ where
         // before the first candle closes). Do NOT persist an empty snapshot or
         // set `HEAD` — else the next run would read an empty prior and back-fill
         // from epoch (CodeRabbit). With no `HEAD`, the next run is a fresh first
-        // run (which anchors on the window). Report a no-data up-to-date result.
+        // run (which anchors on the window). Report a no-data up-to-date result
+        // with an EMPTY path: no Parquet was written, so reporting
+        // `snapshot_path(...)` would point at a file that does not exist (Codex P2).
         series.version = CandleStore::content_version(pair, tf, &series.candles);
-        return summarize(store, &series, Action::UpToDate);
+        return summarize_no_data(&series);
     }
     persist(store, pair, tf, series, Action::Bulk)
 }
@@ -238,6 +240,27 @@ fn persist(
     // HEAD SECOND (atomic temp→rename). A crash between leaves a valid orphan.
     store.write_head(pair, tf, &series.version)?;
     summarize(store, &series, action)
+}
+
+/// Build the no-data summary for a first run that fetched zero candles: nothing
+/// was persisted and no `HEAD` set, so the `path` MUST be empty (reporting
+/// `snapshot_path(...)` would point at a Parquet that does not exist — Codex P2).
+/// The grill-locked `--json` field set/types are unchanged (`path` stays a
+/// `String`; here it is `""`).
+fn summarize_no_data(series: &crate::domain::CandleSeries) -> Result<TfSummary, DataError> {
+    let gaps = series.validate()?;
+    Ok(TfSummary {
+        pair: series.pair.to_string(),
+        timeframe: series.timeframe.binance_interval().to_string(),
+        data_version: series.version.to_string(),
+        action: Action::UpToDate.as_str().to_string(),
+        candle_count: series.candles.len(),
+        first_open_ms: series.candles.first().map(|c| c.open_time),
+        last_open_ms: series.candles.last().map(|c| c.open_time),
+        // Empty: no snapshot was written, so there is no path to report.
+        path: String::new(),
+        gap_count: gaps.len(),
+    })
 }
 
 /// Build the `--json`/human summary for a (persisted or already-current) series.
