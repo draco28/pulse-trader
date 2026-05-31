@@ -169,7 +169,14 @@ where
     S: MarketDataSource,
 {
     let start_ms = years_window_start_ms(now_ms, n_years);
-    let mut series = source.fetch_historical(pair, tf, start_ms, now_ms).await?;
+    // Bulk covers COMPLETE months only — exclude the current (incomplete) month,
+    // which data.binance.vision has not published a monthly archive for yet; the
+    // REST top-up below fills it (audit C5). `years_window_start_ms(_, 0)` floors
+    // `now` to the first day of the current UTC month. Passing `now_ms` here (the
+    // original bug) made the bulk range include the current month → WI-02's
+    // "expected month absent after listing" error on the live `--years 2` run.
+    let bulk_end_ms = years_window_start_ms(now_ms, 0);
+    let mut series = source.fetch_historical(pair, tf, start_ms, bulk_end_ms).await?;
     // Immediate top-up to "now" (closed candles only) so the first snapshot is
     // current (grill). Empty bulk ⇒ since = -1 so a top-up still starts at 0.
     let since = series.candles.last().map_or(-1, |c| c.open_time);
