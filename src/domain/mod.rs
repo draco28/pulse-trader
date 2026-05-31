@@ -21,6 +21,15 @@ pub use series::{CandleSeries, Gap};
 pub use timeframe::Timeframe;
 pub use version::DataVersion;
 
+/// Version of the `CandleSeries` on-disk schema (audit C7).
+///
+/// WI-01 defined no schema version; WI-1.1.1.04 introduces it additively so it
+/// can be folded into the content-hash `data_version` (see
+/// `crate::adapters::store`). Bumping this constant on any future schema change
+/// forces every snapshot to a new `data_version`, preventing a stale snapshot
+/// from being mistaken for one written under the new schema.
+pub const CANDLE_SCHEMA_VERSION: u32 = 1;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

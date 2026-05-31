@@ -24,18 +24,24 @@ thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
 # WI-1.1.1.02 (binance bulk ingest): HTTP client, archive decode, CSV parse,
-# async runtime, and CHECKSUM (SHA256) verification. Additive — WI-04 owns its
-# own dep lines in this shared file.
+# async runtime, and CHECKSUM (SHA256) verification.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-sha2 = "0.10"
 hex = "0.4"
+# WI-1.1.1.04 (parquet persistence).
+polars = { version = "0.53", default-features = false, features = ["parquet"] }
+directories = "6"
+serde_json = "1"
+# Shared by WI-02 (CHECKSUM verify) + WI-04 (data_version hash) — reconciled to one version at merge.
+sha2 = "0.11"
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# WI-1.1.1.04 — tests write to a tempfile dir, never real Application Support.
+tempfile = "3"
 
 # Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
 # unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).
