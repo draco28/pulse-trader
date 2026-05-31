@@ -176,7 +176,9 @@ where
     // original bug) made the bulk range include the current month → WI-02's
     // "expected month absent after listing" error on the live `--years 2` run.
     let bulk_end_ms = years_window_start_ms(now_ms, 0);
-    let mut series = source.fetch_historical(pair, tf, start_ms, bulk_end_ms).await?;
+    let mut series = source
+        .fetch_historical(pair, tf, start_ms, bulk_end_ms)
+        .await?;
     // Immediate top-up to "now" (closed candles only) so the first snapshot is
     // current (grill). Empty bulk ⇒ since = -1 so a top-up still starts at 0.
     let since = series.candles.last().map_or(-1, |c| c.open_time);
