@@ -23,6 +23,15 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
+# WI-1.1.1.02 (binance bulk ingest): HTTP client, archive decode, CSV parse,
+# async runtime, and CHECKSUM (SHA256) verification. Additive — WI-04 owns its
+# own dep lines in this shared file.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+csv = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 serde_json = "1"

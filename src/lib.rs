@@ -23,6 +23,16 @@ pub use domain::{
     ValidationError,
 };
 
+// Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
+// private (`mod adapters`); these curated re-exports are the entrypoints WI-05
+// wires behind the CLI and the integration boundary consumes. Same pattern as
+// the domain re-exports above: the implementation modules stay crate-internal,
+// the public surface is explicit.
+pub use adapters::binance::{
+    BulkMonthSource, FundingEvent, MonthData, MonthOutcome, MonthSource, decode_month, ingest_bulk,
+    ingest_window, verify_archive_checksum,
+};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// Placeholder for WI-01; WI-05 replaces the body with CLI dispatch. Returns
