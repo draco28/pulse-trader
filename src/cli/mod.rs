@@ -102,7 +102,12 @@ where
     S: crate::domain::MarketDataSource,
     C: crate::domain::Clock,
 {
-    let pair = Pair::new(args.pair.clone());
+    // Validate the untrusted CLI symbol before it can reach the store-path layer
+    // (it is joined verbatim into `<base>/candles/<PAIR>/…`; an unvalidated
+    // `../`, `/abs`, or `a/b` would escape/relocate the store root).
+    let pair = Pair::parse(args.pair.clone())
+        .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
+    validate_years(args.years)?;
     let timeframes = parse_timeframes(&args.tf)?;
 
     let mut summaries: Vec<TfSummary> = Vec::new();
@@ -130,6 +135,28 @@ where
                 .join(", ")
         ))
     }
+}
+
+/// The largest accepted `--years` window. Binance USD-M Futures launched in
+/// 2019, so any value beyond this is unrealistic; capping it keeps the
+/// year-arithmetic in [`fetch_data::years_window_start_ms`] well-defined (an
+/// extreme `n_years` would underflow `target_year` and silently degrade to a
+/// current-month-only window).
+const MAX_YEARS: u32 = 50;
+
+/// Validate the `--years` argument is within the accepted range so an
+/// unrealistic value errors predictably rather than silently producing a
+/// current-month-only window.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] naming the offending value + accepted range when
+/// `years > MAX_YEARS`.
+fn validate_years(years: u32) -> anyhow::Result<()> {
+    if years > MAX_YEARS {
+        anyhow::bail!("--years {years} is out of range (accepted: 0..={MAX_YEARS})");
+    }
+    Ok(())
 }
 
 /// Parse the comma-separated `--tf` values into [`Timeframe`]s.
@@ -218,9 +245,42 @@ fn color_enabled() -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Cli, parse_one_tf, parse_timeframes};
+    use super::{Cli, MAX_YEARS, parse_one_tf, parse_timeframes, validate_years};
     use crate::domain::Timeframe;
     use clap::Parser;
+
+    // ---- Fix 5: --years range guard (CodeRabbit Minor) ---------------------
+
+    #[test]
+    fn validate_years_accepts_a_sane_window() {
+        assert!(validate_years(2).is_ok(), "2 years is a normal request");
+        assert!(
+            validate_years(0).is_ok(),
+            "0 (current month only) is allowed"
+        );
+        assert!(
+            validate_years(MAX_YEARS).is_ok(),
+            "the cap itself is allowed"
+        );
+    }
+
+    #[test]
+    fn validate_years_rejects_an_unrealistic_window() {
+        // An extreme value must error predictably (naming the value + range),
+        // NOT silently degrade to a current-month-only window.
+        let err = validate_years(u32::MAX).expect_err("u32::MAX years must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&u32::MAX.to_string()),
+            "error names the offending value: {msg}"
+        );
+        assert!(
+            msg.contains(&MAX_YEARS.to_string()),
+            "error names the accepted upper bound: {msg}"
+        );
+        // Just over the cap is also rejected.
+        assert!(validate_years(MAX_YEARS + 1).is_err());
+    }
 
     // ---- clap parsing ------------------------------------------------------
 

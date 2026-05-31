@@ -28,7 +28,7 @@ use chrono::{Datelike, TimeZone, Utc};
 use pulse::{
     BinanceDataSource, Candle, CandleSeries, CandleStore, DataError, DataVersion, FakeClock,
     FetchArgs, FundingEvent, MarketDataSource, MonthData, MonthOutcome, MonthSource, PageSource,
-    Pair, Timeframe, run_fetch_data,
+    Pair, TfOutcome, Timeframe, ensure_one_tf, run_fetch_data,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -414,6 +414,91 @@ async fn ac8_multi_tf_partial_failure_exits_non_zero_but_keeps_m15() {
             .is_none(),
         "failed H4 left no HEAD"
     );
+}
+
+// ---- Fix 4: no-data first run reports no snapshot path (was never written) --
+
+/// A source whose bulk window AND incremental top-up both yield zero candles —
+/// e.g. `--years 0` right after a UTC month rollover, before the first candle
+/// closes. Drives `first_run` into the empty-candles branch.
+struct EmptySource;
+
+impl MarketDataSource for EmptySource {
+    async fn fetch_historical(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        _start_ms: i64,
+        _end_ms: i64,
+    ) -> Result<CandleSeries, DataError> {
+        Ok(CandleSeries {
+            pair: pair.clone(),
+            timeframe: tf,
+            version: DataVersion::new("empty"),
+            candles: Vec::new(),
+        })
+    }
+
+    async fn fetch_incremental(
+        &self,
+        _pair: &Pair,
+        _tf: Timeframe,
+        _since_ms: i64,
+    ) -> Result<Vec<Candle>, DataError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fix4_no_data_first_run_reports_empty_path_and_writes_nothing() {
+    let (store, tmp) = store();
+    let clock = FakeClock::at(NOW_MS);
+
+    let outcome = ensure_one_tf(&EmptySource, &store, &clock, &btc(), Timeframe::M15, 0).await;
+    let TfOutcome::Ok(summary) = outcome else {
+        panic!("no-data first run must be Ok (up-to-date no-op), not a failure");
+    };
+
+    assert_eq!(summary.action, "up-to-date", "no-data ⇒ up-to-date");
+    assert_eq!(summary.candle_count, 0, "no candles");
+    assert_eq!(
+        summary.path, "",
+        "no snapshot was written ⇒ path must be empty, not a nonexistent Parquet"
+    );
+
+    // And no snapshot/HEAD landed on disk.
+    assert!(
+        store
+            .read_head(&btc(), Timeframe::M15)
+            .expect("read HEAD ok")
+            .is_none(),
+        "no-data run must not set HEAD"
+    );
+    let candles_dir = tmp.path().join("candles");
+    let wrote_parquet = walk_has_parquet(&candles_dir);
+    assert!(
+        !wrote_parquet,
+        "no-data run must not write any .parquet file"
+    );
+}
+
+/// Recursively check whether any `.parquet` file exists under `dir` (helper for
+/// the no-data assertion). Returns false if the dir does not exist.
+fn walk_has_parquet(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if walk_has_parquet(&path) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|e| e == "parquet") {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- AC-7 (reinforce): HEAD written AFTER snapshot; orphan does not move it -
