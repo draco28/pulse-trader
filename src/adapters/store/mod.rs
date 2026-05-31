@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 use crate::domain::CANDLE_SCHEMA_VERSION;
 use crate::domain::{Candle, CandleSeries, DataError, DataVersion, Pair, Timeframe};
 
+/// The per-`(pair,tf)` `HEAD` pointer file name (audit C6 — a bare file holding
+/// the current `data_version`).
+const HEAD_FILE: &str = "HEAD";
+
 /// A store of immutable, content-versioned `CandleSeries` Parquet snapshots.
 ///
 /// The base directory is injectable (AC-3): production uses the platform
@@ -178,6 +182,74 @@ impl CandleStore {
         self.snapshot_path(pair, tf, version).is_file()
     }
 
+    /// Resolve the `HEAD` pointer path for `(pair, tf)`:
+    /// `<base>/candles/<PAIR>/<TF>/HEAD` (audit C6 — a bare file holding the
+    /// current `data_version`).
+    #[must_use]
+    pub fn head_path(&self, pair: &Pair, tf: Timeframe) -> PathBuf {
+        paths::timeframe_dir(&self.base_dir, pair, tf).join(HEAD_FILE)
+    }
+
+    /// Write the `HEAD` pointer for `(pair, tf)` **atomically** (temp → fsync →
+    /// rename), recording `version` as the authoritative current snapshot
+    /// (grill-locked, audit C1/C6).
+    ///
+    /// The mutable `HEAD` supersedes the mtime-based [`Self::latest_version`] as
+    /// the top-up base: it is ordering-independent and survives across runs. The
+    /// caller writes the snapshot Parquet **first**, then this pointer **second**
+    /// (audit C1) so a crash between the two leaves a valid orphaned snapshot and
+    /// an unchanged, consistent `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] on any filesystem error.
+    pub fn write_head(
+        &self,
+        pair: &Pair,
+        tf: Timeframe,
+        version: &DataVersion,
+    ) -> Result<(), DataError> {
+        let path = self.head_path(pair, tf);
+        let dir = parent_of(&path)?;
+        fs::create_dir_all(dir).map_err(|e| io(&format!("create dir {}", dir.display()), &e))?;
+        let tmp = temp_path(&path)?;
+        write_temp(&tmp, version.as_str().as_bytes())?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            io(
+                &format!("rename {} -> {}", tmp.display(), path.display()),
+                &e,
+            )
+        })
+    }
+
+    /// Read the `HEAD` pointer for `(pair, tf)`, the authoritative current
+    /// `data_version` (audit C6). Returns `Ok(None)` when no `HEAD` exists yet
+    /// (a first run, before any snapshot is written).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Io`] on a filesystem error other than absence, or
+    /// [`DataError::Parse`] if the pointer body is empty or not valid UTF-8.
+    pub fn read_head(&self, pair: &Pair, tf: Timeframe) -> Result<Option<DataVersion>, DataError> {
+        let path = self.head_path(pair, tf);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let tag = String::from_utf8(bytes)
+                    .map_err(|e| DataError::Parse(format!("non-UTF8 HEAD pointer: {e}")))?;
+                let tag = tag.trim();
+                if tag.is_empty() {
+                    return Err(DataError::Parse(format!(
+                        "empty HEAD pointer at {}",
+                        path.display()
+                    )));
+                }
+                Ok(Some(DataVersion::new(tag)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io(&format!("read HEAD {}", path.display()), &e)),
+        }
+    }
+
     /// The most-recently-written snapshot version for `(pair, tf)`, by file mtime
     /// (AC-6). Returns `Ok(None)` when no snapshot exists.
     ///
@@ -304,4 +376,125 @@ fn content_equivalent(existing: &[u8], incoming: &[u8]) -> Result<bool, DataErro
 /// Build a `DataError::Io` from a context string and an error.
 fn io(context: &str, err: &impl std::fmt::Display) -> DataError {
     DataError::Io(format!("{context}: {err}"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{CandleStore, HEAD_FILE};
+    use crate::domain::{DataVersion, Pair, Timeframe};
+    use tempfile::TempDir;
+
+    fn store() -> (CandleStore, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = CandleStore::with_base_dir(tmp.path().to_path_buf());
+        (store, tmp)
+    }
+
+    // ---- AC-5: HEAD round-trips and is read as the top-up base -------------
+
+    #[test]
+    fn head_round_trips_the_current_data_version() {
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        // Absent before any write (a first run).
+        assert!(
+            store
+                .read_head(&pair, Timeframe::M15)
+                .expect("read empty HEAD ok")
+                .is_none()
+        );
+
+        let v = DataVersion::new("deadbeefcafef00d");
+        store
+            .write_head(&pair, Timeframe::M15, &v)
+            .expect("write HEAD");
+        let read = store
+            .read_head(&pair, Timeframe::M15)
+            .expect("read HEAD ok")
+            .expect("some HEAD");
+        assert_eq!(read, v, "HEAD reads back the written version");
+    }
+
+    // ---- AC-5: HEAD survives a rewrite (the pointer moves) -----------------
+
+    #[test]
+    fn head_rewrite_moves_the_pointer() {
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        let v1 = DataVersion::new("1111111111111111");
+        let v2 = DataVersion::new("2222222222222222");
+        store
+            .write_head(&pair, Timeframe::H4, &v1)
+            .expect("write 1");
+        store
+            .write_head(&pair, Timeframe::H4, &v2)
+            .expect("write 2");
+        assert_eq!(
+            store
+                .read_head(&pair, Timeframe::H4)
+                .expect("read ok")
+                .expect("some"),
+            v2,
+            "the HEAD pointer moves to the latest version"
+        );
+    }
+
+    // ---- AC-5: HEAD path layout (bare file alongside the snapshots) --------
+
+    #[test]
+    fn head_path_is_a_bare_file_in_the_timeframe_dir() {
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        let path = store.head_path(&pair, Timeframe::M15);
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), HEAD_FILE);
+        assert!(path.to_string_lossy().contains("candles/BTCUSDT/15m/HEAD"));
+    }
+
+    // ---- AC-7: a HEAD that was never written reads as None (prior absent) --
+
+    #[test]
+    fn missing_head_reads_none_not_error() {
+        let (store, _tmp) = store();
+        let pair = Pair::new("ETHUSDT");
+        assert!(
+            store
+                .read_head(&pair, Timeframe::H4)
+                .expect("absent HEAD is Ok(None)")
+                .is_none()
+        );
+    }
+
+    // ---- AC-7: an orphaned snapshot does NOT move HEAD ---------------------
+    //
+    // Simulates the crash-between case (audit C1): a snapshot is written but the
+    // process dies before `write_head`. The next run must read the *prior* HEAD,
+    // not the orphan.
+
+    #[test]
+    fn orphaned_snapshot_leaves_prior_head_unchanged() {
+        let (store, _tmp) = store();
+        let pair = Pair::new("BTCUSDT");
+        let prior = DataVersion::new("aaaaaaaaaaaaaaaa");
+        store
+            .write_head(&pair, Timeframe::M15, &prior)
+            .expect("write prior HEAD");
+
+        // A later run writes a NEW snapshot file but crashes before write_head.
+        let orphan = DataVersion::new("bbbbbbbbbbbbbbbb");
+        let orphan_path = store.snapshot_path(&pair, Timeframe::M15, &orphan);
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, b"orphan").unwrap();
+
+        // The next run reads HEAD: still the prior version, never the orphan.
+        let head = store
+            .read_head(&pair, Timeframe::M15)
+            .expect("read HEAD ok")
+            .expect("some HEAD");
+        assert_eq!(head, prior, "orphaned snapshot must NOT have moved HEAD");
+        assert!(
+            orphan_path.exists(),
+            "the orphan snapshot is retained (GC-able)"
+        );
+    }
 }
