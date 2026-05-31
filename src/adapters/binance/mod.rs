@@ -26,6 +26,7 @@ pub(crate) mod funding;
 pub(crate) mod incremental;
 pub(crate) mod merge;
 pub(crate) mod normalize;
+pub(crate) mod source;
 
 use std::future::Future;
 
@@ -41,6 +42,7 @@ use merge::merge_new;
 
 pub use funding::FundingEvent;
 pub use incremental::PageSource;
+pub use source::BinanceDataSource;
 
 /// One verified, parsed calendar month of klines + funding (the unit the bulk
 /// window assembles).

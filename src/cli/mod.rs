@@ -1,0 +1,288 @@
+//! CLI surface for `pulse` (WI-1.1.1.05): `clap` (derive) argument parsing +
+//! the sync→async bridge + `fetch-data` dispatch.
+//!
+//! **Sync→async bridge (audit C3):** [`run`] is the thin **sync** entry the
+//! binary shim calls. It parses args, builds a multi-thread `tokio` runtime, and
+//! `block_on`s the async orchestration. There is **no** `#[tokio::main]`; `main`
+//! stays the trivial shim mapping `Result` → `ExitCode`.
+//!
+//! **Output discipline (AC-4):** `--json` emits the grill-locked per-tf summary
+//! schema; human mode prints a concise per-tf line. ANSI styling is suppressed
+//! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
+
+pub(crate) mod fetch_data;
+
+use clap::{Parser, Subcommand};
+
+use crate::adapters::binance::BinanceDataSource;
+use crate::adapters::clock::SystemClock;
+use crate::adapters::store::CandleStore;
+use crate::domain::{Pair, Timeframe};
+
+use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
+
+/// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
+#[derive(Debug, Parser)]
+#[command(name = "pulse", version, about)]
+pub struct Cli {
+    /// The subcommand to run.
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// The `pulse` subcommands (v1 ships only `fetch-data`).
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Fetch + persist a versioned candle snapshot for a pair across timeframes.
+    FetchData(FetchArgs),
+}
+
+/// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
+#[derive(Debug, clap::Args)]
+pub struct FetchArgs {
+    /// The trading pair symbol (e.g. `BTCUSDT`).
+    pub pair: String,
+    /// Comma-separated timeframes to fetch (one snapshot per tf), e.g. `M15,H4`.
+    #[arg(long, value_delimiter = ',')]
+    pub tf: Vec<String>,
+    /// Years of history to fetch (floored to the start of the month N years back, UTC).
+    #[arg(long)]
+    pub years: u32,
+    /// Emit the per-tf summary as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The library entry point (audit C3): a thin **sync** shim that builds a
+/// multi-thread `tokio` runtime and `block_on`s the async orchestration. The
+/// binary's `main` calls this and maps the `Result` to an exit code.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] on arg-parse failure, runtime-build failure, or
+/// when **any** requested timeframe failed to fetch (audit C4 — non-zero exit).
+pub fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("build tokio runtime: {e}"))?;
+    runtime.block_on(dispatch(cli))
+}
+
+/// Async dispatch over the parsed CLI.
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Command::FetchData(args) => {
+            let store = CandleStore::with_default_base_dir()
+                .map_err(|e| anyhow::anyhow!("resolve data dir: {e}"))?;
+            let source = BinanceDataSource::live(SystemClock)
+                .map_err(|e| anyhow::anyhow!("build binance source: {e}"))?;
+            run_fetch_data(&source, &store, &SystemClock, &args).await
+        }
+    }
+}
+
+/// Orchestrate `fetch-data` over the injected port + store (NFR-9 / AC-6 — this
+/// fn names only the `MarketDataSource` + `Clock` bounds, never the concrete
+/// adapter). Each tf is fetched **independently**; a failing tf is reported and
+/// the process exits non-zero, while successful tfs remain (audit C4 / AC-8).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] iff at least one tf failed (after all tfs have
+/// been attempted + reported).
+pub async fn run_fetch_data<S, C>(
+    source: &S,
+    store: &CandleStore,
+    clock: &C,
+    args: &FetchArgs,
+) -> anyhow::Result<()>
+where
+    S: crate::domain::MarketDataSource,
+    C: crate::domain::Clock,
+{
+    let pair = Pair::new(args.pair.clone());
+    let timeframes = parse_timeframes(&args.tf)?;
+
+    let mut summaries: Vec<TfSummary> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for tf in timeframes {
+        match ensure_one_tf(source, store, clock, &pair, tf, args.years).await {
+            TfOutcome::Ok(summary) => summaries.push(summary),
+            TfOutcome::Failed { timeframe, error } => failures.push((timeframe, error)),
+        }
+    }
+
+    render(&summaries, &failures, args.json);
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{} timeframe(s) failed: {}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(tf, _)| tf.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+/// Parse the comma-separated `--tf` values into [`Timeframe`]s.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] on an unknown timeframe token or an empty list.
+fn parse_timeframes(raw: &[String]) -> anyhow::Result<Vec<Timeframe>> {
+    if raw.is_empty() {
+        anyhow::bail!("--tf requires at least one timeframe (e.g. M15,H4)");
+    }
+    raw.iter().map(|t| parse_one_tf(t)).collect()
+}
+
+/// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`).
+fn parse_one_tf(token: &str) -> anyhow::Result<Timeframe> {
+    match token.trim().to_ascii_uppercase().as_str() {
+        "M15" | "15M" => Ok(Timeframe::M15),
+        "H4" | "4H" => Ok(Timeframe::H4),
+        other => anyhow::bail!("unknown timeframe '{other}' (expected M15 or H4)"),
+    }
+}
+
+/// Render the per-tf outcomes. `--json` emits one JSON object per line (the
+/// grill-locked schema); human mode prints a plain per-tf line. ANSI styling is
+/// suppressed under `NO_COLOR` (AC-4); v1 human output is plain text either way,
+/// and `--json` never carries ANSI, so neither path emits escape codes here.
+fn render(summaries: &[TfSummary], failures: &[(String, String)], json: bool) {
+    if json {
+        for summary in summaries {
+            // Infallible in practice: TfSummary is a flat struct of owned
+            // primitives. A defensive `if let` keeps the no-panic invariant.
+            if let Ok(line) = serde_json::to_string(summary) {
+                println!("{line}");
+            }
+        }
+        for (tf, error) in failures {
+            let entry = serde_json::json!({
+                "timeframe": tf,
+                "action": "error",
+                "error": error,
+            });
+            println!("{entry}");
+        }
+    } else {
+        let bold = ansi_emphasis();
+        let reset = if bold.is_empty() { "" } else { "\x1b[0m" };
+        for summary in summaries {
+            println!(
+                "{bold}{} {}{reset}: {} ({} candles, {} gaps) -> {}",
+                summary.pair,
+                summary.timeframe,
+                summary.action,
+                summary.candle_count,
+                summary.gap_count,
+                summary.data_version,
+            );
+        }
+        for (tf, error) in failures {
+            eprintln!("{tf}: ERROR {error}");
+        }
+    }
+}
+
+/// The ANSI emphasis prefix for human-mode tf headers, or an empty string when
+/// `NO_COLOR` suppresses styling (AC-4).
+fn ansi_emphasis() -> &'static str {
+    if color_enabled() { "\x1b[1m" } else { "" }
+}
+
+/// Whether ANSI color output is enabled: disabled when `NO_COLOR` is set in the
+/// environment (the de-facto `NO_COLOR` convention, AC-4).
+fn color_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{Cli, parse_one_tf, parse_timeframes};
+    use crate::domain::Timeframe;
+    use clap::Parser;
+
+    // ---- clap parsing ------------------------------------------------------
+
+    #[test]
+    fn parses_fetch_data_with_comma_separated_tfs() {
+        let cli = Cli::try_parse_from([
+            "pulse",
+            "fetch-data",
+            "BTCUSDT",
+            "--tf",
+            "M15,H4",
+            "--years",
+            "1",
+        ])
+        .expect("parse");
+        let super::Command::FetchData(args) = cli.command;
+        assert_eq!(args.pair, "BTCUSDT");
+        assert_eq!(args.tf, vec!["M15".to_string(), "H4".to_string()]);
+        assert_eq!(args.years, 1);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_json_flag() {
+        let cli = Cli::try_parse_from([
+            "pulse",
+            "fetch-data",
+            "BTCUSDT",
+            "--tf",
+            "M15",
+            "--years",
+            "2",
+            "--json",
+        ])
+        .expect("parse");
+        let super::Command::FetchData(args) = cli.command;
+        assert!(args.json);
+    }
+
+    // ---- timeframe parsing -------------------------------------------------
+
+    #[test]
+    fn parses_tf_tokens_case_insensitively() {
+        assert_eq!(parse_one_tf("M15").unwrap(), Timeframe::M15);
+        assert_eq!(parse_one_tf("15m").unwrap(), Timeframe::M15);
+        assert_eq!(parse_one_tf("H4").unwrap(), Timeframe::H4);
+        assert_eq!(parse_one_tf("4h").unwrap(), Timeframe::H4);
+    }
+
+    #[test]
+    fn rejects_unknown_timeframe() {
+        assert!(parse_one_tf("D1").is_err());
+        assert!(parse_timeframes(&[]).is_err());
+    }
+
+    // ---- AC-4: NO_COLOR suppresses color ----------------------------------
+
+    #[test]
+    fn no_color_env_disables_color() {
+        // SAFETY: single-threaded test; we set+restore the var around the check.
+        // The function reads NO_COLOR once; this proves the suppression branch.
+        let prev = std::env::var_os("NO_COLOR");
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+        }
+        assert!(!super::color_enabled(), "NO_COLOR set ⇒ color disabled");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("NO_COLOR", v),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+        }
+    }
+}

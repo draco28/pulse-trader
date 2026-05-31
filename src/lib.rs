@@ -10,6 +10,7 @@ pub(crate) mod domain;
 
 mod adapters;
 mod agent;
+mod cli;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -29,8 +30,8 @@ pub use domain::{
 // the domain re-exports above: the implementation modules stay crate-internal,
 // the public surface is explicit.
 pub use adapters::binance::{
-    BulkMonthSource, FundingEvent, MonthData, MonthOutcome, MonthSource, decode_month, ingest_bulk,
-    ingest_window, verify_archive_checksum,
+    BinanceDataSource, BulkMonthSource, FundingEvent, MonthData, MonthOutcome, MonthSource,
+    decode_month, ingest_bulk, ingest_window, verify_archive_checksum,
 };
 
 // WI-1.1.1.03: the REST incremental top-up surface. `top_up_with` is the
@@ -52,15 +53,26 @@ pub use adapters::clock::{FakeClock, SystemClock};
 // internals.
 pub use adapters::store::{CandleStore, SnapshotProvenance};
 
+// WI-1.1.1.05: the `fetch-data` orchestration surface. The end-to-end OFFLINE
+// integration test (`tests/integration_fetch_data.rs`, the auto-demo proxy per
+// audit C2) drives `run_fetch_data` over fixture seams + a `FakeClock`, never
+// the live network. The CLI depends only on the `MarketDataSource` port + the
+// store (NFR-9 / AC-6); these re-exports expose the seam without leaking the
+// concrete adapter.
+pub use cli::fetch_data::{Action, TfOutcome, TfSummary, ensure_one_tf, years_window_start_ms};
+pub use cli::{FetchArgs, run_fetch_data};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
-/// Placeholder for WI-01; WI-05 replaces the body with CLI dispatch. Returns
-/// `Ok(())` so the bootstrap binary exits cleanly.
+/// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
+/// parses args via `clap`, builds a multi-thread `tokio` runtime, and
+/// `block_on`s the async `fetch-data` orchestration. There is no `#[tokio::main]`
+/// and `main` stays the trivial `Result` → `ExitCode` shim.
 ///
 /// # Errors
 ///
-/// Currently never errors. The `Result` signature is the stable contract the
-/// binary maps to a process exit code; later work items return real failures.
+/// Returns an [`anyhow::Error`] on arg-parse failure, runtime-build failure, or
+/// when any requested timeframe failed to fetch (non-zero exit, audit C4).
 pub fn run() -> anyhow::Result<()> {
-    Ok(())
+    cli::run()
 }
