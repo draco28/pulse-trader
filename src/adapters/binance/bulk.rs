@@ -117,8 +117,13 @@ pub(crate) fn unzip_single_csv(archive_bytes: &[u8]) -> Result<String, DataError
     let mut zip = zip::ZipArchive::new(reader)
         .map_err(|e| DataError::Parse(format!("invalid zip archive: {e}")))?;
 
-    if zip.is_empty() {
-        return Err(DataError::Parse("zip archive holds no entries".to_string()));
+    // data.binance.vision archives hold exactly one CSV; enforce that contract
+    // rather than silently reading entry 0 of a multi-entry archive (CodeRabbit).
+    if zip.len() != 1 {
+        return Err(DataError::Parse(format!(
+            "expected a single-entry zip archive, found {}",
+            zip.len()
+        )));
     }
 
     let mut entry = zip

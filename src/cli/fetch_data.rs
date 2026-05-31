@@ -189,6 +189,15 @@ where
     if !new.is_empty() {
         series = crate::adapters::binance::merge::merge_new(&series, new)?.0;
     }
+    if series.candles.is_empty() {
+        // Nothing fetched (e.g. `--years 0` right after a UTC month rollover,
+        // before the first candle closes). Do NOT persist an empty snapshot or
+        // set `HEAD` — else the next run would read an empty prior and back-fill
+        // from epoch (CodeRabbit). With no `HEAD`, the next run is a fresh first
+        // run (which anchors on the window). Report a no-data up-to-date result.
+        series.version = CandleStore::content_version(pair, tf, &series.candles);
+        return summarize(store, &series, Action::UpToDate);
+    }
     persist(store, pair, tf, series, Action::Bulk)
 }
 

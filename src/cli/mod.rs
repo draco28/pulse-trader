@@ -141,7 +141,16 @@ fn parse_timeframes(raw: &[String]) -> anyhow::Result<Vec<Timeframe>> {
     if raw.is_empty() {
         anyhow::bail!("--tf requires at least one timeframe (e.g. M15,H4)");
     }
-    raw.iter().map(|t| parse_one_tf(t)).collect()
+    // Dedupe (order-preserving) so `--tf M15,M15` doesn't fetch the same
+    // snapshot twice (CodeRabbit).
+    let mut out: Vec<Timeframe> = Vec::new();
+    for t in raw {
+        let tf = parse_one_tf(t)?;
+        if !out.contains(&tf) {
+            out.push(tf);
+        }
+    }
+    Ok(out)
 }
 
 /// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`).
