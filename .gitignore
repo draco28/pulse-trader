@@ -1,2 +1,11 @@
 /target
 /.worktrees
+
+# AI assistant config — keep the canonical repo "zero AI traces".
+# The global excludes file no longer ignores these (dual-repo workflow: AI
+# scaffolding is tracked in the paired AI workspace, never committed here).
+.claude/
+CLAUDE.md
+AGENTS.md
+.codex/
+.mcp.json
