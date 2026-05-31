@@ -2,8 +2,9 @@
 //! (spec §3 audit C4/C5, AC-5/AC-7).
 //!
 //! The concrete transport is `reqwest`, but the retry policy is written against
-//! an injectable [`HttpTransport`] trait so AC-5/AC-7 can be exercised entirely
-//! offline (AC-6) with a fake transport that scripts failures. Retry policy:
+//! an injectable async operation (a `FnMut() -> Future` closure) so AC-5/AC-7
+//! can be exercised entirely offline (AC-6) with a fake op that scripts
+//! failures. Retry policy:
 //! retryable = network errors + HTTP 429/5xx; non-retryable = other 4xx; max 4
 //! attempts; exponential backoff base 500 ms, cap 8 s, full jitter.
 //!

@@ -180,8 +180,11 @@ where
         .fetch_historical(pair, tf, start_ms, bulk_end_ms)
         .await?;
     // Immediate top-up to "now" (closed candles only) so the first snapshot is
-    // current (grill). Empty bulk ⇒ since = -1 so a top-up still starts at 0.
-    let since = series.candles.last().map_or(-1, |c| c.open_time);
+    // current (grill). Empty bulk ⇒ anchor the top-up at the requested window
+    // start (`start_ms - 1` so the candle opening at `start_ms` is included),
+    // NOT epoch 0 — else an empty-bulk run (e.g. `--years 0` in an unpublished
+    // current month) would back-fill from Binance's earliest candle.
+    let since = series.candles.last().map_or(start_ms - 1, |c| c.open_time);
     let new = source.fetch_incremental(pair, tf, since).await?;
     if !new.is_empty() {
         series = crate::adapters::binance::merge::merge_new(&series, new)?.0;
