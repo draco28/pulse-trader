@@ -23,18 +23,24 @@
 pub(crate) mod bulk;
 pub(crate) mod client;
 pub(crate) mod funding;
+pub(crate) mod incremental;
+pub(crate) mod merge;
 pub(crate) mod normalize;
 
 use std::future::Future;
 
-use crate::domain::{Candle, CandleSeries, DataError, DataVersion, Gap, Pair, Timeframe};
+use crate::domain::{Candle, CandleSeries, Clock, DataError, DataVersion, Gap, Pair, Timeframe};
 
 use bulk::{KlineArchive, archive_urls, parse_klines, unzip_single_csv, verify_checksum};
 use client::BinanceClient;
 use funding::{parse_funding, stamp_funding};
 use normalize::normalize;
 
+use incremental::{RestPageSource, fetch_incremental_with};
+use merge::merge_new;
+
 pub use funding::FundingEvent;
+pub use incremental::PageSource;
 
 /// One verified, parsed calendar month of klines + funding (the unit the bulk
 /// window assembles).
@@ -178,6 +184,89 @@ pub async fn ingest_bulk(
 ) -> Result<(CandleSeries, Vec<Gap>), DataError> {
     let source = BulkMonthSource::new()?;
     ingest_window(&source, pair, tf, version, months).await
+}
+
+/// The funding bookkeeping the incremental top-up needs from the caller: the
+/// `prior` snapshot to extend and the timestamp of the **last funding event
+/// already applied** to it (`funding_since_ms` is derived as `+ 1`, grill rule).
+///
+/// `last_applied_funding_ms` is the caller's responsibility because the prior
+/// series only records funding *sparsely* (on the candles where it landed); the
+/// caller (WI-05) tracks the last-applied timestamp in the snapshot's
+/// provenance. Passing it explicitly keeps the boundary unambiguous and avoids
+/// re-scanning the whole series here.
+#[derive(Debug, Clone, Copy)]
+pub struct TopUpBoundary {
+    /// The `open_time` (epoch ms) of the prior snapshot's last candle: only
+    /// candles with `open_time >` this are fetched.
+    pub last_open_ms: i64,
+    /// The `calc_time` (epoch ms) of the last funding event already applied to
+    /// the prior snapshot. Funding is fetched from `last_applied_funding_ms + 1`
+    /// (grill rule — no overlap, no double-application at the boundary).
+    pub last_applied_funding_ms: i64,
+}
+
+/// Incremental top-up over an injected [`PageSource`] + [`Clock`] (the
+/// offline-testable seam, AC-1..AC-6).
+///
+/// Fetches only candles with `open_time > boundary.last_open_ms` whose
+/// `close_time < clock.now_ms()` (the still-forming kline is dropped — grill /
+/// audit C5), fetches funding from `boundary.last_applied_funding_ms + 1` and
+/// stamps it on the **new candles only** (grill), then [`merge_new`]s the new
+/// candles onto `prior` and re-validates — returning the **full merged**
+/// [`CandleSeries`] (audit C1). The merged series is a new value; persisting it
+/// mints a new `data_version` (WI-04) and never appends in place.
+///
+/// The [`Clock`] is supplied by the caller because `BinanceDataSource` holds it
+/// as a field injected at construction (audit C4) — the WI-01
+/// [`MarketDataSource`](crate::domain::MarketDataSource) port signature is
+/// unchanged.
+///
+/// # Errors
+///
+/// [`DataError`] from the transport (WI-02 mapping), a JSON decode failure, or
+/// structural re-validation of the merged series.
+pub async fn top_up_with<S, C>(
+    source: &S,
+    clock: &C,
+    prior: &CandleSeries,
+    boundary: TopUpBoundary,
+) -> Result<(CandleSeries, Vec<Gap>), DataError>
+where
+    S: PageSource + Sync,
+    C: Clock + Sync,
+{
+    let new_candles = fetch_incremental_with(
+        source,
+        clock,
+        &prior.pair,
+        prior.timeframe,
+        boundary.last_open_ms,
+        boundary.last_applied_funding_ms + 1,
+    )
+    .await?;
+    merge_new(prior, new_candles)
+}
+
+/// Production incremental top-up: same as [`top_up_with`] but over the live
+/// USD-M Futures REST API via WI-02's retry/backoff [`BinanceClient`] (no second
+/// HTTP client — the WI-05 seam). The `clock` is the [`Clock`] WI-05 injects into
+/// `BinanceDataSource` (audit C4).
+///
+/// # Errors
+///
+/// [`DataError`] if the HTTP client cannot be built, the transport fails after
+/// retries, a page cannot be decoded, or the merged series fails re-validation.
+pub async fn top_up_incremental<C>(
+    clock: &C,
+    prior: &CandleSeries,
+    boundary: TopUpBoundary,
+) -> Result<(CandleSeries, Vec<Gap>), DataError>
+where
+    C: Clock + Sync,
+{
+    let source = RestPageSource::new()?;
+    top_up_with(&source, clock, prior, boundary).await
 }
 
 /// Production [`MonthSource`]: downloads each month's klines + funding archive
