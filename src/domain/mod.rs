@@ -6,6 +6,7 @@
 //! `thiserror`, and `chrono` are permitted.
 
 mod candle;
+mod clock;
 mod error;
 mod pair;
 mod port;
@@ -14,6 +15,7 @@ mod timeframe;
 mod version;
 
 pub use candle::Candle;
+pub use clock::Clock;
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;
