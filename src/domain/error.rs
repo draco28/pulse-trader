@@ -45,6 +45,17 @@ pub enum DataError {
     /// domain stays free of `std::io::Error`'s non-`Serialize` payload).
     #[error("io error: {0}")]
     Io(String),
+
+    /// A snapshot already exists at the target `(pair, timeframe, data_version)`
+    /// path but its on-disk content differs from the data being written (audit
+    /// C5 / WI-1.1.1.04). Because `data_version` is a content hash, an *identical*
+    /// re-write is a no-op success — this variant fires only for the pathological
+    /// same-path-different-content case (collision or corruption).
+    #[error("snapshot already exists with differing content at {path}")]
+    SnapshotExists {
+        /// The conflicting snapshot path.
+        path: String,
+    },
 }
 
 /// The specific kinds of structural corruption a `CandleSeries` can exhibit.

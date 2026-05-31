@@ -23,10 +23,17 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
+# WI-1.1.1.04 (parquet persistence) — additive deps only.
+polars = { version = "0.53", default-features = false, features = ["parquet"] }
+sha2 = "0.11"
+directories = "6"
+serde_json = "1"
 
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# WI-1.1.1.04 — tests write to a tempfile dir, never real Application Support.
+tempfile = "3"
 
 # Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
 # unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).

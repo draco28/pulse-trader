@@ -19,9 +19,15 @@ mod tauri;
 // consumers (and the integration boundary) actually see. The binary, a separate
 // crate (audit C1), still reaches only `run()` — it never imports these.
 pub use domain::{
-    Candle, CandleSeries, DataError, DataVersion, Gap, MarketDataSource, Pair, Timeframe,
-    ValidationError,
+    CANDLE_SCHEMA_VERSION, Candle, CandleSeries, DataError, DataVersion, Gap, MarketDataSource,
+    Pair, Timeframe, ValidationError,
 };
+
+// WI-1.1.1.04: the persistence surface (immutable, content-versioned Parquet).
+// Re-exported so the integration boundary (and `tests/parquet_roundtrip.rs`)
+// can drive a full `CandleSeries` round-trip without reaching `pub(crate)`
+// internals.
+pub use adapters::store::{CandleStore, SnapshotProvenance};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

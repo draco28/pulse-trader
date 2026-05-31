@@ -2,3 +2,6 @@
 //!
 //! Stub for WI-01 to pin the hexagonal layout. WI-02/03/04 land the concrete
 //! `MarketDataSource` implementations here.
+
+// WI-1.1.1.04: immutable, content-versioned Parquet persistence for `CandleSeries`.
+pub(crate) mod store;
