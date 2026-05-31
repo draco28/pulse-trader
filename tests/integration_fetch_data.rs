@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
 
+use chrono::{Datelike, TimeZone, Utc};
+
 use pulse::{
     BinanceDataSource, Candle, CandleSeries, CandleStore, DataError, DataVersion, FakeClock,
     FetchArgs, FundingEvent, MarketDataSource, MonthData, MonthOutcome, MonthSource, PageSource,
@@ -443,4 +445,68 @@ async fn ac7_orphaned_snapshot_does_not_move_head_next_run_reads_prior() {
         orphan_path.exists(),
         "orphan snapshot retained, GC-able later"
     );
+}
+
+// ---- Regression: current incomplete month excluded from bulk (audit C5) -----
+
+/// A bulk [`MonthSource`] that mimics `data.binance.vision`: the **current
+/// (incomplete) month** has no published archive yet (`Absent`), while past
+/// months return a (deduped-to-3-candle) month. The live `--years 2` run failed
+/// because `first_run` included the current month in the bulk range → WI-02's
+/// "expected month absent after listing". This source reproduces that.
+struct CurrentMonthAbsentBulk {
+    now_year: i32,
+    now_month: u32,
+}
+
+impl MonthSource for CurrentMonthAbsentBulk {
+    async fn load_month(
+        &self,
+        _pair: &Pair,
+        _tf: Timeframe,
+        year: i32,
+        month: u32,
+    ) -> Result<MonthOutcome, DataError> {
+        if (year, month) == (self.now_year, self.now_month) {
+            // data.binance.vision has no monthly archive for the current month yet.
+            return Ok(MonthOutcome::Absent);
+        }
+        Ok(MonthOutcome::Loaded(MonthData {
+            candles: vec![
+                bulk_candle(BULK_OPEN_0),
+                bulk_candle(BULK_OPEN_1),
+                bulk_candle(BULK_OPEN_2),
+            ],
+            funding: vec![],
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regression_current_incomplete_month_excluded_from_bulk() {
+    // first_run must bound bulk to COMPLETE months ([start, current_month)) and
+    // leave the current month to the REST top-up (audit C5). If it asks the bulk
+    // source for the current month, that month is Absent → "expected month absent
+    // after listing" → the run errors. This is the live-demo regression.
+    let (store, _tmp) = store();
+    let now = Utc.timestamp_millis_opt(NOW_MS).single().unwrap();
+    let bulk = CurrentMonthAbsentBulk {
+        now_year: now.year(),
+        now_month: now.month(),
+    };
+    // REST top-up at the bulk boundary returns nothing new (caught up).
+    let mut m: HashMap<String, Vec<u8>> = HashMap::new();
+    m.insert(format!("klines:{}", BULK_OPEN_2 + 1), b"[]".to_vec());
+    m.insert(format!("funding:{}", BULK_OPEN_2 + 1), b"[]".to_vec());
+    let source = BinanceDataSource::new(bulk, FixtureRest { by_marker: m }, FakeClock::at(NOW_MS));
+
+    run_fetch_data(&source, &store, &FakeClock::at(NOW_MS), &args(false))
+        .await
+        .expect("current incomplete month must be excluded from bulk (audit C5)");
+
+    let head = store
+        .read_head(&btc(), Timeframe::M15)
+        .expect("read HEAD")
+        .expect("HEAD set");
+    assert!(store.snapshot_exists(&btc(), Timeframe::M15, &head));
 }
