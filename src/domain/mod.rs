@@ -23,6 +23,8 @@ pub use dsl::{
 };
 // VS-1.1.2 work-2.03: the semantic-validation surface (FR-3 correctable rejection).
 pub use dsl::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
+// VS-1.1.2 work-2.05: the version-safe migration read-path (FR-4).
+pub use dsl::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;

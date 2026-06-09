@@ -49,6 +49,13 @@ pub use domain::{
 // `pub(crate) mod domain` (an un-re-exported public domain type is a `dead_code`
 // build error, not a warning).
 pub use domain::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
+// VS-1.1.2 work-2.05: the version-safe migration read-path (FR-4). `Migrator`
+// detects a document's `schema_version`, migrates the JSON forward to `CURRENT`,
+// preserves the verbatim `dsl_original`, and returns an UNvalidated
+// current-version `StrategyDsl` (`Loaded`). `Migration`/`MigrationKind`/
+// `MigrationError`/`LoadError` are its registry + error vocabulary. Re-exported
+// on the same curated-surface pattern — REQUIRED under `deny(warnings)`.
+pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
 
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05

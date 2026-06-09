@@ -32,6 +32,7 @@
 
 mod condition;
 mod exit;
+mod migrate;
 mod risk;
 mod schema_version;
 mod strategy;
@@ -41,6 +42,7 @@ mod value;
 
 pub use condition::{Comparator, Condition};
 pub use exit::ExitRule;
+pub use migrate::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
 pub use risk::{Direction, RiskParams};
 pub use schema_version::{SchemaVersion, SchemaVersionParseError};
 pub use strategy::StrategyDsl;
