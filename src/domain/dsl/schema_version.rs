@@ -6,7 +6,7 @@
 //! version (MASTER-SPEC §A1). Ordering is derived (field order
 //! major→minor→patch gives correct version comparison). The **JSON
 //! representation is a string** `"MAJOR.MINOR.PATCH"` (e.g. `"1.0.0"`), NOT a
-//! `{ "major": … }` object — serde routes through [`Display`]/[`FromStr`] via
+//! `{ "major": … }` object — serde routes through [`fmt::Display`]/[`FromStr`] via
 //! `#[serde(into/try_from)]`.
 //!
 //! Scope (2.02): the type + `Ord` + string serde + [`SchemaVersion::CURRENT`].
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Ordering is derived from the field declaration order (major, then minor,
 /// then patch), which is exactly version-precedence order. Serialized as a
 /// `"MAJOR.MINOR.PATCH"` JSON **string** (not an object) through
-/// [`Display`]/[`FromStr`].
+/// [`fmt::Display`]/[`FromStr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct SchemaVersion {
