@@ -41,6 +41,15 @@ pub use domain::{
     Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
 };
 
+// VS-1.1.2 work-2.03: the semantic-validation engine (FR-3 correctable rejection).
+// `validate` is the entry point; `ValidatedDsl` is the newtype 2.04's compiler
+// accepts (constructible ONLY via `validate`); `FieldError`/`ValidationCode`/
+// `ValidationErrors` are the field-pathed, serde-serializable error collection
+// that crosses the Tauri boundary later. REQUIRED under `deny(warnings)` +
+// `pub(crate) mod domain` (an un-re-exported public domain type is a `dead_code`
+// build error, not a warning).
+pub use domain::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as
