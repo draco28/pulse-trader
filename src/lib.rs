@@ -30,6 +30,17 @@ pub use domain::{
 // same curated-surface pattern as the domain types above.
 pub use domain::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValue, ValueSource};
 
+// VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
+// top-level document the LLM composes (FR-3) and the backtester executes;
+// `ExitRule`/`RiskParams`/`Direction` are its exit/risk vocabulary; the
+// hand-rolled `SchemaVersion` (+ its parse error) carries FR-4's semver field.
+// Re-exported on the same curated-surface pattern — REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` (an un-re-exported public domain
+// type is a `dead_code` build error, not a warning).
+pub use domain::{
+    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
+};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as
