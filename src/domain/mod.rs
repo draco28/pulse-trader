@@ -21,6 +21,8 @@ pub use dsl::{
     Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
     SchemaVersion, SchemaVersionParseError, StrategyDsl, SweepableValue, ValueSource,
 };
+// VS-1.1.2 work-2.03: the semantic-validation surface (FR-3 correctable rejection).
+pub use dsl::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;

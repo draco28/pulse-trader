@@ -36,6 +36,7 @@ mod risk;
 mod schema_version;
 mod strategy;
 mod sweepable;
+mod validate;
 mod value;
 
 pub use condition::{Comparator, Condition};
@@ -44,4 +45,5 @@ pub use risk::{Direction, RiskParams};
 pub use schema_version::{SchemaVersion, SchemaVersionParseError};
 pub use strategy::StrategyDsl;
 pub use sweepable::SweepableValue;
+pub use validate::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
 pub use value::{IndicatorSpec, PriceField, ValueSource};
