@@ -25,6 +25,14 @@ pub use dsl::{
 pub use dsl::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
 // VS-1.1.2 work-2.05: the version-safe migration read-path (FR-4).
 pub use dsl::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
+// VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3). `compile`
+// turns a `ValidatedDsl` into a `CompiledStrategy` the backtester walks; the
+// `Compiled*` types + `EvalContext` seam + pure exit-geometry helpers are its
+// surface.
+pub use dsl::{
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
+    EvalContext, compile, stop_price, take_profit_price,
+};
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;
