@@ -21,6 +21,7 @@ pub use dsl::{
     Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
     SchemaVersion, SchemaVersionParseError, StrategyDsl, SweepableValue, ValueSource,
 };
+pub use dsl::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;
