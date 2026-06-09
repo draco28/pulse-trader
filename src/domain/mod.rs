@@ -17,7 +17,10 @@ mod version;
 
 pub use candle::Candle;
 pub use clock::Clock;
-pub use dsl::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValue, ValueSource};
+pub use dsl::{
+    Comparator, Condition, Direction, ExitRule, IndicatorSpec, PriceField, RiskParams,
+    SchemaVersion, SchemaVersionParseError, StrategyDsl, SweepableValue, ValueSource,
+};
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
 pub use port::MarketDataSource;
