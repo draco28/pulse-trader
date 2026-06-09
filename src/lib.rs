@@ -57,6 +57,21 @@ pub use domain::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, val
 // on the same curated-surface pattern — REQUIRED under `deny(warnings)`.
 pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
 
+// VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3 / BACKLOG-3).
+// `compile(&ValidatedDsl) -> Result<CompiledStrategy, CompileError>` is the slice
+// payoff (demo-2): it folds entry ∧ filters into one effective-entry predicate,
+// resolves `Fixed` leaves, and yields the stateless evaluator tree the VS-1.2.x
+// backtester walks per candle. `CompiledStrategy`/`CompiledCondition`/
+// `CompiledValue`/`CompiledExit`/`CompiledRisk` are the tree types; `EvalContext`
+// is the seam VS-1.1.3 indicators + the backtester implement; `stop_price`/
+// `take_profit_price` are the pure direction-relative exit-geometry helpers.
+// Re-exported on the same curated-surface pattern — REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain`.
+pub use domain::{
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
+    EvalContext, compile, stop_price, take_profit_price,
+};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as

@@ -30,6 +30,7 @@
 //! variant wrapping a `Vec`/scalar/enum. [`SweepableValue`] is `#[serde(untagged)]`
 //! so `Fixed` is a bare value and `Sweep` is an object.
 
+mod compile;
 mod condition;
 mod exit;
 mod migrate;
@@ -40,6 +41,11 @@ mod sweepable;
 mod validate;
 mod value;
 
+// VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3).
+pub use compile::{
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
+    EvalContext, compile, stop_price, take_profit_price,
+};
 pub use condition::{Comparator, Condition};
 pub use exit::ExitRule;
 pub use migrate::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
