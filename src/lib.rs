@@ -24,6 +24,54 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
+// strategy-as-data contract types (serde-tagged enums) the LLM builder tools
+// (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
+// same curated-surface pattern as the domain types above.
+pub use domain::{Comparator, Condition, IndicatorSpec, PriceField, SweepableValue, ValueSource};
+
+// VS-1.1.2 work-2.02: the whole-strategy document layer. `StrategyDsl` is the
+// top-level document the LLM composes (FR-3) and the backtester executes;
+// `ExitRule`/`RiskParams`/`Direction` are its exit/risk vocabulary; the
+// hand-rolled `SchemaVersion` (+ its parse error) carries FR-4's semver field.
+// Re-exported on the same curated-surface pattern — REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` (an un-re-exported public domain
+// type is a `dead_code` build error, not a warning).
+pub use domain::{
+    Direction, ExitRule, RiskParams, SchemaVersion, SchemaVersionParseError, StrategyDsl,
+};
+
+// VS-1.1.2 work-2.03: the semantic-validation engine (FR-3 correctable rejection).
+// `validate` is the entry point; `ValidatedDsl` is the newtype 2.04's compiler
+// accepts (constructible ONLY via `validate`); `FieldError`/`ValidationCode`/
+// `ValidationErrors` are the field-pathed, serde-serializable error collection
+// that crosses the Tauri boundary later. REQUIRED under `deny(warnings)` +
+// `pub(crate) mod domain` (an un-re-exported public domain type is a `dead_code`
+// build error, not a warning).
+pub use domain::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
+// VS-1.1.2 work-2.05: the version-safe migration read-path (FR-4). `Migrator`
+// detects a document's `schema_version`, migrates the JSON forward to `CURRENT`,
+// preserves the verbatim `dsl_original`, and returns an UNvalidated
+// current-version `StrategyDsl` (`Loaded`). `Migration`/`MigrationKind`/
+// `MigrationError`/`LoadError` are its registry + error vocabulary. Re-exported
+// on the same curated-surface pattern — REQUIRED under `deny(warnings)`.
+pub use domain::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
+
+// VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3 / BACKLOG-3).
+// `compile(&ValidatedDsl) -> Result<CompiledStrategy, CompileError>` is the slice
+// payoff (demo-2): it folds entry ∧ filters into one effective-entry predicate,
+// resolves `Fixed` leaves, and yields the stateless evaluator tree the VS-1.2.x
+// backtester walks per candle. `CompiledStrategy`/`CompiledCondition`/
+// `CompiledValue`/`CompiledExit`/`CompiledRisk` are the tree types; `EvalContext`
+// is the seam VS-1.1.3 indicators + the backtester implement; `stop_price`/
+// `take_profit_price` are the pure direction-relative exit-geometry helpers.
+// Re-exported on the same curated-surface pattern — REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain`.
+pub use domain::{
+    CompileError, CompiledCondition, CompiledExit, CompiledRisk, CompiledStrategy, CompiledValue,
+    EvalContext, compile, stop_price, take_profit_price,
+};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as

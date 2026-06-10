@@ -44,6 +44,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # WI-1.1.1.04 — tests write to a tempfile dir, never real Application Support.
 tempfile = "3"
+# VS-1.1.2 work-2.01 — property-based DSL serde round-trip harness (dev-only;
+# not in engine_fingerprint, so a floating "1" pin is fine).
+proptest = "1"
 
 # Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
 # unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).
