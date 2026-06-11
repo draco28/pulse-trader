@@ -11,3 +11,7 @@ pub(crate) mod clock;
 
 // WI-1.1.1.04: immutable, content-versioned Parquet persistence for `CandleSeries`.
 pub(crate) mod store;
+
+// VS-1.1.3 work-3.01: indicator adapters (ta-rs wrapped) + the `Decimal↔f64`
+// conversion seam. The ONLY module tree where `f64` is permitted.
+pub(crate) mod indicators;
