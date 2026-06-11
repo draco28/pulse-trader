@@ -24,6 +24,12 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — a new public domain type unused
+// outside its module is a `dead_code` build error, not a warning (VS-1.1.2
+// harvested gotcha). The EMA adapter + future indicators implement this seam.
+pub use domain::Indicator;
+
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
@@ -109,6 +115,16 @@ pub use adapters::store::{CandleStore, SnapshotProvenance};
 // concrete adapter.
 pub use cli::fetch_data::{Action, TfOutcome, TfSummary, ensure_one_tf, years_window_start_ms};
 pub use cli::{FetchArgs, run_fetch_data};
+
+// VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
+// `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
+// are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
+// Re-exported on the same curated-surface pattern — REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` (an un-re-exported public adapter
+// item unused outside its module is a `dead_code` build error). Consumed by
+// 3.02 (RSI/ADX/MACD), 3.03 (engine/EvalContext), and 3.04/3.05 downstream.
+pub use adapters::indicators::convert::{INDICATOR_SCALE, decimal_to_f64, f64_to_decimal_rounded};
+pub use adapters::indicators::ema::Ema;
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
