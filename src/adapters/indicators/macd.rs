@@ -10,13 +10,12 @@
 //! here and is filed as a tracked issue at round close.
 //!
 //! **Warmup convention.** Like ta-rs's other indicators, the underlying EMAs are
-//! *seeded* and emit from candle 1. Our port suppresses output until
-//! `slow + signal` candles have streamed: the signal line is an EMA *of* the
-//! MACD line, so the MACD line must warm (needs the slow EMA, `slow` candles)
-//! before the signal EMA accrues its own `signal` candles. The first genuinely
-//! defined value lands on candle `slow + signal + 1`. We feed *every* candle to
-//! the underlying ta-rs MACD (warming its recursive state) but gate emission on
-//! a candle counter. The warmup count is pinned by an AC test.
+//! *seeded* and emit from candle 1. This adapter emits the MACD line, not the
+//! signal line, so the port suppresses output until the slow EMA is defined:
+//! `slow - 1` candles return `None`, then candle `slow` returns the first
+//! `Some`. We feed *every* candle to the underlying ta-rs MACD (warming its
+//! recursive state) but gate emission on a candle counter. The warmup count is
+//! pinned by an AC test.
 
 use crate::adapters::indicators::convert::{decimal_to_f64, f64_to_decimal_rounded};
 use crate::domain::{Candle, Indicator};
@@ -30,7 +29,7 @@ use ta::indicators::MovingAverageConvergenceDivergence;
 /// bare `Macd` spec (#18). Output is rounded to scale-8.
 pub struct Macd {
     inner: MovingAverageConvergenceDivergence,
-    /// Warmup bar-count: `slow + signal` candles are suppressed.
+    /// Warmup bar-count: `slow - 1` candles are suppressed.
     warmup: u32,
     /// Number of candles fed so far.
     seen: u32,
@@ -49,7 +48,7 @@ impl Macd {
                 .ok()?;
         Some(Self {
             inner,
-            warmup: slow.saturating_add(signal),
+            warmup: slow,
             seen: 0,
         })
     }
@@ -65,9 +64,9 @@ impl Indicator for Macd {
         let input = decimal_to_f64(candle.close)?;
         let out = self.inner.next(input);
 
-        // Warmup: suppress the first `slow + signal` candles; emit from candle
-        // `slow + signal + 1` onward.
-        if self.seen <= self.warmup {
+        // Warmup: suppress the first `slow - 1` candles; emit from candle
+        // `slow` onward.
+        if self.seen < self.warmup {
             return None;
         }
         // The v1 #18 default: the MACD line (`EMA(fast) − EMA(slow)`).
@@ -75,9 +74,9 @@ impl Indicator for Macd {
     }
 
     fn is_ready(&self) -> bool {
-        // ready iff the NEXT call (the `seen + 1`-th candle) is candle
-        // `warmup + 1` or beyond.
-        self.seen.saturating_add(1) > self.warmup
+        // ready iff the NEXT call (the `seen + 1`-th candle) reaches candle
+        // `warmup` or beyond.
+        self.seen.saturating_add(1) >= self.warmup
     }
 }
 
@@ -132,27 +131,27 @@ mod tests {
     #[test]
     fn macd_returns_none_during_warmup_then_some() {
         let (fast, slow, signal) = (3u32, 6u32, 4u32);
-        let warmup = slow + signal; // 10
+        let warmup = slow; // MACD line first defined on the slow-period candle.
         let mut macd = Macd::new(fast, slow, signal).expect("periods >= 1");
 
-        // Feed exactly the warmup count of candles → all None.
-        for i in 1..=warmup {
+        // Feed exactly `warmup - 1` candles → all None.
+        for i in 1..warmup {
             let out = macd.next(&candle_close(&format!("{}", 100 + i)));
             assert_eq!(out, None, "candle {i} is warmup → None");
         }
-        // Having fed exactly `slow + signal` candles, the NEXT call is candle
-        // `warmup + 1` → first defined MACD line.
-        assert!(macd.is_ready(), "ready right before candle warmup + 1");
+        // Having fed exactly `slow - 1` candles, the NEXT call is candle
+        // `warmup` → first defined MACD line.
+        assert!(macd.is_ready(), "ready right before candle warmup");
 
         let out = macd.next(&candle_close("200"));
-        assert!(out.is_some(), "candle warmup + 1 → Some");
+        assert!(out.is_some(), "candle warmup → Some");
         assert!(macd.is_ready(), "stays ready once warm");
     }
 
     #[test]
     fn macd_resolves_to_macd_line() {
         let (fast, slow, signal) = (3u32, 6u32, 4u32);
-        let warmup = slow + signal;
+        let warmup = slow;
         // A series comfortably longer than warmup so we exercise warm output.
         let closes = [
             2.0_f64, 3.0, 4.2, 7.0, 6.7, 6.5, 8.1, 9.4, 8.8, 10.2, 11.5, 10.9, 12.3, 13.0, 12.1,
@@ -164,7 +163,7 @@ mod tests {
         for (i, &c) in closes.iter().enumerate() {
             idx += 1;
             let out = macd.next(&candle_close(&c.to_string()));
-            if idx <= warmup {
+            if idx < warmup {
                 assert_eq!(out, None, "warmup candle {idx} → None");
             } else {
                 let got: f64 = out.expect("warm → Some").to_string().parse().unwrap();
