@@ -126,6 +126,13 @@ pub use cli::{FetchArgs, run_fetch_data};
 pub use adapters::indicators::convert::{INDICATOR_SCALE, decimal_to_f64, f64_to_decimal_rounded};
 pub use adapters::indicators::ema::Ema;
 
+// VS-1.1.3 work-3.02b: the `Adx` adapter (Wilder `+DI`/`−DI`/ATR), built
+// in-adapter because ta-rs v0.5.0 ships no ADX. REQUIRED under `deny(warnings)`
+// + `pub(crate) mod adapters` (a new public adapter struct unused outside its
+// module is a `dead_code` build error, not a warning); the 3.03 factory that
+// consumes it is next round.
+pub use adapters::indicators::adx::Adx;
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
