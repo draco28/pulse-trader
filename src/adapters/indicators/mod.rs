@@ -9,6 +9,7 @@
 pub mod adx;
 pub mod convert;
 pub mod ema;
+pub mod engine;
 pub mod macd;
 pub mod rsi;
 

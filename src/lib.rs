@@ -141,6 +141,11 @@ pub use adapters::indicators::rsi::Rsi;
 // module is a `dead_code` build error, not a warning); the 3.03 factory that
 // consumes it is next round.
 pub use adapters::indicators::adx::Adx;
+// VS-1.1.3 work-3.03: the multi-indicator engine that implements the frozen
+// `EvalContext` seam over real candles and streaming adapter values. Its
+// readiness gate is load-bearing for warmup safety under the current boolean DSL
+// evaluator.
+pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
