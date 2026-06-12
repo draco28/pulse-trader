@@ -126,6 +126,16 @@ pub use cli::{FetchArgs, run_fetch_data};
 pub use adapters::indicators::convert::{INDICATOR_SCALE, decimal_to_f64, f64_to_decimal_rounded};
 pub use adapters::indicators::ema::Ema;
 
+// VS-1.1.3 work-3.02: the RSI + MACD adapters — thin ta-rs wraps behind the same
+// `Indicator` port. `Rsi` is Cutler's RSI (EMA-smoothed; 3.04 pins pandas-ta to
+// `mamode="ema"`); `Macd` resolves a bare `Macd` spec to the MACD line
+// (`EMA(fast) − EMA(slow)`), the v1 #18 default. REQUIRED under `deny(warnings)`
+// + `pub(crate) mod adapters` — an un-re-exported public adapter struct unused
+// outside its module is a `dead_code` build error (the 3.03 factory consumes
+// them next round).
+pub use adapters::indicators::macd::Macd;
+pub use adapters::indicators::rsi::Rsi;
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
