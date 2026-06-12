@@ -6,6 +6,7 @@
 //! is the walking-skeleton adapter (3.01). RSI/ADX/MACD land in 3.02; the
 //! multi-indicator engine / `EvalContext` impl in 3.03.
 
+pub mod adx;
 pub mod convert;
 pub mod ema;
 pub mod macd;
