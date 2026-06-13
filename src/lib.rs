@@ -147,6 +147,16 @@ pub use adapters::indicators::adx::Adx;
 // evaluator.
 pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 
+// VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
+// wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
+// `0001_init` migration set. REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter item unused outside its module is a `dead_code`
+// build error, not a warning (VS-1.1.2/1.1.3 harvested gotcha). Their first
+// in-crate consumers (1.03's repo + 1.04's backup wrapper) land next round and
+// reach them through these re-exports; the new `DataError::{Db,Migration}`
+// variants ride the existing `pub use domain::{... DataError ...}` re-export.
+pub use adapters::db::{Db, MIGRATOR};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which

@@ -15,3 +15,9 @@ pub(crate) mod store;
 // VS-1.1.3 work-3.01: indicator adapters (ta-rs wrapped) + the `Decimal↔f64`
 // conversion seam. The ONLY module tree where `f64` is permitted.
 pub(crate) mod indicators;
+
+// VS-1.1.4 work-1.01: the SQLite persistence tier — the `Db` pool wrapper (WAL +
+// foreign_keys + busy_timeout connect options), the embedded `MIGRATOR`, and the
+// platform-default db-path resolver. The ONLY module tree where `sqlx` is allowed
+// (the domain stays I/O-free).
+pub(crate) mod db;

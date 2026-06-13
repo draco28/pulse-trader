@@ -9,6 +9,11 @@ jobs:
   check:
     name: fmt + clippy + nextest
     runs-on: macos-latest
+    # VS-1.1.4 work-1.01: build offline (belt-and-suspenders with
+    # `.cargo/config.toml`) so a stray DATABASE_URL/.env can't override the
+    # committed `.sqlx` cache. The embedded `MIGRATOR` needs no live DB/sqlx-cli.
+    env:
+      SQLX_OFFLINE: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,3 +32,24 @@ jobs:
 
       - name: Tests (nextest)
         run: cargo nextest run
+
+  # VS-1.1.4 work-1.01 (NFR-12): fail on a STALE committed `.sqlx` cache. With no
+  # `query!` macros yet (1.03 adds them), `--check` against the bootstrap cache is
+  # a no-op pass; this job is the gate 1.03's generated cache must satisfy. It
+  # installs sqlx-cli (a developer-local tool, NOT in the `check` job) and runs
+  # the check against a throwaway migrated DB.
+  prepare-check:
+    name: sqlx prepare --check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls
+      - name: Create + migrate throwaway DB
+        run: |
+          DATABASE_URL=sqlite://ci-prepare.db sqlx database create
+          DATABASE_URL=sqlite://ci-prepare.db sqlx migrate run
+      - name: sqlx prepare --check
+        run: DATABASE_URL=sqlite://ci-prepare.db cargo sqlx prepare --check
