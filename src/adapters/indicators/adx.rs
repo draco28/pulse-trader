@@ -150,13 +150,16 @@ impl Adx {
 
 impl Indicator for Adx {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
-        self.seen = self.seen.saturating_add(1);
-
-        // Convert this bar's H/L/C across the seam; a non-representable price maps
-        // to `None` defensively (never a panic), and the bar is skipped for state.
+        // Convert this bar's H/L/C across the seam BEFORE advancing the warmup
+        // counter: a non-representable price (`None`) must not desync
+        // `seen`/readiness from the indicator state (a phase shift in the
+        // determinism layer). All three conversions must succeed before the bar
+        // is counted/consumed.
         let high = decimal_to_f64(candle.high)?;
         let low = decimal_to_f64(candle.low)?;
         let close = decimal_to_f64(candle.close)?;
+
+        self.seen = self.seen.saturating_add(1);
 
         // The first candle has no predecessor → no DM/TR; just record state.
         let Some(prev) = self.prev.as_ref() else {

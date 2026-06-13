@@ -91,10 +91,19 @@ pub(crate) fn parse_indicator_specs(raw: &[String]) -> anyhow::Result<Vec<Indica
         raw.to_vec()
     };
 
-    tokens
-        .iter()
-        .map(|token| parse_one_indicator(token))
-        .collect()
+    // The engine dedups specs, but the viewer renders one column per flag — so
+    // repeated `--indicator` flags would print duplicate columns. Dedup here,
+    // order-preserving, keyed on the case-normalized `kind:period` label (which
+    // is 1:1 with the parsed spec for rsi/ema/adx).
+    let mut seen = std::collections::HashSet::new();
+    let mut columns = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        let column = parse_one_indicator(token)?;
+        if seen.insert(column.label.clone()) {
+            columns.push(column);
+        }
+    }
+    Ok(columns)
 }
 
 #[must_use]
@@ -236,6 +245,24 @@ mod tests {
                 .map(|column| column.label.as_str())
                 .collect::<Vec<_>>(),
             ["rsi:14", "ema:50", "adx:14"]
+        );
+
+        // Repeated / case-variant specs dedup to one column each, order preserved
+        // (the viewer renders one column per surviving spec).
+        let deduped = parse_indicator_specs(&[
+            "rsi:14".to_owned(),
+            "RSI:14".to_owned(),
+            "ema:50".to_owned(),
+            "rsi:14".to_owned(),
+        ])
+        .expect("dedup parses");
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|column| column.label.as_str())
+                .collect::<Vec<_>>(),
+            ["rsi:14", "ema:50"],
+            "duplicate / case-variant --indicator flags dedup, order preserved"
         );
 
         assert!(parse_indicator_specs(&["macd:12".to_owned()]).is_err());

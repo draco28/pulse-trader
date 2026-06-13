@@ -216,7 +216,10 @@ fn indicators_match_pandas_ta_reference_after_settling() {
 
     let specs = all_specs();
     let mut engine = IndicatorEngine::from_specs(&specs).expect("build engine");
-    let mut compared = [(IndicatorName::Rsi, 0usize); 4];
+    // One (indicator, compared-row-count) slot per `indicator_names()` entry, in
+    // the same order the loop below enumerates — so a vacuous-count failure names
+    // the right indicator (every slot was previously mislabelled `Rsi`).
+    let mut compared = indicator_names().map(|name| (name, 0usize));
 
     for (row_idx, (candle, row)) in candles.iter().zip(reference.iter()).enumerate() {
         assert_eq!(candle.open_time, row.open_time, "row {row_idx} open_time");

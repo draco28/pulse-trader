@@ -44,12 +44,12 @@ impl Ema {
 
 impl Indicator for Ema {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
-        self.seen = self.seen.saturating_add(1);
-
-        // Feed every candle so the recursive ta-rs state warms, even while we are
-        // still suppressing output during warmup. A non-representable price maps
-        // to `None` defensively (never a panic).
+        // Convert BEFORE advancing the warmup counter: a non-representable price
+        // (`None`) must not desync `seen`/readiness from the inner ta-rs state (a
+        // phase shift in the determinism layer). Feed every valid candle so the
+        // recursive ta-rs state warms even while output is suppressed.
         let input = decimal_to_f64(candle.close)?;
+        self.seen = self.seen.saturating_add(1);
         let out = self.inner.next(input);
 
         // Warmup: suppress the first `period − 1` emissions; emit from candle

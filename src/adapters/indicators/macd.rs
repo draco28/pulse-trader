@@ -11,11 +11,12 @@
 //!
 //! **Warmup convention.** Like ta-rs's other indicators, the underlying EMAs are
 //! *seeded* and emit from candle 1. This adapter emits the MACD line, not the
-//! signal line, so the port suppresses output until the slow EMA is defined:
-//! `slow - 1` candles return `None`, then candle `slow` returns the first
-//! `Some`. We feed *every* candle to the underlying ta-rs MACD (warming its
-//! recursive state) but gate emission on a candle counter. The warmup count is
-//! pinned by an AC test.
+//! signal line, so the port suppresses output until the slower EMA is defined:
+//! `max(fast, slow) − 1` candles return `None`, then candle `max(fast, slow)`
+//! (which is `slow` for a valid `fast < slow` MACD) returns the first `Some`. We
+//! feed *every* candle to the underlying ta-rs MACD (warming its recursive
+//! state) but gate emission on a candle counter. The warmup count is pinned by
+//! an AC test.
 
 use crate::adapters::indicators::convert::{decimal_to_f64, f64_to_decimal_rounded};
 use crate::domain::{Candle, Indicator};
@@ -29,7 +30,10 @@ use ta::indicators::MovingAverageConvergenceDivergence;
 /// bare `Macd` spec (#18). Output is rounded to scale-8.
 pub struct Macd {
     inner: MovingAverageConvergenceDivergence,
-    /// Warmup bar-count: `slow - 1` candles are suppressed.
+    /// Warmup bar-count: the first `warmup - 1` candles are suppressed, where
+    /// `warmup = max(fast, slow)`. For a valid MACD (`fast < slow`) this is
+    /// exactly `slow`; the `max` is defense-in-depth for the `pub` constructor
+    /// against inverted periods (the engine factory already rejects `fast >= slow`).
     warmup: u32,
     /// Number of candles fed so far.
     seen: u32,
@@ -48,7 +52,7 @@ impl Macd {
                 .ok()?;
         Some(Self {
             inner,
-            warmup: slow,
+            warmup: fast.max(slow),
             seen: 0,
         })
     }
@@ -56,16 +60,16 @@ impl Macd {
 
 impl Indicator for Macd {
     fn next(&mut self, candle: &Candle) -> Option<Decimal> {
-        self.seen = self.seen.saturating_add(1);
-
-        // Feed every candle so the recursive ta-rs EMA state warms, even during
-        // warmup suppression. A non-representable price maps to `None`
-        // defensively (never a panic).
+        // Convert BEFORE advancing the warmup counter: a non-representable price
+        // (`None`) must not desync `seen`/readiness from the inner ta-rs EMA
+        // state (a phase shift in the determinism layer). Feed every valid candle
+        // so the recursive state warms even while output is suppressed.
         let input = decimal_to_f64(candle.close)?;
+        self.seen = self.seen.saturating_add(1);
         let out = self.inner.next(input);
 
-        // Warmup: suppress the first `slow - 1` candles; emit from candle
-        // `slow` onward.
+        // Warmup: suppress the first `warmup - 1` candles; emit from candle
+        // `warmup` (= max(fast, slow)) onward.
         if self.seen < self.warmup {
             return None;
         }
@@ -145,6 +149,32 @@ mod tests {
 
         let out = macd.next(&candle_close("200"));
         assert!(out.is_some(), "candle warmup → Some");
+        assert!(macd.is_ready(), "stays ready once warm");
+    }
+
+    #[test]
+    fn macd_warmup_uses_max_of_fast_and_slow() {
+        // Defense-in-depth: the engine factory rejects `fast >= slow`, but the
+        // `pub` constructor (and ta-rs's own `MACD::new`) does not. With inverted
+        // periods the warmup must gate on `max(fast, slow)` — the slower EMA — NOT
+        // the bare `slow`, or it would emit before the longer EMA has reached its
+        // nominal warmup.
+        let (fast, slow, signal) = (6u32, 3u32, 4u32); // fast > slow (inverted)
+        let warmup = fast.max(slow); // 6, not slow (3)
+        let mut macd = Macd::new(fast, slow, signal).expect("periods >= 1");
+
+        for i in 1..warmup {
+            let out = macd.next(&candle_close(&format!("{}", 100 + i)));
+            assert_eq!(out, None, "candle {i} (< max(fast,slow)) → None");
+            assert_eq!(
+                macd.is_ready(),
+                i >= warmup - 1,
+                "readiness tracks max warmup"
+            );
+        }
+        // Candle `max(fast, slow)` is the first defined emission.
+        let out = macd.next(&candle_close("200"));
+        assert!(out.is_some(), "candle max(fast,slow) → first Some");
         assert!(macd.is_ready(), "stays ready once warm");
     }
 
