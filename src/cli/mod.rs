@@ -11,6 +11,7 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod fetch_data;
+pub(crate) mod indicators;
 
 use clap::{Parser, Subcommand};
 
@@ -20,6 +21,7 @@ use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
+use indicators::{IndicatorsArgs, run_indicators};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
 #[derive(Debug, Parser)]
@@ -35,6 +37,8 @@ pub struct Cli {
 pub enum Command {
     /// Fetch + persist a versioned candle snapshot for a pair across timeframes.
     FetchData(FetchArgs),
+    /// Render indicator values over a local candle snapshot.
+    Indicators(IndicatorsArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -80,6 +84,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("build binance source: {e}"))?;
             run_fetch_data(&source, &store, &SystemClock, &args).await
         }
+        Command::Indicators(args) => run_indicators(&args),
     }
 }
 
@@ -181,7 +186,7 @@ fn parse_timeframes(raw: &[String]) -> anyhow::Result<Vec<Timeframe>> {
 }
 
 /// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`).
-fn parse_one_tf(token: &str) -> anyhow::Result<Timeframe> {
+pub(crate) fn parse_one_tf(token: &str) -> anyhow::Result<Timeframe> {
     match token.trim().to_ascii_uppercase().as_str() {
         "M15" | "15M" => Ok(Timeframe::M15),
         "H4" | "4H" => Ok(Timeframe::H4),
@@ -296,7 +301,9 @@ mod tests {
             "1",
         ])
         .expect("parse");
-        let super::Command::FetchData(args) = cli.command;
+        let super::Command::FetchData(args) = cli.command else {
+            panic!("expected fetch-data command");
+        };
         assert_eq!(args.pair, "BTCUSDT");
         assert_eq!(args.tf, vec!["M15".to_string(), "H4".to_string()]);
         assert_eq!(args.years, 1);
@@ -316,7 +323,9 @@ mod tests {
             "--json",
         ])
         .expect("parse");
-        let super::Command::FetchData(args) = cli.command;
+        let super::Command::FetchData(args) = cli.command else {
+            panic!("expected fetch-data command");
+        };
         assert!(args.json);
     }
 
