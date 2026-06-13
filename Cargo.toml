@@ -21,7 +21,11 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "2"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# VS-1.1.4 work-1.02: `serde` feature added (NOT a new dep — a feature toggle on
+# the EXISTING chrono dep) so the strategy entities' `created_at: DateTime<Utc>`
+# fields can `#[derive(Serialize, Deserialize)]` (the `clock` feature alone does
+# not bring serde support). Additive — keep-both with 1.01's Cargo edits at merge.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 anyhow = "1"
 # WI-1.1.1.02 (binance bulk ingest): HTTP client, archive decode, CSV parse,
 # async runtime, and CHECKSUM (SHA256) verification.
