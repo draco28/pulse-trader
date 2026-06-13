@@ -56,6 +56,19 @@ pub enum DataError {
         /// The conflicting snapshot path.
         path: String,
     },
+
+    /// A SQLite/sqlx failure (connection, query, trigger ABORT). The sqlx error is
+    /// flattened to a message so the domain stays free of `sqlx::Error` (VS-1.1.4
+    /// work-1.01; sqlx lives only in `adapters::db`). A `RAISE(ABORT, ...)` from
+    /// the `strategy_version` immutability triggers (FR-4) surfaces here.
+    #[error("database error: {0}")]
+    Db(String),
+
+    /// A migration-protocol failure (apply/verify/backup-restore). Surfaced by the
+    /// backup-before-migrate wrapper (1.04); the variant is declared here in
+    /// work-1.01 so the shared error file never needs a later rewrite (NFR-12).
+    #[error("migration error: {0}")]
+    Migration(String),
 }
 
 /// The specific kinds of structural corruption a `CandleSeries` can exhibit.

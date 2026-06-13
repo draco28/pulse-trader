@@ -43,6 +43,18 @@ clap = { version = "4", features = ["derive"] }
 # can shift indicator outputs in low decimals → reproducibility break. The pinned
 # version is folded into the future engine_fingerprint. Do NOT relax to a caret.
 ta = "=0.5.0"
+# VS-1.1.4 work-1.01 (sqlite persistence): the embedded DB tier (WAL pool +
+# compile-time-checked queries from 1.03). EXACT `=0.8.6` pin (NFR-12 + gate-7
+# C7): a caret `0.8` could pull a patch that changes sqlx's `.sqlx` offline-cache
+# format → spurious CI `prepare --check` churn and a reproducibility break. The
+# pinned version keys 1.03's committed `.sqlx` cache and joins a future dependency
+# fingerprint (mirrors the ta-rs `=0.5.0` determinism pin). Do NOT relax to caret.
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "uuid"] }
+# VS-1.1.4 work-1.01: id generator for the ADAPTER only (1.03 mints
+# `Uuid::new_v4().to_string()` for StrategyId/VersionId); the domain stays
+# uuid-free (1.02 uses String newtypes). A floating major-1 pin is fine — uuid is
+# not in the engine/dep fingerprint, unlike sqlx.
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 serde_json = "1"
