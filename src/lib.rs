@@ -30,6 +30,26 @@ pub use domain::{
 // harvested gotcha). The EMA adapter + future indicators implement this seam.
 pub use domain::Indicator;
 
+// VS-1.1.4 work-1.02: the strategy-tree entities + the `StrategyRepository` port
+// (FR-4 / FR-11). `Strategy`/`StrategyVersion` are the persisted records (the
+// immutable version's `dsl_original` is verbatim — FR-4); `StrategyId`/`VersionId`
+// are the `#[serde(transparent)]` String id newtypes the adapter (1.03) fills
+// with UUIDs (1.02 is uuid-free); `CreatedBy` is the `created_by` provenance enum;
+// `NewVersion` is the create-request; `diff_versions`/`VersionDiff` are the pure
+// FR-11 compare. `StrategyRepository` is the create+read-only persistence seam
+// 1.03 implements and 1.05's CLI consumes. REQUIRED under `deny(warnings)` +
+// `pub(crate) mod domain` — an un-re-exported public domain item is a `dead_code`
+// build error, not a warning.
+// The entity value types come from `domain::strategy::` directly (the module is
+// `pub(crate)`, matching the `adapters::binance::`/`cli::fetch_data::` precedent);
+// `StrategyRepository` lives in `domain::port`, re-exported via the `domain`
+// curated surface like `MarketDataSource`.
+pub use domain::StrategyRepository;
+pub use domain::strategy::{
+    CreatedBy, NewVersion, Strategy, StrategyId, StrategyVersion, VersionDiff, VersionId,
+    diff_versions,
+};
+
 // VS-1.1.2 work-2.01: the DSL grammar leaf + predicate layer. These are the
 // strategy-as-data contract types (serde-tagged enums) the LLM builder tools
 // (FR-3) target and later DSL items (2.02–2.05) compose. Re-exported on the
