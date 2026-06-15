@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 id                AS \"id!: String\",\n                 name              AS \"name!: String\",\n                 tags              AS \"tags!: String\",\n                 owner             AS \"owner?: String\",\n                 pinned_version_id AS \"pinned_version_id?: String\",\n                 archived          AS \"archived!: i64\",\n                 created_at        AS \"created_at!: String\"\n               FROM strategy\n               WHERE (?1 = 1 OR archived = 0)\n               ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "name!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "tags!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "owner?: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "pinned_version_id?: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "archived!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "dedab41c6d3d67d78d35210ef60dd48e04aa1836757d6471c149934a6a913437"
+}

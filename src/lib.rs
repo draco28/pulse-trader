@@ -177,6 +177,15 @@ pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 // variants ride the existing `pub use domain::{... DataError ...}` re-export.
 pub use adapters::db::{Db, MIGRATOR};
 
+// VS-1.1.4 work-1.03: the SQLite `StrategyRepository` adapter. `SqliteStrategyRepo`
+// implements the FR-11 strategy surface + the FR-4 immutable version write/read
+// path over `query!`/`query_as!` (the committed `.sqlx/` cache). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter type unused
+// outside its module is a `dead_code` build error, not a warning (§4a-2: the
+// `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
+// it through the `StrategyRepository` port.
+pub use adapters::db::SqliteStrategyRepo;
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
