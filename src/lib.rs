@@ -185,6 +185,14 @@ pub use adapters::db::{Db, MIGRATOR};
 // `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
 // it through the `StrategyRepository` port.
 pub use adapters::db::SqliteStrategyRepo;
+// VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
+// is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
+// + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
+// integration boundary drive. REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter item unused outside its module is a `dead_code`
+// build error, not a warning (VS-1.1.2 harvested gotcha); re-export ALL of them,
+// not just the first. Append-only (keep-both with 1.03's re-exports at merge).
+pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

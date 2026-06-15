@@ -17,6 +17,14 @@ pub mod strategy_repo;
 
 pub use strategy_repo::SqliteStrategyRepo;
 
+// VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
+// item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
+// `dead_code` BUILD ERROR, not a warning (VS-1.1.2 harvested gotcha). All three
+// fns + the outcome enum are surfaced (lib.rs mirrors these). Append-only across
+// the parallel R2 items (trivial keep-both with 1.03's `pub mod strategy_repo;`).
+pub mod migrate;
+pub use migrate::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
+
 use std::path::Path;
 use std::time::Duration;
 
