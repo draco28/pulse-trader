@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO strategy (id, name, tags, owner, pinned_version_id, archived, created_at) VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "42747b56a4075335ecb26e1e567097b600cd454624b45dd26b33cf74032dffb7"
+}

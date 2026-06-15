@@ -13,6 +13,9 @@
 //! the real `pulse.db`.
 
 mod paths;
+pub mod strategy_repo;
+
+pub use strategy_repo::SqliteStrategyRepo;
 
 use std::path::Path;
 use std::time::Duration;

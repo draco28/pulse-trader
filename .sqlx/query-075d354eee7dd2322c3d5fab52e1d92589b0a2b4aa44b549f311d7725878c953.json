@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO strategy_version (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, creating_llm_call_ids, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "075d354eee7dd2322c3d5fab52e1d92589b0a2b4aa44b549f311d7725878c953"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE strategy SET pinned_version_id = ?1 WHERE id = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8fd48d532f649db889f9a10a2b17beaae2e587300590964ae56433d0c4e56ff7"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE strategy SET name = ?1 WHERE id = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "fc8041e1c3e78c1cdf24b14d26852e0e36eef1380b660d679a42ed144c2c4262"
+}
