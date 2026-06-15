@@ -15,6 +15,14 @@
 mod paths;
 pub mod strategy_repo;
 
+// VS-1.1.4 work-1.05 (§4a-3): the CLI dispatch resolves the default `pulse.db`
+// path BEFORE calling `open_migrated` (migrate-then-open), so it must reach
+// `default_db_path()`. It lives `pub(crate)` inside the private `mod paths`, so
+// `src/cli/` cannot see it without this one-line additive re-export. This is the
+// documented exception to spec §9's "no new re-exports" rule — a minimal,
+// intentional 1.01-surface touch. `pub(crate)` keeps it crate-internal (no leak).
+pub(crate) use paths::default_db_path;
+
 pub use strategy_repo::SqliteStrategyRepo;
 
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
