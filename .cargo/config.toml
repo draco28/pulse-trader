@@ -1,0 +1,10 @@
+# VS-1.1.4 work-1.01 — sqlx offline plumbing (NFR-12).
+#
+# `SQLX_OFFLINE = "true"` makes `cargo build` / `cargo nextest` offline-by-default
+# so a stray `DATABASE_URL` / `.env` cannot silently override the (eventually
+# committed, 1.03-populated) `.sqlx/` query cache. The embedded `MIGRATOR`
+# (`sqlx::migrate!`) reads the migrations at compile time, so build/test need
+# neither a live DB nor `sqlx-cli`. `relative = true` is NOT needed — `SQLX_OFFLINE`
+# is a plain flag, not a path.
+[env]
+SQLX_OFFLINE = "true"

@@ -13,6 +13,10 @@ mod indicator;
 mod pair;
 mod port;
 mod series;
+// `pub(crate)` (matching the `adapters`/`cli` nested-module precedent) so the
+// curated `lib.rs` surface can re-export via the `domain::strategy::` path — the
+// types still leave the crate only through the explicit `pub use` re-exports.
+pub(crate) mod strategy;
 mod timeframe;
 mod version;
 
@@ -39,7 +43,11 @@ pub use dsl::{
 };
 pub use error::{DataError, ValidationError};
 pub use pair::Pair;
-pub use port::MarketDataSource;
+// VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
+// `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
+// via the `pub(crate) mod strategy` path directly (matching the
+// `adapters::binance::` precedent), so they are NOT re-listed here.
+pub use port::{MarketDataSource, StrategyRepository};
 pub use series::{CandleSeries, Gap};
 pub use timeframe::Timeframe;
 pub use version::DataVersion;
@@ -61,6 +69,11 @@ mod tests {
     #[test]
     fn data_error_skeleton_variants_exist_and_serialize() {
         // The audit-C5 documented skeleton: Validation{Unsorted,Duplicate}, Gap, Parse, Io.
+        // VS-1.1.4 work-1.01 extends it additively with the SQLite tier's `Db`
+        // (connection/query/trigger-ABORT) + `Migration` (apply/verify/backup)
+        // variants — both `String`-payload so the domain stays free of
+        // `sqlx::Error` (which is not `Serialize`), exactly as `Io` avoids
+        // `std::io::Error`.
         let cases = vec![
             DataError::Validation(ValidationError::Unsorted {
                 earlier: 1,
@@ -73,6 +86,8 @@ mod tests {
             },
             DataError::Parse("bad decimal".to_string()),
             DataError::Io("disk full".to_string()),
+            DataError::Db("near \"SELCT\": syntax error".to_string()),
+            DataError::Migration("0001_init failed to apply".to_string()),
         ];
 
         for err in cases {

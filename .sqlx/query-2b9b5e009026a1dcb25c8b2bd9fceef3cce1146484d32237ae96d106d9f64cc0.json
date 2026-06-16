@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"one!: i64\" FROM strategy_version\n                   WHERE id = ?1 AND strategy_id = ?2",
+  "describe": {
+    "columns": [
+      {
+        "name": "one!: i64",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2b9b5e009026a1dcb25c8b2bd9fceef3cce1146484d32237ae96d106d9f64cc0"
+}

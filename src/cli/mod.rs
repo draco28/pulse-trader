@@ -12,16 +12,19 @@
 
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
+pub(crate) mod strategy;
 
 use clap::{Parser, Subcommand};
 
 use crate::adapters::binance::BinanceDataSource;
 use crate::adapters::clock::SystemClock;
+use crate::adapters::db::{default_db_path, open_migrated};
 use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
+use strategy::{StrategyArgs, run_strategy};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
 #[derive(Debug, Parser)]
@@ -39,6 +42,8 @@ pub enum Command {
     FetchData(FetchArgs),
     /// Render indicator values over a local candle snapshot.
     Indicators(IndicatorsArgs),
+    /// Browse / create / clone / tag / pin / archive / compare strategies (FR-11).
+    Strategy(StrategyArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -85,6 +90,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             run_fetch_data(&source, &store, &SystemClock, &args).await
         }
         Command::Indicators(args) => run_indicators(&args),
+        Command::Strategy(args) => {
+            // Gate-7 C3 startup wiring (§4a-3): resolve the db path FIRST, then
+            // run the backup-before-migrate protocol + open the pool via 1.04's
+            // `open_migrated` (migrate-then-open). On a migration failure this
+            // REFUSES TO START (DataError::Migration → anyhow → non-zero exit,
+            // MASTER-SPEC §7.4). `Db::with_path`/`open_default` are pure openers
+            // that do NOT migrate, so they are deliberately NOT used here.
+            let path = match &args.db {
+                Some(p) => p.clone(),
+                None => default_db_path().map_err(|e| anyhow::anyhow!("resolve db path: {e}"))?,
+            };
+            let db = open_migrated(&path)
+                .await
+                .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+            run_strategy(&db, &args).await
+        }
     }
 }
 

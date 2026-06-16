@@ -72,7 +72,7 @@ pulse-store repositories for Strategy/StrategyVersion (immutable) + sqlx compile
 
 - FR: FR-4, FR-11
 - NFR: NFR-2
-- Backlog: BACKLOG-5
+- Backlog: BACKLOG-6
 
 ##### Demo criteria
 
