@@ -75,7 +75,12 @@ pub fn align<'a>(primary: &'a CandleSeries, htf: Option<&'a CandleSeries>) -> Ve
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown
+)]
 mod tests {
     use super::{AlignedBar, align};
     use crate::domain::candle::Candle;
