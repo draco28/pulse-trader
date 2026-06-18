@@ -194,6 +194,23 @@ pub use adapters::db::SqliteStrategyRepo;
 // not just the first. Append-only (keep-both with 1.03's re-exports at merge).
 pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
 
+// VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
+// BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/
+// `TradeSource`), the run aggregate (`BacktestResult`), the error taxonomy
+// (`BacktestError`, incl. `NoStopLoss` (G5/#20) + `UnsupportedExit` (C4)), and
+// the pure `Decimal`-only money-math (`taker_fee`/`apply_slippage`+`Side`/
+// `funding_payment`/`realized_pnl`/`realized_r`/`position_size`) +
+// intra-bar collision (`resolve_intra_bar_exit`/`IntraBarExit`). The event loop
+// (1.03) composes these; 1.04's CLI renders the result. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
+// MTF feed extends the same `backtest` tree at the R1→R2 merge).
+pub use domain::{
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
+    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    resolve_intra_bar_exit, taker_fee,
+};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which

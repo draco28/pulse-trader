@@ -5,6 +5,10 @@
 //! Dependency policy is "zero I/O", not "zero deps": `serde`, `rust_decimal`,
 //! `thiserror`, and `chrono` are permitted.
 
+// VS-1.2.1 work-1.01: the pure-domain backtester foundation (money-math + trade
+// entities). `pub(crate)` (matching the `strategy` nested-module precedent) so
+// `lib.rs` can curate the public surface via the `domain::backtest::` path.
+pub(crate) mod backtest;
 mod candle;
 mod clock;
 mod dsl;
@@ -20,6 +24,16 @@ pub(crate) mod strategy;
 mod timeframe;
 mod version;
 
+// VS-1.2.1 work-1.01: the pure backtester domain surface (money-math + entities).
+// Kept additive — work-1.02 extends `backtest` with the MTF feed at the R1→R2
+// merge (keep-both). Re-exported here so `lib.rs` can curate the crate surface;
+// an un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use backtest::{
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
+    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    resolve_intra_bar_exit, taker_fee,
+};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
