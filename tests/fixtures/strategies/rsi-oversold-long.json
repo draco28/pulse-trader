@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0.0",
+  "name": "RSI Oversold Long",
+  "direction": "long",
+  "entry": {
+    "type": "Compare",
+    "lhs": {
+      "type": "Indicator",
+      "spec": { "indicator": "Rsi", "period": 14 }
+    },
+    "op": "Lt",
+    "rhs": { "type": "Constant", "value": "30" }
+  },
+  "filters": [],
+  "exits": [
+    { "type": "StopLoss", "distance_pct": "0.05" },
+    { "type": "TakeProfit", "target_r": "2" }
+  ],
+  "risk": {
+    "risk_per_trade_pct": "0.01",
+    "max_leverage": "3"
+  }
+}
