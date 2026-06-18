@@ -176,6 +176,11 @@ pub use adapters::indicators::adx::Adx;
 // evaluator.
 pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 
+// VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
+// owns the concrete indicator engine while composing the pure domain backtest
+// types and money-math primitives.
+pub use adapters::backtest::{BacktestConfig, run_backtest};
+
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
 // `0001_init` migration set. REQUIRED under `deny(warnings)` + `pub(crate) mod
