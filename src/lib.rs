@@ -30,6 +30,15 @@ pub use domain::{
 // harvested gotcha). The EMA adapter + future indicators implement this seam.
 pub use domain::Indicator;
 
+// VS-1.2.1 work-1.02: the MTF-aligned, no-look-ahead candle feed (FR-5 /
+// BACKLOG-4). `align(primary, htf)` is the backtest iteration substrate; each
+// `AlignedBar` pairs a primary candle with the most-recent already-closed HTF
+// bar (or `None`). REQUIRED under `deny(warnings)` + `pub(crate) mod domain` —
+// an un-re-exported public domain type is a `dead_code` build error, not a
+// warning. (C6: nothing consumes `AlignedBar::htf` this slice; it is the
+// substrate validated by its own unit tests.)
+pub use domain::{AlignedBar, align};
+
 // VS-1.1.4 work-1.02: the strategy-tree entities + the `StrategyRepository` port
 // (FR-4 / FR-11). `Strategy`/`StrategyVersion` are the persisted records (the
 // immutable version's `dsl_original` is verbatim — FR-4); `StrategyId`/`VersionId`

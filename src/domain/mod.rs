@@ -5,6 +5,11 @@
 //! Dependency policy is "zero I/O", not "zero deps": `serde`, `rust_decimal`,
 //! `thiserror`, and `chrono` are permitted.
 
+// VS-1.2.1 work-1.02: the backtest substrate (MTF-aligned, no-look-ahead feed).
+// `pub(crate)` matching the `dsl`/`strategy` nested-module precedent so the
+// curated `lib.rs` surface can re-export `backtest::feed::` types; they leave the
+// crate only through the explicit `pub use` re-exports.
+pub(crate) mod backtest;
 mod candle;
 mod clock;
 mod dsl;
@@ -20,6 +25,9 @@ pub(crate) mod strategy;
 mod timeframe;
 mod version;
 
+// VS-1.2.1 work-1.02: the no-look-ahead candle feed (FR-5). `AlignedBar` borrows
+// from the input series, so its lifetime is tied to the caller's `CandleSeries`.
+pub use backtest::{AlignedBar, align};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
