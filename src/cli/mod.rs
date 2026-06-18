@@ -10,6 +10,7 @@
 //! schema; human mode prints a concise per-tf line. ANSI styling is suppressed
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
+pub(crate) mod backtest;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
 pub(crate) mod strategy;
@@ -22,6 +23,7 @@ use crate::adapters::db::{default_db_path, open_migrated};
 use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
+use backtest::{BacktestArgs, run_backtest_cli};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
 use strategy::{StrategyArgs, run_strategy};
@@ -44,6 +46,8 @@ pub enum Command {
     Indicators(IndicatorsArgs),
     /// Browse / create / clone / tag / pin / archive / compare strategies (FR-11).
     Strategy(StrategyArgs),
+    /// Backtest a DSL strategy over a local candle snapshot + render the trade log (FR-5/FR-6).
+    Backtest(BacktestArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -106,6 +110,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
             run_strategy(&db, &args).await
         }
+        // The backtest engine + candle store are synchronous (no I/O port); the
+        // handler runs inline on the runtime's worker thread — no `.await`, no
+        // new runtime (the `mod.rs` sync→async bridge, audit C3, is reused).
+        Command::Backtest(args) => run_backtest_cli(&args),
     }
 }
 
