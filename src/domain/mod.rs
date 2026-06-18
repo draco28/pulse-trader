@@ -5,8 +5,9 @@
 //! Dependency policy is "zero I/O", not "zero deps": `serde`, `rust_decimal`,
 //! `thiserror`, and `chrono` are permitted.
 
-// VS-1.2.1 work-1.01: the pure-domain backtester foundation (money-math + trade
-// entities). `pub(crate)` (matching the `strategy` nested-module precedent) so
+// VS-1.2.1: the pure-domain backtester foundation — money-math + trade entities
+// (work-1.01) and the MTF-aligned, no-look-ahead candle feed (work-1.02).
+// `pub(crate)` (matching the `dsl`/`strategy` nested-module precedent) so
 // `lib.rs` can curate the public surface via the `domain::backtest::` path.
 pub(crate) mod backtest;
 mod candle;
@@ -24,14 +25,14 @@ pub(crate) mod strategy;
 mod timeframe;
 mod version;
 
-// VS-1.2.1 work-1.01: the pure backtester domain surface (money-math + entities).
-// Kept additive — work-1.02 extends `backtest` with the MTF feed at the R1→R2
-// merge (keep-both). Re-exported here so `lib.rs` can curate the crate surface;
-// an un-re-exported public domain type is a `dead_code` BUILD error under
-// `deny(warnings)`.
+// VS-1.2.1 backtester domain surface: money-math + entities (work-1.01) and the
+// no-look-ahead candle feed (work-1.02). Re-exported here so `lib.rs` can curate
+// the crate surface; an un-re-exported public domain type is a `dead_code` BUILD
+// error under `deny(warnings)`. `AlignedBar` borrows from the input series, so
+// its lifetime is tied to the caller's `CandleSeries`.
 pub use backtest::{
-    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
-    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade,
+    TradeSource, align, apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
 pub use candle::Candle;
