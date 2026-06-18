@@ -48,7 +48,7 @@ const GOLDEN_TRADE_COUNT: usize = 6;
 /// fees/funding/slippage) across the run. Exact `Decimal` — a silent engine
 /// drift changes this and fails the golden assertion. See the module header for
 /// regeneration.
-const GOLDEN_NET_PNL: &str = "142.96792368029048810681316863";
+const GOLDEN_NET_PNL: &str = "145.38478212503902969051241815";
 
 /// The RSI lookback period the canonical fixture uses. The streaming indicator
 /// engine warms RSI(period) at candle index `period + 1` (the first index where

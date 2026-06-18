@@ -43,8 +43,8 @@ pub fn run_backtest(
     config: &BacktestConfig,
 ) -> Result<BacktestResult, BacktestError> {
     let exit_plan = ExitPlan::from_strategy(compiled)?;
-    let mut engine = IndicatorEngine::new(compiled)
-        .map_err(|err| BacktestError::UnsupportedExit(format!("indicator engine: {err}")))?;
+    let mut engine =
+        IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
     let mut state = LoopState::default();
     let direction = compiled.direction();
 
@@ -328,7 +328,10 @@ fn close_position(
         position.qty,
         position.direction,
     );
-    let net = gross + funding_total - fees_total - slippage_total;
+    // `gross` is computed from the *slipped* entry/exit fills, so slippage is
+    // already embedded in it. `slippage_total` is a reporting figure only — do
+    // NOT subtract it again here (that would double-count it).
+    let net = gross + funding_total - fees_total;
     let realized_r = realized_r(
         position.entry_price,
         exit_price,
@@ -433,7 +436,7 @@ mod tests {
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, Timeframe, ValueSource, compile, validate,
+        SweepableValue, Timeframe, ValueSource, compile, realized_pnl, validate,
     };
     use rust_decimal::Decimal;
 
@@ -734,5 +737,41 @@ mod tests {
             primary.candles[3].open_time
         );
         assert_eq!(result.trades[0].exit_price, d(105));
+    }
+
+    #[test]
+    fn net_pnl_does_not_double_count_slippage() {
+        // Slippage is embedded in the slipped entry/exit fills, so `gross` already
+        // reflects it; `net` must NOT subtract `slippage_total` a second time.
+        // Invariant under test: net == gross(of the recorded fills) + funding - fees.
+        let cfg = BacktestConfig {
+            starting_equity: d(10_000),
+            taker_fee_bps: d(4),
+            slippage_bps: d(10),
+        };
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 105, 99, 100),
+            funding_candle(3, 100, 105, 99, 103),
+        ]);
+        let result = run_backtest(&base_strategy(), &primary, None, &cfg).unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let trade = &result.trades[0];
+        // The assertion is only meaningful if slippage is genuinely nonzero.
+        assert!(trade.slippage_total > Decimal::ZERO);
+
+        let gross = realized_pnl(
+            trade.entry_price,
+            trade.exit_price,
+            trade.qty,
+            trade.direction,
+        );
+        assert_eq!(
+            trade.realized_pnl,
+            gross + trade.funding_total - trade.fees_total,
+            "net P&L must embed slippage via the fills only, not subtract it twice"
+        );
     }
 }

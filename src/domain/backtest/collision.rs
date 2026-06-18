@@ -8,13 +8,19 @@
 //!
 //! # Fill geometry
 //!
+//! - **Open gaps fire first:** the `open` is the chronologically-first price of
+//!   the bar, so a bar that *opens* already beyond a level fills at the open
+//!   before any intra-bar travel could reach the other level. Both open-gap
+//!   checks (through the stop and through the take-profit) are therefore resolved
+//!   *before* the intra-bar `low`/`high` checks. (A single bar cannot open beyond
+//!   both levels at once — the stop sits below the TP for a long, above it for a
+//!   short — so the two open-gap cases never collide.)
 //! - **Intra-bar touch:** fill at the level itself (`stop_price` / `tp_price`).
 //!   Slippage ([`apply_slippage`](super::cost::apply_slippage)) is the caller's
 //!   later, separate step.
-//! - **Gap-through (worse for us):** if the bar *opens* already beyond the stop,
-//!   the honest fill is the **open** (a long gapping down through its stop fills
-//!   at the open, below the stop). A take-profit gap fills at the open **only
-//!   when the stop was not also gapped** — the stop still wins ties (G2).
+//! - **SL-first ties (G2):** only the genuinely *ambiguous* intra-bar case — a
+//!   bar whose `[low, high]` range reaches **both** levels with the open inside
+//!   the channel — resolves to the stop (the pessimistic outcome).
 //!
 //! This module performs no sizing, no P&L, and no slippage — just "which level
 //! fired and at what price".
@@ -71,7 +77,8 @@ fn resolve_long(
     stop_price: Decimal,
     tp_price: Decimal,
 ) -> Option<IntraBarExit> {
-    // Stop first (SL-first / stop wins ties).
+    // Open gaps resolve first (the open is the bar's first price). These two are
+    // mutually exclusive for a long (stop < tp), so order between them is moot.
     if open <= stop_price {
         // Gapped down through the stop → honest fill at the (worse) open.
         return Some(IntraBarExit {
@@ -79,17 +86,18 @@ fn resolve_long(
             price: open,
         });
     }
+    if open >= tp_price {
+        // Gapped up through the take-profit → fill at the open.
+        return Some(IntraBarExit {
+            reason: ExitReason::TakeProfit,
+            price: open,
+        });
+    }
+    // Open inside the channel → intra-bar touches, SL-first (stop wins ties, G2).
     if low <= stop_price {
         return Some(IntraBarExit {
             reason: ExitReason::StopLoss,
             price: stop_price,
-        });
-    }
-    // Stop not reached → consider the take-profit.
-    if open >= tp_price {
-        return Some(IntraBarExit {
-            reason: ExitReason::TakeProfit,
-            price: open,
         });
     }
     if high >= tp_price {
@@ -110,6 +118,8 @@ fn resolve_short(
     stop_price: Decimal,
     tp_price: Decimal,
 ) -> Option<IntraBarExit> {
+    // Open gaps resolve first (the open is the bar's first price). These two are
+    // mutually exclusive for a short (tp < stop), so order between them is moot.
     if open >= stop_price {
         // Gapped up through the stop → fill at the (worse) open.
         return Some(IntraBarExit {
@@ -117,16 +127,18 @@ fn resolve_short(
             price: open,
         });
     }
+    if open <= tp_price {
+        // Gapped down through the take-profit → fill at the open.
+        return Some(IntraBarExit {
+            reason: ExitReason::TakeProfit,
+            price: open,
+        });
+    }
+    // Open inside the channel → intra-bar touches, SL-first (stop wins ties, G2).
     if high >= stop_price {
         return Some(IntraBarExit {
             reason: ExitReason::StopLoss,
             price: stop_price,
-        });
-    }
-    if open <= tp_price {
-        return Some(IntraBarExit {
-            reason: ExitReason::TakeProfit,
-            price: open,
         });
     }
     if low <= tp_price {
@@ -236,6 +248,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn long_opens_past_tp_and_reaches_stop_resolves_to_tp_at_open() {
+        // opens at 112 (already above tp 110 → the chronologically-first price is
+        // past the TP) while the bar's range also dips to the stop (low 90 <= 95).
+        // An open gap is not intra-bar-ambiguous: the TP fills at the open, BEFORE
+        // price could travel down to the stop → TakeProfit@open, NOT StopLoss.
+        assert_eq!(
+            resolve_intra_bar_exit(d(112), d(115), d(90), d(STOP_L), d(TP_L), Direction::Long),
+            Some(IntraBarExit {
+                reason: ExitReason::TakeProfit,
+                price: d(112),
+            })
+        );
+    }
+
     // Short fixture: entry ~100, stop 105 (above), tp 90 (below).
     const STOP_S: i64 = 105;
     const TP_S: i64 = 90;
@@ -301,6 +328,20 @@ mod tests {
         // opens at 88 (below tp 90), high 92 stays below the stop → TP at open.
         assert_eq!(
             resolve_intra_bar_exit(d(88), d(92), d(85), d(STOP_S), d(TP_S), Direction::Short),
+            Some(IntraBarExit {
+                reason: ExitReason::TakeProfit,
+                price: d(88),
+            })
+        );
+    }
+
+    #[test]
+    fn short_opens_past_tp_and_reaches_stop_resolves_to_tp_at_open() {
+        // Short: tp 90 (below), stop 105 (above). Opens at 88 (already below tp →
+        // TP fills at the open) while the bar's range also rises to the stop
+        // (high 110 >= 105). The open gap beats the intra-bar stop → TakeProfit@open.
+        assert_eq!(
+            resolve_intra_bar_exit(d(88), d(110), d(85), d(STOP_S), d(TP_S), Direction::Short),
             Some(IntraBarExit {
                 reason: ExitReason::TakeProfit,
                 price: d(88),

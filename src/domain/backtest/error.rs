@@ -36,4 +36,11 @@ pub enum BacktestError {
     /// mis-pricing it (C4).
     #[error("unsupported exit kind for this backtester: {0}")]
     UnsupportedExit(String),
+
+    /// The streaming indicator engine could not be constructed for the compiled
+    /// strategy (e.g. a non-fixed or invalid indicator spec). A construction
+    /// failure is neither a missing stop nor an unsupported exit — it gets its
+    /// own neutral category so the cause is not mislabelled.
+    #[error("indicator engine initialization failed: {0}")]
+    EngineInit(String),
 }
