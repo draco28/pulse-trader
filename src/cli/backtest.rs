@@ -98,6 +98,11 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Validate the cost knobs up front (they depend only on CLI scalars) so an
+    // invalid --equity/--fee-bps/--slippage-bps fails fast — before the DSL
+    // compile + snapshot reads — and is never masked by a later load error.
+    validate_cost_knobs(args.equity, args.fee_bps, args.slippage_bps)?;
+
     let compiled = load_compiled_strategy(&args.dsl)?;
 
     let store = match &args.store {
@@ -112,7 +117,6 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    validate_cost_knobs(args.equity, args.fee_bps, args.slippage_bps)?;
     let config = BacktestConfig {
         starting_equity: args.equity,
         taker_fee_bps: args.fee_bps,
@@ -131,22 +135,27 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
 }
 
 /// Reject cost/equity knobs that would feed the sizing + fill math nonsensical
-/// inputs: equity must be strictly positive (it is the sizing denominator), and
-/// the fee / slippage rates must be non-negative (a negative rate would invent a
-/// favorable "adverse" fill or a fee rebate this slice does not model).
+/// inputs. Equity must be strictly positive (it is the sizing denominator). The
+/// fee and slippage rates must be in `[0, 10_000)` bps — `[0%, 100%)`: a negative
+/// rate would invent a favorable "adverse" fill or a fee rebate this slice does
+/// not model, and a rate at or above 100% would drive a slipped fill price to
+/// zero or negative.
 fn validate_cost_knobs(
     equity: Decimal,
     fee_bps: Decimal,
     slippage_bps: Decimal,
 ) -> anyhow::Result<()> {
+    let full_pct_bps = Decimal::new(10_000, 0); // 100%
     if equity <= Decimal::ZERO {
         anyhow::bail!("--equity must be positive (got {equity})");
     }
-    if fee_bps < Decimal::ZERO {
-        anyhow::bail!("--fee-bps must be non-negative (got {fee_bps})");
+    if fee_bps < Decimal::ZERO || fee_bps >= full_pct_bps {
+        anyhow::bail!("--fee-bps must be in [0, 10000) bps, i.e. [0%, 100%) (got {fee_bps})");
     }
-    if slippage_bps < Decimal::ZERO {
-        anyhow::bail!("--slippage-bps must be non-negative (got {slippage_bps})");
+    if slippage_bps < Decimal::ZERO || slippage_bps >= full_pct_bps {
+        anyhow::bail!(
+            "--slippage-bps must be in [0, 10000) bps, i.e. [0%, 100%) (got {slippage_bps})"
+        );
     }
     Ok(())
 }
@@ -446,13 +455,19 @@ mod tests {
         // Valid (zero fee/slippage allowed; equity must be strictly positive).
         assert!(validate_cost_knobs(ok_eq, Decimal::new(4, 0), Decimal::ONE).is_ok());
         assert!(validate_cost_knobs(ok_eq, Decimal::ZERO, Decimal::ZERO).is_ok());
-        // Invalid.
+        // Invalid (sign / lower bound).
         assert!(validate_cost_knobs(Decimal::ZERO, Decimal::new(4, 0), Decimal::ONE).is_err());
         assert!(
             validate_cost_knobs(Decimal::new(-1, 0), Decimal::new(4, 0), Decimal::ONE).is_err()
         );
         assert!(validate_cost_knobs(ok_eq, Decimal::new(-1, 0), Decimal::ONE).is_err());
         assert!(validate_cost_knobs(ok_eq, Decimal::new(4, 0), Decimal::new(-5, 0)).is_err());
+        // Invalid (upper bound): a rate >= 100% (10_000 bps) drives the slipped
+        // fill price to zero/negative (and a 100%+ fee is equally nonsensical).
+        assert!(validate_cost_knobs(ok_eq, Decimal::new(4, 0), Decimal::new(10_000, 0)).is_err());
+        assert!(validate_cost_knobs(ok_eq, Decimal::new(10_000, 0), Decimal::ONE).is_err());
+        // A large-but-sub-100% rate is still valid (stress configs are allowed).
+        assert!(validate_cost_knobs(ok_eq, Decimal::new(9_999, 0), Decimal::new(9_999, 0)).is_ok());
     }
 
     #[test]
