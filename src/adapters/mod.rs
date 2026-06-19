@@ -16,6 +16,10 @@ pub(crate) mod store;
 // conversion seam. The ONLY module tree where `f64` is permitted.
 pub(crate) mod indicators;
 
+// VS-1.2.1 work-1.03: deterministic backtest event loop. Lives in adapters
+// because it owns the concrete IndicatorEngine.
+pub(crate) mod backtest;
+
 // VS-1.1.4 work-1.01: the SQLite persistence tier — the `Db` pool wrapper (WAL +
 // foreign_keys + busy_timeout connect options), the embedded `MIGRATOR`, and the
 // platform-default db-path resolver. The ONLY module tree where `sqlx` is allowed

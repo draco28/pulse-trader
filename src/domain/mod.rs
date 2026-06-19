@@ -5,6 +5,11 @@
 //! Dependency policy is "zero I/O", not "zero deps": `serde`, `rust_decimal`,
 //! `thiserror`, and `chrono` are permitted.
 
+// VS-1.2.1: the pure-domain backtester foundation — money-math + trade entities
+// (work-1.01) and the MTF-aligned, no-look-ahead candle feed (work-1.02).
+// `pub(crate)` (matching the `dsl`/`strategy` nested-module precedent) so
+// `lib.rs` can curate the public surface via the `domain::backtest::` path.
+pub(crate) mod backtest;
 mod candle;
 mod clock;
 mod dsl;
@@ -20,6 +25,16 @@ pub(crate) mod strategy;
 mod timeframe;
 mod version;
 
+// VS-1.2.1 backtester domain surface: money-math + entities (work-1.01) and the
+// no-look-ahead candle feed (work-1.02). Re-exported here so `lib.rs` can curate
+// the crate surface; an un-re-exported public domain type is a `dead_code` BUILD
+// error under `deny(warnings)`. `AlignedBar` borrows from the input series, so
+// its lifetime is tied to the caller's `CandleSeries`.
+pub use backtest::{
+    AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade,
+    TradeSource, align, apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    resolve_intra_bar_exit, taker_fee,
+};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
