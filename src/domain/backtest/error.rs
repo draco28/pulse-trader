@@ -43,4 +43,12 @@ pub enum BacktestError {
     /// own neutral category so the cause is not mislabelled.
     #[error("indicator engine initialization failed: {0}")]
     EngineInit(String),
+
+    /// A short strategy's take-profit geometry resolves to a non-positive price
+    /// (`target_r × stop_distance_pct ≥ 1`, so `entry × (1 − target_r ×
+    /// stop_distance_pct) ≤ 0`). Such a target can never be reached by positive
+    /// market data, so the loop rejects it fail-fast rather than silently
+    /// behaving as if no take-profit were set.
+    #[error("impossible take-profit geometry: {0}")]
+    ImpossibleTakeProfit(String),
 }

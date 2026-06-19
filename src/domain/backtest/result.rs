@@ -25,7 +25,8 @@ pub struct BacktestResult {
     pub net_pnl: Decimal,
     /// Total taker fees paid across the run.
     pub fees_total: Decimal,
-    /// Total signed funding (paid positive, received negative) across the run.
+    /// Total signed funding P&L delta across the run — **negative when positions
+    /// paid funding, positive when they received** (matches `funding_payment`).
     pub funding_total: Decimal,
     /// Total adverse slippage cost across the run.
     pub slippage_total: Decimal,

@@ -92,8 +92,10 @@ pub struct Trade {
 
     /// Total taker fees paid across all fills (quote currency).
     pub fees_total: Decimal,
-    /// Total funding paid (positive) or received (negative) — the signed sum of
-    /// per-boundary [`funding_payment`](super::cost::funding_payment) deltas.
+    /// Total funding as a signed P&L delta — the signed sum of per-boundary
+    /// [`funding_payment`](super::cost::funding_payment) values: **negative when
+    /// the position paid funding, positive when it received** (a long paying
+    /// positive-rate funding accrues a negative delta).
     pub funding_total: Decimal,
     /// Total adverse slippage cost across all fills (quote currency).
     pub slippage_total: Decimal,

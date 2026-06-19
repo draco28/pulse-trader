@@ -95,9 +95,15 @@ impl<'a> ExitPlan<'a> {
             return Err(BacktestError::NoStopLoss);
         };
         reject_unsupported(compiled.exits())?;
+        let take_profit_target_r = take_profit_target(compiled.exits());
+        reject_impossible_short_tp(
+            compiled.direction(),
+            take_profit_target_r,
+            stop_distance_pct,
+        )?;
         Ok(Self {
             stop_distance_pct,
-            take_profit_target_r: take_profit_target(compiled.exits()),
+            take_profit_target_r,
             signal_exits: signal_exits(compiled.exits()),
             risk_per_trade_pct: compiled.risk().risk_per_trade_pct,
             max_leverage: compiled.risk().max_leverage,
@@ -414,6 +420,33 @@ fn signal_exits(exits: &[CompiledExit]) -> Vec<&CompiledCondition> {
         .collect()
 }
 
+/// Reject a short take-profit whose geometry resolves to a non-positive price.
+///
+/// A short TP sits at `entry · (1 − target_r · stop_distance_pct)`; once
+/// `target_r · stop_distance_pct ≥ 1` that price is `≤ 0` and can never be reached
+/// by positive market data, so the strategy would silently behave as if it had no
+/// take-profit. Fail fast instead. (A long TP is `entry · (1 + …)`, always
+/// positive, so this only applies to shorts.)
+fn reject_impossible_short_tp(
+    direction: Direction,
+    take_profit_target_r: Option<Decimal>,
+    stop_distance_pct: Decimal,
+) -> Result<(), BacktestError> {
+    if direction != Direction::Short {
+        return Ok(());
+    }
+    let Some(target_r) = take_profit_target_r else {
+        return Ok(());
+    };
+    if target_r * stop_distance_pct >= Decimal::ONE {
+        return Err(BacktestError::ImpossibleTakeProfit(format!(
+            "short take-profit at {target_r}R × stop {stop_distance_pct} \
+             resolves to a non-positive price"
+        )));
+    }
+    Ok(())
+}
+
 fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
     for exit in exits {
         match exit {
@@ -531,11 +564,15 @@ mod tests {
         }
     }
 
-    fn compiled(entry: Condition, exits: Vec<ExitRule>) -> CompiledStrategy {
+    fn compiled_dir(
+        entry: Condition,
+        exits: Vec<ExitRule>,
+        direction: Direction,
+    ) -> CompiledStrategy {
         let dsl = StrategyDsl {
             schema_version: SchemaVersion::CURRENT,
             name: "test strategy".to_owned(),
-            direction: Direction::Long,
+            direction,
             entry,
             filters: vec![],
             exits,
@@ -545,6 +582,10 @@ mod tests {
             },
         };
         compile(&validate(&dsl).unwrap()).unwrap()
+    }
+
+    fn compiled(entry: Condition, exits: Vec<ExitRule>) -> CompiledStrategy {
+        compiled_dir(entry, exits, Direction::Long)
     }
 
     fn base_strategy() -> CompiledStrategy {
@@ -737,6 +778,41 @@ mod tests {
             primary.candles[3].open_time
         );
         assert_eq!(result.trades[0].exit_price, d(105));
+    }
+
+    #[test]
+    fn short_take_profit_resolving_nonpositive_is_rejected() {
+        // Short, 50% stop (0.5) × 3R target → tp = entry·(1 − 1.5) < 0, a price the
+        // market can never reach. The plan must reject it, not silently drop the TP.
+        let strategy = compiled_dir(
+            price_entry(),
+            vec![
+                ExitRule::StopLoss {
+                    distance_pct: SweepableValue::Fixed(rate(5, 1)), // 0.5 = 50%
+                },
+                tp(3),
+            ],
+            Direction::Short,
+        );
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+        ]);
+
+        let err = run_backtest(&strategy, &primary, None, &config()).unwrap_err();
+        assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
+    }
+
+    #[test]
+    fn short_take_profit_with_reachable_target_is_accepted() {
+        // Short, 5% stop × 2R target → tp = entry·(1 − 0.10) = 0.9·entry > 0, fine.
+        let strategy = compiled_dir(price_entry(), vec![stop(), tp(2)], Direction::Short);
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+        ]);
+        // Must not error at plan construction (it may simply produce no trades).
+        assert!(run_backtest(&strategy, &primary, None, &config()).is_ok());
     }
 
     #[test]
