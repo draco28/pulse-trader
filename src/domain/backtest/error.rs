@@ -51,4 +51,11 @@ pub enum BacktestError {
     /// behaving as if no take-profit were set.
     #[error("impossible take-profit geometry: {0}")]
     ImpossibleTakeProfit(String),
+
+    /// The cost/equity configuration is out of range — non-positive starting
+    /// equity (the sizing denominator) or a fee/slippage rate outside `[0, 100%)`.
+    /// Enforced at the engine boundary so a non-CLI caller cannot feed the
+    /// sizing/fill math nonsensical inputs.
+    #[error("invalid backtest configuration: {0}")]
+    InvalidConfig(String),
 }

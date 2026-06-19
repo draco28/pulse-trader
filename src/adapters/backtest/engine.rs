@@ -31,6 +31,41 @@ impl Default for BacktestConfig {
     }
 }
 
+impl BacktestConfig {
+    /// Validate the cost/equity knobs before they reach the sizing + fill math.
+    /// Starting equity must be strictly positive (it is the sizing denominator);
+    /// the fee and slippage rates must be in `[0, 10_000)` bps — `[0%, 100%)`: a
+    /// negative rate would invent a favorable fill or a fee rebate this slice does
+    /// not model, and a rate at or above 100% would drive a slipped fill price to
+    /// zero or negative.
+    ///
+    /// # Errors
+    ///
+    /// [`BacktestError::InvalidConfig`] when any knob is out of range.
+    pub fn validate(&self) -> Result<(), BacktestError> {
+        let full_pct_bps = Decimal::new(10_000, 0); // 100%
+        if self.starting_equity <= Decimal::ZERO {
+            return Err(BacktestError::InvalidConfig(format!(
+                "starting equity must be positive (got {})",
+                self.starting_equity
+            )));
+        }
+        if self.taker_fee_bps < Decimal::ZERO || self.taker_fee_bps >= full_pct_bps {
+            return Err(BacktestError::InvalidConfig(format!(
+                "taker fee must be in [0, 10000) bps (got {})",
+                self.taker_fee_bps
+            )));
+        }
+        if self.slippage_bps < Decimal::ZERO || self.slippage_bps >= full_pct_bps {
+            return Err(BacktestError::InvalidConfig(format!(
+                "slippage must be in [0, 10000) bps (got {})",
+                self.slippage_bps
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Run one sequential, deterministic backtest.
 ///
 /// # Errors
@@ -42,6 +77,7 @@ pub fn run_backtest(
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
 ) -> Result<BacktestResult, BacktestError> {
+    config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
@@ -778,6 +814,59 @@ mod tests {
             primary.candles[3].open_time
         );
         assert_eq!(result.trades[0].exit_price, d(105));
+    }
+
+    #[test]
+    fn config_validate_rejects_out_of_range_cost_knobs() {
+        let ok = BacktestConfig {
+            starting_equity: d(10_000),
+            taker_fee_bps: d(4),
+            slippage_bps: Decimal::ONE,
+        };
+        assert!(ok.validate().is_ok());
+        // Zero/negative equity (the sizing denominator).
+        assert!(matches!(
+            BacktestConfig {
+                starting_equity: Decimal::ZERO,
+                ..ok
+            }
+            .validate(),
+            Err(BacktestError::InvalidConfig(_))
+        ));
+        // Negative fee / slippage, and a rate >= 100% (10_000 bps).
+        assert!(
+            BacktestConfig {
+                taker_fee_bps: d(-1),
+                ..ok
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            BacktestConfig {
+                slippage_bps: d(10_000),
+                ..ok
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_backtest_rejects_invalid_config_at_the_engine_boundary() {
+        // A non-CLI caller passing a bad config must be rejected by the engine
+        // itself, not just by the CLI guard.
+        let bad = BacktestConfig {
+            starting_equity: Decimal::ZERO,
+            taker_fee_bps: Decimal::ZERO,
+            slippage_bps: Decimal::ZERO,
+        };
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+        ]);
+        let err = run_backtest(&base_strategy(), &primary, None, &bad).unwrap_err();
+        assert!(matches!(err, BacktestError::InvalidConfig(_)));
     }
 
     #[test]
