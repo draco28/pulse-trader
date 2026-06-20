@@ -21,7 +21,11 @@ fn indicators_cli_runs_over_fixture() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.first(), Some(&"open_time\trsi:14\tema:50\tadx:14"));
-    assert_eq!(lines.len(), 2_979, "header + 2976 candle rows + summary + disclaimer footer");
+    assert_eq!(
+        lines.len(),
+        2_979,
+        "header + 2976 candle rows + summary + disclaimer footer"
+    );
 
     assert_eq!(
         lines[1].split('\t').collect::<Vec<_>>()[1..],
