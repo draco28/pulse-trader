@@ -552,11 +552,28 @@ mod prop_tests {
             };
             let stop_dist = (entry - stop).abs();
             let budget = equity * risk;
+            // Pre-quantization, cap-applied size (effective cap = min(strategy
+            // leverage, exchange max_leverage) — mirrors compute_position_size).
+            let pre_quant =
+                risk_capped_qty(equity, risk, entry, stop, lev.min(filters.max_leverage))
+                    .unwrap();
             if let SizingOutcome::Sized(qty) = compute_position_size(
                 equity, risk, entry, stop, lev, &filters,
             ).unwrap() {
-                // Flooring + cap only reduce ⇒ realized risk ≤ budget.
-                prop_assert!(qty * stop_dist <= budget);
+                // Cap + lot-step flooring only ever REDUCE the size vs. the
+                // pre-quantization risk_capped_qty — monotone, exact, no rounding
+                // slack. This is the bulletproof "quantization never sizes up" guard.
+                prop_assert!(qty <= pre_quant);
+                // After real lot-step flooring (lot_step > 0), realized risk is
+                // strictly within budget — the slice's post-flooring `≤` demo
+                // criterion. With lot_step == 0 there is NO flooring, so qty is the
+                // pre-quantization size, which equals equity·risk / |entry−stop| only
+                // up to `rust_decimal` division rounding (round-half-even can land a
+                // sub-ulp ABOVE budget; the identity proptests cover the `==` leg), so
+                // the strict budget bound is asserted only on the flooring path.
+                if filters.lot_step > Decimal::ZERO {
+                    prop_assert!(qty * stop_dist <= budget);
+                }
             }
         }
 

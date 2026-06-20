@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn unknown_pair_errors_unknown_symbol() {
-        let adapter = BinanceAdapter::default();
+        let adapter = BinanceAdapter::new();
         let err = adapter
             .symbol_filters(&Pair::new("ETHUSDT"))
             .expect_err("non-BTCUSDT pair is unknown");
