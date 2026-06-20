@@ -21,7 +21,7 @@ fn indicators_cli_runs_over_fixture() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.first(), Some(&"open_time\trsi:14\tema:50\tadx:14"));
-    assert_eq!(lines.len(), 2_978, "header + 2976 candle rows + summary");
+    assert_eq!(lines.len(), 2_979, "header + 2976 candle rows + summary + disclaimer footer");
 
     assert_eq!(
         lines[1].split('\t').collect::<Vec<_>>()[1..],
@@ -34,10 +34,13 @@ fn indicators_cli_runs_over_fixture() {
     assert_eq!(lines[49].split('\t').collect::<Vec<_>>()[2], "—");
     assert_ne!(lines[50].split('\t').collect::<Vec<_>>()[2], "—");
 
+    // The second-to-last line is the summary; the last line is the disclaimer footer.
+    assert_eq!(
+        lines[lines.len() - 2],
+        "summary\tcandles=2976\trsi:14_first_row=15\tema:50_first_row=50\tadx:14_first_row=28"
+    );
     assert_eq!(
         lines.last(),
-        Some(
-            &"summary\tcandles=2976\trsi:14_first_row=15\tema:50_first_row=50\tadx:14_first_row=28"
-        )
+        Some(&"\u{26a0} Not financial advice \u{2014} hypothetical results. See DISCLAIMER.md")
     );
 }

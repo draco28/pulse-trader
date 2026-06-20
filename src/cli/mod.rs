@@ -28,7 +28,12 @@ use strategy::{StrategyArgs, run_strategy};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
 #[derive(Debug, Parser)]
-#[command(name = "pulse", version, about)]
+#[command(
+    name = "pulse",
+    version,
+    about,
+    long_about = "`pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI PoC).\n\nNot financial advice. See DISCLAIMER.md. Trading carries substantial risk of loss."
+)]
 pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]
