@@ -1,3 +1,9 @@
+# PulseTrader
+
+> AI-orchestrated crypto-futures strategy development — describe a target in natural language; the agent composes a DSL strategy, a Rust engine backtests it, and an AI coach iterates. Source-available, non-commercial.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a high-level overview.
+
 ## License
 
 PulseTrader is **source-available, non-commercial** — licensed under the
