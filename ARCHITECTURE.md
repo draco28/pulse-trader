@@ -14,7 +14,7 @@ pulse-trader/
 │   ├── adapters/      # Binance, SQLite, Parquet, indicator implementations
 │   ├── agent/         # Agent orchestration (PulseHive-backed)
 │   ├── cli/           # CLI surface (proof-of-concept entry point)
-│   └── tauri/         # Tauri command-bus stubs (future native-app shell)
+│   └── tauri/         # Tauri command-bus stubs (scaffolded; shares this Rust core)
 ├── docs/adr/          # Architecture Decision Records
 ├── migrations/        # sqlx migration files for the SQLite schema
 ├── tests/             # Integration tests
@@ -66,14 +66,13 @@ sidecar process.
 ### `cli/` — command-line surface
 
 The `pulse` binary entry point. Parses arguments via `clap`, wires up
-adapters, and drives the compose → backtest → coach loop. The CLI is a
-proof-of-concept proving ground; the end product is the native macOS app.
+adapters, and drives the compose → backtest → coach loop.
 
 ### `tauri/` — desktop shell stubs
 
-Stub module for the future Tauri command bus. The Tauri desktop app will
-share this same Rust core; the CLI and the app differ only at this outermost
-layer.
+Stub module for the Tauri command bus. The `tauri/` layer is scaffolded here
+and shares the same Rust core; the CLI and the Tauri shell differ only at this
+outermost layer.
 
 ---
 
@@ -85,8 +84,8 @@ Four storage tiers; no server processes, no Postgres, no Redis.
 
 - Path: `~/Library/Application Support/PulseTrader/pulse.db`
 - Managed by sqlx with compile-time-checked queries and `sqlx migrate`.
-- Exact version pin: `sqlx = "=0.8.6"` (determinism — see ADR-0007 rationale
-  in `docs/adr/`).
+- Exact version pin: `sqlx = "=0.8.6"` (determinism — see the decision queue
+  in [ADR-0001](docs/adr/0001-record-architecture-decisions.md)).
 - `StrategyVersion` rows are **immutable by DB trigger** (`BEFORE UPDATE` /
   `BEFORE DELETE` each `RAISE(ABORT, …)`) — see [ADR-0010](docs/adr/0010-strategyversion-identity-immutability-provenance-storage.md).
 - Startup protocol: if a schema migration would alter a table that already
