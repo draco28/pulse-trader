@@ -67,3 +67,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4   # SHA-pinned in Task 9
       - run: bash .github/scripts/check-no-private-docs.sh
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4   # SHA-pinned in Task 9
+      - uses: EmbarkStudios/cargo-deny-action@v2   # SHA-pinned in Task 9
