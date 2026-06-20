@@ -58,3 +58,12 @@ jobs:
           DATABASE_URL=sqlite://ci-prepare.db sqlx migrate run
       - name: sqlx prepare --check
         run: DATABASE_URL=sqlite://ci-prepare.db cargo sqlx prepare --check
+
+  private-docs-guard:
+    name: private-docs-guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4   # SHA-pinned in Task 9
+      - run: bash .github/scripts/check-no-private-docs.sh
