@@ -32,7 +32,7 @@ use strategy::{StrategyArgs, run_strategy};
     name = "pulse",
     version,
     about,
-    long_about = "`pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI PoC).\n\nNot financial advice. See DISCLAIMER.md. Trading carries substantial risk of loss."
+    long_about = "pulse — AI-orchestrated crypto-futures strategy development (v1 CLI PoC).\n\nNot financial advice. See DISCLAIMER.md. Trading carries substantial risk of loss."
 )]
 pub struct Cli {
     /// The subcommand to run.

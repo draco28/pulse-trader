@@ -1,7 +1,11 @@
 //! CLI disclaimer assertions (VS-1.2.3 CX3 runtime disclaimer).
 //!
 //! Verifies that `pulse --help` carries the "not financial advice" disclaimer
-//! and that `pulse indicators` output ends with the disclaimer footer.
+//! via the clap `long_about` string.
+//!
+//! The disclaimer footer on `pulse indicators` output is covered by the
+//! fixture-backed `tests/indicators_cli_runs_over_fixture.rs` (robust — has
+//! proper candle fixture setup and a `lines.last()` assertion).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::Command;
@@ -22,28 +26,5 @@ fn cli_help_shows_not_financial_advice() {
     assert!(
         combined.to_lowercase().contains("not financial advice"),
         "pulse --help must carry the disclaimer; got:\n{combined}"
-    );
-}
-
-/// `pulse indicators` output must end with the disclaimer footer line.
-#[test]
-fn indicators_output_ends_with_disclaimer_footer() {
-    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
-        .args(["indicators", "--pair", "BTCUSDT", "--tf", "M15"])
-        .output()
-        .expect("run pulse indicators");
-
-    assert!(
-        output.status.success(),
-        "pulse indicators must succeed; stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
-    let last_line = stdout.lines().last().expect("output has lines");
-    assert_eq!(
-        last_line,
-        "\u{26a0} Not financial advice \u{2014} hypothetical results. See DISCLAIMER.md",
-        "last line of indicators output must be the disclaimer footer"
     );
 }
