@@ -225,6 +225,28 @@ pub use domain::{
     resolve_intra_bar_exit, taker_fee,
 };
 
+// VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
+// BACKLOG-5) — the `pulse-broker` money-math home. `compute_position_size` is the
+// single sizer sim + (future v3) live execution share (NFR-3 by construction);
+// `risk_capped_qty` is its pre-quantization core (VS-1.2.1's `position_size`,
+// moved verbatim). `SymbolFilters` (+ `unconstrained()`) is the exchange-filter
+// value type; `SizingOutcome`/`SkipReason` are the skip-and-count substrate (2.04
+// wires, 2.05 renders). `ExchangeAdapter` is the exchange-metadata port;
+// `ExchangeError` its dedicated error (audit C5). REQUIRED under `deny(warnings)`
+// + `pub(crate) mod domain` — an un-re-exported public domain type is a
+// `dead_code` build error, not a warning.
+pub use domain::{
+    ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SymbolFilters,
+    compute_position_size, risk_capped_qty,
+};
+
+// VS-1.2.2 work-2.01: the `BinanceAdapter` exchange-metadata implementor
+// (`adapters/broker`), returning pinned BTCUSDT USD-M futures filters. REQUIRED
+// under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter type
+// unused outside its module is a `dead_code` build error. 2.04 wires it into
+// `run_backtest`'s sizing call through the `ExchangeAdapter` port.
+pub use adapters::broker::BinanceAdapter;
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which

@@ -4,6 +4,12 @@
 //! - [`StrategyRepository`] — the strategy-tree persistence port (VS-1.1.4,
 //!   FR-4 / FR-11); the `sqlx` adapter (1.03) implements it, the CLI (1.05) and
 //!   agent layer consume it generically (`<R: StrategyRepository>`).
+//! - [`ExchangeAdapter`] — the exchange-metadata port (VS-1.2.2, FR-5 / NFR-3);
+//!   `BinanceAdapter` (`adapters/broker`) implements it, the sizer consumes the
+//!   returned [`SymbolFilters`](crate::domain::sizing::SymbolFilters). Minimal v1
+//!   surface (NO order/account/balance methods); returns a dedicated
+//!   [`ExchangeError`](crate::domain::exchange::ExchangeError), not
+//!   `BacktestError` (audit C5).
 //!
 //! Hexagonal inbound-of-outer ports (NFR-9): adapters (`BinanceDataSource` in
 //! WI-02, a `Parquet`-replay source later) implement them; the engine consumes
@@ -20,10 +26,35 @@ use std::future::Future;
 
 use crate::domain::candle::Candle;
 use crate::domain::error::DataError;
+use crate::domain::exchange::ExchangeError;
 use crate::domain::pair::Pair;
 use crate::domain::series::CandleSeries;
+use crate::domain::sizing::SymbolFilters;
 use crate::domain::strategy::{NewVersion, Strategy, StrategyId, StrategyVersion, VersionId};
 use crate::domain::timeframe::Timeframe;
+
+/// The exchange-metadata port (VS-1.2.2, FR-5 / NFR-3) — audit C3 / C5.
+///
+/// Supplies a symbol's [`SymbolFilters`] (lot step / min qty / min notional /
+/// exchange max-leverage) so the shared
+/// [`compute_position_size`](crate::domain::sizing::compute_position_size) can
+/// apply exchange constraints. **Minimal v1 surface** — NO order / cancel /
+/// account / balance methods (those land with live execution in v3). Returns the
+/// **dedicated** [`ExchangeError`] (NOT [`DataError`] / `BacktestError`) because
+/// the port serves live execution too (audit C5).
+///
+/// Synchronous: v1's only implementor (`BinanceAdapter`) returns **pinned
+/// consts** with no I/O. A future networked filter-fetch adapter can wrap a cache
+/// behind the same sync surface, or this method gains an async sibling additively.
+pub trait ExchangeAdapter {
+    /// Return the [`SymbolFilters`] for `pair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::UnknownSymbol`] when the adapter has no filters
+    /// pinned for `pair` (v1's `BinanceAdapter` only knows `BTCUSDT`).
+    fn symbol_filters(&self, pair: &Pair) -> Result<SymbolFilters, ExchangeError>;
+}
 
 /// A source of historical and incremental candle data.
 ///
