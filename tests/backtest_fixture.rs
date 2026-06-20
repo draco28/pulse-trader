@@ -134,6 +134,34 @@ fn golden_backtest_reproduces_frozen_trade_count_and_pnl() {
     );
 }
 
+/// FR-6 / C5 MFE/MAE demo invariant: every completed golden trade satisfies
+/// `mfe_r >= 0 ∧ mae_r <= 0` (the slice's MFE/MAE auto-demo criterion). Holds by
+/// the init-0 running sample regardless of price path. This reads the *new* fields
+/// only — it does NOT touch `GOLDEN_NET_PNL` / `GOLDEN_TRADE_COUNT` (those refreeze
+/// in 2.04, not here).
+#[test]
+fn golden_trades_have_nonneg_mfe_nonpos_mae() {
+    let primary = load_primary();
+    let result = run_golden(&primary);
+
+    assert!(
+        !result.trades.is_empty(),
+        "the golden run must produce trades for the MFE/MAE invariant to be meaningful"
+    );
+    for (i, trade) in result.trades.iter().enumerate() {
+        assert!(
+            trade.mfe_r >= Decimal::ZERO,
+            "trade {i}: mfe_r must be >= 0, got {}",
+            trade.mfe_r
+        );
+        assert!(
+            trade.mae_r <= Decimal::ZERO,
+            "trade {i}: mae_r must be <= 0, got {}",
+            trade.mae_r
+        );
+    }
+}
+
 /// C2 non-vacuity: the auto-demo would be meaningless if the chosen params
 /// produced 0 (or only intra-bar) trades, or never held across a funding
 /// boundary. Assert >= 3 completed trades, >= 1 trade crossing an 8h funding

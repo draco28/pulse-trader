@@ -372,6 +372,8 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             realized_pnl: Decimal::new(1_484, 0),
             realized_r: Decimal::new(2, 0),
+            mfe_r: Decimal::new(25, 1), // 2.5; render of MFE/MAE is 2.05's job
+            mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
         }
