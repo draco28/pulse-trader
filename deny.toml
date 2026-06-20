@@ -100,7 +100,6 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
     # BSL-1.0 (Boost): xxhash-rust 0.8.15 (transitive via polars-core)
     "BSL-1.0",
     # CDLA-Permissive-2.0: webpki-roots 1.0.7 (transitive via reqwest → hyper-rustls)
@@ -117,6 +116,10 @@ exceptions = [
     # Each entry is the crate and version constraint, and its specific allow
     # list
     #{ allow = ["Zlib"], crate = "adler32" },
+    # option-ext 0.2.0 (transitive via directories → dirs-sys) is MPL-2.0.
+    # Named exception keeps the global allow-list permissive-only; any future
+    # MPL dep will fail the gate until consciously added here.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
 ]
 
 # Some crates don't have (easily) machine readable licensing information,
