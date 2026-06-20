@@ -42,6 +42,10 @@ pub use backtest::{
     TradeSource, align, apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
+// VS-1.2.2 work-2.03: the pure regime surface (EMA50/200 + ADX14 classifier).
+// Re-exported here so `lib.rs` can curate the crate surface; an un-re-exported
+// public domain type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every

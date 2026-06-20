@@ -247,6 +247,16 @@ pub use domain::{
 // `run_backtest`'s sizing call through the `ExchangeAdapter` port.
 pub use adapters::broker::BinanceAdapter;
 
+// VS-1.2.2 work-2.03: the regime classifier surface (FR-5 / FR-6, BACKLOG-5).
+// `Regime`/`RegimeBreakdown`/`RegimeCell`/`classify`/`ADX_TREND_THRESHOLD` are
+// the pure domain half; `RegimeDetector` is the stateful adapter composing the
+// VS-1.1.3 `Ema`/`Adx` adapters. REQUIRED under `deny(warnings)` + `pub(crate)
+// mod domain`/`mod adapters` — an un-re-exported public item is a `dead_code`
+// build error, not a warning. 2.04 steps the detector over the run + aggregates
+// the breakdown onto `BacktestResult`; 2.05 renders it.
+pub use adapters::backtest::RegimeDetector;
+pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
