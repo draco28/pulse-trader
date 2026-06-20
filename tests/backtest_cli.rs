@@ -97,6 +97,67 @@ fn backtest_cli_runs_over_fixture_and_shows_costs() {
     );
 }
 
+/// The VS-1.2.2 work-2.05 user demo criterion (the slice's headline payoff): the
+/// human `pulse backtest` readout carries per-trade `mfe_r`/`mae_r`/`regime`
+/// columns AND a summary regime-breakdown block with at least one **non-`unknown`**
+/// regime, plus an observable `skipped_entries=` line.
+#[test]
+fn backtest_cli_renders_regime_breakdown_and_mfe_mae() {
+    let (_dir, dsl_path) = write_minimal_dsl();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pulse"))
+        .args([
+            "backtest",
+            "--dsl",
+            &dsl_path,
+            "--pair",
+            "BTCUSDT",
+            "--tf",
+            "M15",
+            "--store",
+            "tests/fixtures/btcusdt-1m-store",
+        ])
+        .output()
+        .expect("run pulse backtest");
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+
+    // Per-trade excursion + entry-regime columns (the trade-log readout).
+    assert!(
+        stdout.contains("mfe_r") && stdout.contains("mae_r") && stdout.contains("regime"),
+        "trade-log header must name mfe_r/mae_r/regime; stdout was:\n{stdout}"
+    );
+
+    // The summary regime-breakdown block (one `regime=<label>` line per regime).
+    assert!(
+        stdout.contains("regime="),
+        "summary must show a regime breakdown line; stdout was:\n{stdout}"
+    );
+
+    // At least one NON-`unknown` regime must appear (the EMA200/ADX warms at M15
+    // bar ~200 of ~2976, so the bulk of the run is in a determined regime).
+    let has_non_unknown = stdout.contains("regime=trending_up")
+        || stdout.contains("regime=trending_down")
+        || stdout.contains("regime=ranging");
+    assert!(
+        has_non_unknown,
+        "at least one non-`unknown` regime must appear in the breakdown; stdout was:\n{stdout}"
+    );
+
+    // The skipped-entries observability line always prints (even at zero).
+    assert!(
+        stdout.contains("skipped_entries="),
+        "summary must show a skipped_entries line; stdout was:\n{stdout}"
+    );
+}
+
 /// `--json` emits a structured object carrying the trades + run-level cost
 /// totals (the same `BacktestResult` surface the demo reads, machine-parseable).
 #[test]
@@ -141,6 +202,17 @@ fn backtest_cli_json_emits_structured_result() {
             && parsed.get("funding_total").is_some()
             && parsed.get("slippage_total").is_some(),
         "JSON must carry the cost totals; got:\n{stdout}"
+    );
+    // VS-1.2.2 work-2.05: the JSON path already serializes the regime breakdown +
+    // skipped-entries aggregate (serde rides along — no extra render code), but the
+    // e2e asserts they are present so a regression in the result shape is caught.
+    assert!(
+        parsed.get("regime_breakdown").is_some(),
+        "JSON must carry the regime breakdown; got:\n{stdout}"
+    );
+    assert!(
+        parsed.get("skipped_entries").is_some(),
+        "JSON must carry the skipped-entries aggregate; got:\n{stdout}"
     );
 }
 
