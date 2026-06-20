@@ -39,7 +39,7 @@ mod version;
 // its lifetime is tied to the caller's `CandleSeries`.
 pub use backtest::{
     AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade,
-    TradeSource, align, apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    TradeSource, align, apply_slippage, funding_payment, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
 // VS-1.2.2 work-2.03: the pure regime surface (EMA50/200 + ADX14 classifier).
@@ -84,7 +84,8 @@ pub use port::{ExchangeAdapter, MarketDataSource, StrategyRepository};
 pub use exchange::ExchangeError;
 pub use series::{CandleSeries, Gap};
 pub use sizing::{
-    SizingOutcome, SkipReason, SymbolFilters, compute_position_size, risk_capped_qty,
+    SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters, compute_position_size,
+    risk_capped_qty,
 };
 pub use timeframe::Timeframe;
 pub use version::DataVersion;

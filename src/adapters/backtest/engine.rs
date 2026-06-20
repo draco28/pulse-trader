@@ -2,12 +2,14 @@
 
 use rust_decimal::Decimal;
 
+use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, Direction, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource, align,
-    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
-    resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, Direction, ExitReason, Fill, IntraBarExit, Regime, RegimeBreakdown, Side,
+    SizingOutcome, SkippedEntryCounts, SymbolFilters, Trade, TradeSource, align, apply_slippage,
+    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
+    stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -76,16 +78,35 @@ pub fn run_backtest(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
+    filters: &SymbolFilters,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
+    // The regime detector is stepped over the PRIMARY M15 series (v1, README C7),
+    // independently of the strategy's indicators — so a trade is tagged with the
+    // market regime regardless of which indicators the strategy declares.
+    let mut detector = RegimeDetector::new();
     let mut state = LoopState::default();
     let direction = compiled.direction();
 
     for bar in align(primary, htf) {
-        fill_pending_entry(&mut state, bar.primary, direction, &exit_plan, config)?;
+        // The regime in effect for an entry filling at THIS bar's open is the one
+        // determined by already-closed bars (the detector is stepped at the
+        // bottom of the loop, mirroring `engine.step`) — the same no-look-ahead
+        // discipline the entry signal itself obeys. `current()` is `Unknown` until
+        // the EMA200/ADX warm.
+        let regime = detector.current();
+        fill_pending_entry(
+            &mut state,
+            bar.primary,
+            direction,
+            &exit_plan,
+            config,
+            filters,
+            regime,
+        )?;
         if let Some(position) = state.position.as_mut() {
             // Fold this bar (the just-opened entry bar, or any held bar including
             // the full exit bar) into the running MFE/MAE before the close reads
@@ -95,6 +116,11 @@ pub fn run_backtest(
         close_on_bar_open_or_price(&mut state, primary, bar.primary, config)?;
 
         engine.step(bar.primary);
+        // Advance the regime detector in lock-step with the indicator engine, once
+        // per primary bar (README C7). The order vs. `engine.step` is irrelevant
+        // (independent state); both step after fill/close so the next bar reads
+        // only already-closed information.
+        detector.step(bar.primary);
 
         if state.position.is_some()
             && state.pending_exit.is_none()
@@ -165,16 +191,26 @@ struct LoopState {
     pending_exit: Option<PendingExit>,
     position: Option<OpenPosition>,
     trades: Vec<Trade>,
+    /// Bounded O(1) per-reason tally of entries the exchange-constrained sizer
+    /// suppressed over the run (audit C4); surfaced on the result.
+    skipped_entries: SkippedEntryCounts,
 }
 
 impl LoopState {
     fn into_result(self) -> BacktestResult {
+        let mut regime_breakdown = RegimeBreakdown::new();
+        for trade in &self.trades {
+            // Aggregate each closed trade into its entry-bar regime cell (FR-5).
+            regime_breakdown.record(trade.regime, trade.realized_pnl);
+        }
         let mut result = BacktestResult {
             trades: self.trades,
             net_pnl: Decimal::ZERO,
             fees_total: Decimal::ZERO,
             funding_total: Decimal::ZERO,
             slippage_total: Decimal::ZERO,
+            regime_breakdown,
+            skipped_entries: self.skipped_entries,
         };
         for trade in &result.trades {
             result.net_pnl += trade.realized_pnl;
@@ -214,6 +250,9 @@ struct OpenPosition {
     /// Running maximum adverse excursion in R-multiples (C5). Initialized to 0 at
     /// entry; `update_excursion` walks it down over each held bar.
     mae_r: Decimal,
+    /// The market regime in effect at the entry-fill bar (FR-6), carried to the
+    /// `Trade` at close so `RegimeBreakdown` can aggregate it.
+    regime: Regime,
 }
 
 fn fill_pending_entry(
@@ -222,6 +261,8 @@ fn fill_pending_entry(
     direction: Direction,
     plan: &ExitPlan<'_>,
     config: &BacktestConfig,
+    filters: &SymbolFilters,
+    regime: Regime,
 ) -> Result<(), BacktestError> {
     let Some(pending) = state.pending_entry.take() else {
         return Ok(());
@@ -233,13 +274,24 @@ fn fill_pending_entry(
     let raw_entry = candle.open;
     let entry_price = apply_slippage(raw_entry, config.slippage_bps, direction, Side::Entry);
     let stop = stop_price(entry_price, plan.stop_distance_pct, direction);
-    let qty = position_size(
+    // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim
+    // and (future v3) live. `NoStopLoss` (zero stop distance) still propagates
+    // fail-fast (G5/#20). A `Skipped` outcome consumes the pending entry (it is
+    // NOT retried) and increments the matching `SkippedEntryCounts` cell.
+    let qty = match compute_position_size(
         config.starting_equity,
         plan.risk_per_trade_pct,
         entry_price,
         stop,
         plan.max_leverage,
-    )?;
+        filters,
+    )? {
+        SizingOutcome::Sized(qty) => qty,
+        SizingOutcome::Skipped(reason) => {
+            state.skipped_entries.record(reason);
+            return Ok(());
+        }
+    };
     let entry_fee = taker_fee(qty * entry_price, config.taker_fee_bps);
     state.position = Some(OpenPosition {
         direction,
@@ -255,6 +307,7 @@ fn fill_pending_entry(
         entry_slippage: (entry_price - raw_entry).abs() * qty,
         mfe_r: Decimal::ZERO,
         mae_r: Decimal::ZERO,
+        regime,
     });
     Ok(())
 }
@@ -518,6 +571,9 @@ fn close_position(
         mae_r: position.mae_r,
         exit_reason: exit.reason,
         source: TradeSource::Backtest,
+        // The market regime captured at the entry-fill bar (FR-6), carried
+        // through to the trade record for `RegimeBreakdown` aggregation.
+        regime: position.regime,
     });
     Ok(())
 }
@@ -611,8 +667,9 @@ mod tests {
     use super::{BacktestConfig, OpenPosition, run_backtest, update_excursion};
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
-        Direction, ExitReason, ExitRule, Pair, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, Timeframe, ValueSource, compile, realized_pnl, validate,
+        Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
+        StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile, realized_pnl,
+        validate,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
@@ -758,7 +815,14 @@ mod tests {
             candle(1, 110, 112, 108, 111),
             candle(2, 120, 121, 119, 120),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -773,7 +837,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert!(result.trades.is_empty());
     }
@@ -785,7 +856,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             candle(2, 100, 120, 90, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
         assert_eq!(result.trades[0].exit_price, d(95));
@@ -800,7 +878,14 @@ mod tests {
             funding_candle(3, 100, 101, 99, 100),
             candle(4, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].funding_total, d(-2));
@@ -814,7 +899,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             funding_candle(2, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].funding_total, Decimal::ZERO);
@@ -828,7 +920,14 @@ mod tests {
             candle(2, 100, 101, 99, 100),
             funding_candle(3, 100, 101, 94, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
@@ -845,7 +944,14 @@ mod tests {
             }],
         );
 
-        let err = run_backtest(&strategy, &primary, None, &config()).unwrap_err();
+        let err = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
     }
 
@@ -872,11 +978,25 @@ mod tests {
         );
 
         assert!(matches!(
-            run_backtest(&trailing, &primary, None, &config()).unwrap_err(),
+            run_backtest(
+                &trailing,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
         assert!(matches!(
-            run_backtest(&time, &primary, None, &config()).unwrap_err(),
+            run_backtest(
+                &time,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
     }
@@ -888,7 +1008,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             candle(2, 100, 101, 99, 103),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::EndOfData);
@@ -901,7 +1028,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert!(result.trades.is_empty());
     }
@@ -924,7 +1058,14 @@ mod tests {
             candle(2, 100, 101, 99, 160),
             candle(3, 105, 106, 104, 105),
         ]);
-        let result = run_backtest(&strategy, &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::Signal);
@@ -970,7 +1111,14 @@ mod tests {
             candle(2, 100, 101, 99, 160),
             candle(3, 100, 101, 90, 100),
         ]);
-        let result = run_backtest(&strategy, &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -1017,7 +1165,14 @@ mod tests {
             candle(2, 100, 101, 99, 160),
             candle(3, 160, 161, 159, 160),
         ]);
-        let result = run_backtest(&strategy, &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -1049,7 +1204,14 @@ mod tests {
             candle(2, 100, 101, 99, 160),
             candle(3, 90, 95, 89, 92),
         ]);
-        let result = run_backtest(&strategy, &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -1074,7 +1236,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             candle(2, 100, 110, 96, 105),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -1103,7 +1272,14 @@ mod tests {
             candle(2, 100, 130, 90, 100),
             candle(3, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert!(!result.trades.is_empty());
         for trade in &result.trades {
@@ -1148,6 +1324,7 @@ mod tests {
                 entry_slippage: Decimal::ZERO,
                 mfe_r: Decimal::ZERO,
                 mae_r: Decimal::ZERO,
+                regime: Regime::Unknown,
             };
             for (lo_off, span, up_off) in &bars {
                 // Build a coherent OHLC bar around the entry price: low <= open,
@@ -1213,7 +1390,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let err = run_backtest(&base_strategy(), &primary, None, &bad).unwrap_err();
+        let err = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &bad,
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BacktestError::InvalidConfig(_)));
     }
 
@@ -1236,7 +1420,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
         ]);
 
-        let err = run_backtest(&strategy, &primary, None, &config()).unwrap_err();
+        let err = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
     }
 
@@ -1249,7 +1440,16 @@ mod tests {
             candle(1, 100, 101, 99, 100),
         ]);
         // Must not error at plan construction (it may simply produce no trades).
-        assert!(run_backtest(&strategy, &primary, None, &config()).is_ok());
+        assert!(
+            run_backtest(
+                &strategy,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1268,7 +1468,14 @@ mod tests {
             candle(2, 100, 105, 99, 100),
             funding_candle(3, 100, 105, 99, 103),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &cfg).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &cfg,
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];

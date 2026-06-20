@@ -15,7 +15,6 @@ mod collision;
 mod cost;
 mod error;
 mod result;
-mod sizing;
 mod trade;
 // work-1.02: the MTF-aligned, no-look-ahead candle feed.
 mod feed;
@@ -33,5 +32,4 @@ pub use error::BacktestError;
 pub use feed::{AlignedBar, align};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
-pub use sizing::position_size;
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

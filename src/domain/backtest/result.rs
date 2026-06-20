@@ -9,7 +9,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use super::regime::RegimeBreakdown;
 use super::trade::Trade;
+use crate::domain::sizing::SkippedEntryCounts;
 
 /// The result of one backtest run: the trade log plus run-level totals.
 ///
@@ -30,6 +32,18 @@ pub struct BacktestResult {
     pub funding_total: Decimal,
     /// Total adverse slippage cost across the run.
     pub slippage_total: Decimal,
+
+    /// Per-regime trade-count + net-P&L breakdown over the run (FR-5, VS-1.2.2
+    /// work-2.04), aggregated in `into_result` by feeding each trade's
+    /// `(regime, realized_pnl)` to [`RegimeBreakdown::record`]. **Deliberately
+    /// NOT a frozen golden constant** — it is threshold-on-`f64`-EMA/ADX derived
+    /// and inherits the deferred #29 cross-arch determinism caveat (deterministic
+    /// on the v1 pinned toolchain, not byte-portable). 2.05 renders it.
+    pub regime_breakdown: RegimeBreakdown,
+    /// Per-reason tally of entries the exchange-constrained sizer suppressed over
+    /// the run (audit C4): a bounded O(1) [`SkippedEntryCounts`] (sub-lot /
+    /// sub-notional / leverage-capped), populated in `into_result`. 2.05 renders.
+    pub skipped_entries: SkippedEntryCounts,
 }
 
 #[cfg(test)]
@@ -45,6 +59,8 @@ mod tests {
             fees_total: Decimal::ZERO,
             funding_total: Decimal::ZERO,
             slippage_total: Decimal::ZERO,
+            regime_breakdown: crate::domain::backtest::RegimeBreakdown::new(),
+            skipped_entries: crate::domain::sizing::SkippedEntryCounts::new(),
         }
     }
 
