@@ -2,12 +2,14 @@
 
 use rust_decimal::Decimal;
 
+use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, Direction, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource, align,
-    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
-    resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, Direction, ExitReason, Fill, IntraBarExit, Regime, RegimeBreakdown, Side,
+    SizingOutcome, SkippedEntryCounts, SymbolFilters, Trade, TradeSource, align, apply_slippage,
+    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
+    stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -76,19 +78,49 @@ pub fn run_backtest(
     primary: &CandleSeries,
     htf: Option<&CandleSeries>,
     config: &BacktestConfig,
+    filters: &SymbolFilters,
 ) -> Result<BacktestResult, BacktestError> {
     config.validate()?;
     let exit_plan = ExitPlan::from_strategy(compiled)?;
     let mut engine =
         IndicatorEngine::new(compiled).map_err(|err| BacktestError::EngineInit(err.to_string()))?;
+    // The regime detector is stepped over the PRIMARY M15 series (v1, README C7),
+    // independently of the strategy's indicators — so a trade is tagged with the
+    // market regime regardless of which indicators the strategy declares.
+    let mut detector = RegimeDetector::new();
     let mut state = LoopState::default();
     let direction = compiled.direction();
 
     for bar in align(primary, htf) {
-        fill_pending_entry(&mut state, bar.primary, direction, &exit_plan, config)?;
+        // The regime in effect for an entry filling at THIS bar's open is the one
+        // determined by already-closed bars (the detector is stepped at the
+        // bottom of the loop, mirroring `engine.step`) — the same no-look-ahead
+        // discipline the entry signal itself obeys. `current()` is `Unknown` until
+        // the EMA200/ADX warm.
+        let regime = detector.current();
+        fill_pending_entry(
+            &mut state,
+            bar.primary,
+            direction,
+            &exit_plan,
+            config,
+            filters,
+            regime,
+        )?;
+        if let Some(position) = state.position.as_mut() {
+            // Fold this bar (the just-opened entry bar, or any held bar including
+            // the full exit bar) into the running MFE/MAE before the close reads
+            // it. C5: after fill, before close.
+            update_excursion(position, bar.primary);
+        }
         close_on_bar_open_or_price(&mut state, primary, bar.primary, config)?;
 
         engine.step(bar.primary);
+        // Advance the regime detector in lock-step with the indicator engine, once
+        // per primary bar (README C7). The order vs. `engine.step` is irrelevant
+        // (independent state); both step after fill/close so the next bar reads
+        // only already-closed information.
+        detector.step(bar.primary);
 
         if state.position.is_some()
             && state.pending_exit.is_none()
@@ -159,16 +191,26 @@ struct LoopState {
     pending_exit: Option<PendingExit>,
     position: Option<OpenPosition>,
     trades: Vec<Trade>,
+    /// Bounded O(1) per-reason tally of entries the exchange-constrained sizer
+    /// suppressed over the run (audit C4); surfaced on the result.
+    skipped_entries: SkippedEntryCounts,
 }
 
 impl LoopState {
     fn into_result(self) -> BacktestResult {
+        let mut regime_breakdown = RegimeBreakdown::new();
+        for trade in &self.trades {
+            // Aggregate each closed trade into its entry-bar regime cell (FR-5).
+            regime_breakdown.record(trade.regime, trade.realized_pnl);
+        }
         let mut result = BacktestResult {
             trades: self.trades,
             net_pnl: Decimal::ZERO,
             fees_total: Decimal::ZERO,
             funding_total: Decimal::ZERO,
             slippage_total: Decimal::ZERO,
+            regime_breakdown,
+            skipped_entries: self.skipped_entries,
         };
         for trade in &result.trades {
             result.net_pnl += trade.realized_pnl;
@@ -202,6 +244,15 @@ struct OpenPosition {
     entry_fill_time: i64,
     entry_fee: Decimal,
     entry_slippage: Decimal,
+    /// Running maximum favorable excursion in R-multiples (C5). Initialized to 0
+    /// at entry; `update_excursion` walks it up over each held bar.
+    mfe_r: Decimal,
+    /// Running maximum adverse excursion in R-multiples (C5). Initialized to 0 at
+    /// entry; `update_excursion` walks it down over each held bar.
+    mae_r: Decimal,
+    /// The market regime in effect at the entry-fill bar (FR-6), carried to the
+    /// `Trade` at close so `RegimeBreakdown` can aggregate it.
+    regime: Regime,
 }
 
 fn fill_pending_entry(
@@ -210,6 +261,8 @@ fn fill_pending_entry(
     direction: Direction,
     plan: &ExitPlan<'_>,
     config: &BacktestConfig,
+    filters: &SymbolFilters,
+    regime: Regime,
 ) -> Result<(), BacktestError> {
     let Some(pending) = state.pending_entry.take() else {
         return Ok(());
@@ -221,13 +274,24 @@ fn fill_pending_entry(
     let raw_entry = candle.open;
     let entry_price = apply_slippage(raw_entry, config.slippage_bps, direction, Side::Entry);
     let stop = stop_price(entry_price, plan.stop_distance_pct, direction);
-    let qty = position_size(
+    // The shared exchange-constrained sizer (NFR-3, C8): one sizing path for sim
+    // and (future v3) live. `NoStopLoss` (zero stop distance) still propagates
+    // fail-fast (G5/#20). A `Skipped` outcome consumes the pending entry (it is
+    // NOT retried) and increments the matching `SkippedEntryCounts` cell.
+    let qty = match compute_position_size(
         config.starting_equity,
         plan.risk_per_trade_pct,
         entry_price,
         stop,
         plan.max_leverage,
-    )?;
+        filters,
+    )? {
+        SizingOutcome::Sized(qty) => qty,
+        SizingOutcome::Skipped(reason) => {
+            state.skipped_entries.record(reason);
+            return Ok(());
+        }
+    };
     let entry_fee = taker_fee(qty * entry_price, config.taker_fee_bps);
     state.position = Some(OpenPosition {
         direction,
@@ -241,8 +305,50 @@ fn fill_pending_entry(
         entry_fill_time: candle.open_time,
         entry_fee,
         entry_slippage: (entry_price - raw_entry).abs() * qty,
+        mfe_r: Decimal::ZERO,
+        mae_r: Decimal::ZERO,
+        regime,
     });
     Ok(())
+}
+
+/// Fold one held bar into the position's running MFE/MAE (C5). Called in the
+/// `run_backtest` loop **after** `fill_pending_entry` and **before**
+/// `close_on_bar_open_or_price`, only when a position exists — so it folds the
+/// just-opened entry bar and the full exit bar before the close reads the running
+/// values.
+///
+/// Excursion is measured from the entry fill price `E` and normalized by the
+/// initial stop distance `D = |E − stop|` (`> 0`, the sizer guarantees it). For a
+/// held bar with high `H`, low `L`: long → `fav = (H − E)/D`, `adv = (L − E)/D`;
+/// short → `fav = (E − L)/D`, `adv = (E − H)/D`. We keep the running
+/// `mfe_r = max(mfe_r, fav)` and `mae_r = min(mae_r, adv)`. The init-0 sample
+/// keeps `mfe_r >= 0 ∧ mae_r <= 0` (C5). The full bar range counts (no intra-bar
+/// path reconstruction), so `mfe_r >= realized_r >= mae_r` is NOT guaranteed.
+fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
+    let entry = position.entry_price;
+    let stop_distance = (entry - position.stop_price).abs();
+    if stop_distance.is_zero() {
+        // The sizer refuses a zero stop distance, so this is unreachable in a
+        // real run; guard anyway to avoid a divide-by-zero on a degenerate path.
+        return;
+    }
+    let (fav, adv) = match position.direction {
+        Direction::Long => (
+            (candle.high - entry) / stop_distance,
+            (candle.low - entry) / stop_distance,
+        ),
+        Direction::Short => (
+            (entry - candle.low) / stop_distance,
+            (entry - candle.high) / stop_distance,
+        ),
+    };
+    if fav > position.mfe_r {
+        position.mfe_r = fav;
+    }
+    if adv < position.mae_r {
+        position.mae_r = adv;
+    }
 }
 
 fn close_on_bar_open_or_price(
@@ -256,22 +362,70 @@ fn close_on_bar_open_or_price(
         return Ok(());
     };
 
-    if let Some(exit) = price_exit(candle, &position) {
+    // #44 fix (C6): a signal-exit that fired on bar N's close is scheduled to fill
+    // at THIS bar's open — it fills at the open and the bar's intra-bar (post-open)
+    // SL/TP CANNOT preempt it. The open may itself gap through a level, which we
+    // label symmetrically via `open_gap_reason`: gapped through the stop →
+    // `StopLoss`; through the TP → `TakeProfit`; inside the channel → `Signal`.
+    // The fill price is the open in all three cases; only the `exit_reason` (and
+    // the `signal_time`) differs.
+    if let Some(pending) = state.pending_exit.take() {
+        let exit = match open_gap_reason(candle.open, &position) {
+            Some(reason) => ExitFill {
+                // A price event at the open, not the prior signal: the timestamp
+                // is this bar's open, not the prior bar's close.
+                signal_time: candle.open_time,
+                fill_time: candle.open_time,
+                raw_price: candle.open,
+                reason,
+            },
+            None => ExitFill {
+                signal_time: pending.signal_time,
+                fill_time: candle.open_time,
+                raw_price: candle.open,
+                reason: pending.reason,
+            },
+        };
         close_position(state, primary, exit, config)?;
-        state.pending_exit = None;
         return Ok(());
     }
 
-    if let Some(pending) = state.pending_exit.take() {
-        let exit = ExitFill {
-            signal_time: pending.signal_time,
-            fill_time: candle.open_time,
-            raw_price: candle.open,
-            reason: pending.reason,
-        };
+    // No pending signal-exit: the existing intra-bar SL/TP resolution runs
+    // unchanged.
+    if let Some(exit) = price_exit(candle, &position) {
         close_position(state, primary, exit, config)?;
     }
     Ok(())
+}
+
+/// Resolve whether this bar's **open** itself gapped through a price level for a
+/// position whose signal-exit is filling at the open (#44 / C6). Symmetric
+/// labeling: an open at/through the stop → `StopLoss`; an open at/through the TP →
+/// `TakeProfit`; an open inside the channel → `None` (⇒ the caller labels it
+/// `Signal`). This is the ONLY level check on a signal-exit bar — the intra-bar
+/// high/low are deliberately ignored, because the position is already closed at
+/// the open.
+fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason> {
+    match position.direction {
+        Direction::Long => {
+            if open <= position.stop_price {
+                Some(ExitReason::StopLoss)
+            } else if position.take_profit_price.is_some_and(|tp| open >= tp) {
+                Some(ExitReason::TakeProfit)
+            } else {
+                None
+            }
+        }
+        Direction::Short => {
+            if open >= position.stop_price {
+                Some(ExitReason::StopLoss)
+            } else if position.take_profit_price.is_some_and(|tp| open <= tp) {
+                Some(ExitReason::TakeProfit)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn close_end_of_data(
@@ -409,8 +563,17 @@ fn close_position(
         slippage_total,
         realized_pnl: net,
         realized_r,
+        // The running excursion folded by `update_excursion` over every held bar
+        // (entry-fill to exit-fill inclusive). For an `EndOfData` force-close the
+        // final bar was already folded in the loop's last iteration before this
+        // out-of-loop close runs, so it carries the correct excursion too (C6).
+        mfe_r: position.mfe_r,
+        mae_r: position.mae_r,
         exit_reason: exit.reason,
         source: TradeSource::Backtest,
+        // The market regime captured at the entry-fill bar (FR-6), carried
+        // through to the trade record for `RegimeBreakdown` aggregation.
+        regime: position.regime,
     });
     Ok(())
 }
@@ -501,12 +664,14 @@ fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{BacktestConfig, run_backtest};
+    use super::{BacktestConfig, OpenPosition, run_backtest, update_excursion};
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
-        Direction, ExitReason, ExitRule, Pair, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, Timeframe, ValueSource, compile, realized_pnl, validate,
+        Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
+        StrategyDsl, SweepableValue, SymbolFilters, Timeframe, ValueSource, compile, realized_pnl,
+        validate,
     };
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
 
     fn d(value: i64) -> Decimal {
@@ -533,6 +698,21 @@ mod tests {
             high: d(high),
             low: d(low),
             close: d(close),
+            volume: Decimal::ONE,
+            funding_rate: None,
+        }
+    }
+
+    /// `candle` with `Decimal` OHLC (for the excursion proptest, which builds bars
+    /// at sub-integer offsets from the entry price).
+    fn candle_dec(idx: i64, open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Candle {
+        Candle {
+            open_time: idx * 60_000,
+            close_time: idx * 60_000 + 59_999,
+            open,
+            high,
+            low,
+            close,
             volume: Decimal::ONE,
             funding_rate: None,
         }
@@ -635,7 +815,14 @@ mod tests {
             candle(1, 110, 112, 108, 111),
             candle(2, 120, 121, 119, 120),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];
@@ -650,7 +837,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert!(result.trades.is_empty());
     }
@@ -662,7 +856,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             candle(2, 100, 120, 90, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
         assert_eq!(result.trades[0].exit_price, d(95));
@@ -677,7 +878,14 @@ mod tests {
             funding_candle(3, 100, 101, 99, 100),
             candle(4, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].funding_total, d(-2));
@@ -691,7 +899,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             funding_candle(2, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].funding_total, Decimal::ZERO);
@@ -705,7 +920,14 @@ mod tests {
             candle(2, 100, 101, 99, 100),
             funding_candle(3, 100, 101, 94, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
@@ -722,7 +944,14 @@ mod tests {
             }],
         );
 
-        let err = run_backtest(&strategy, &primary, None, &config()).unwrap_err();
+        let err = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
     }
 
@@ -749,11 +978,25 @@ mod tests {
         );
 
         assert!(matches!(
-            run_backtest(&trailing, &primary, None, &config()).unwrap_err(),
+            run_backtest(
+                &trailing,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
         assert!(matches!(
-            run_backtest(&time, &primary, None, &config()).unwrap_err(),
+            run_backtest(
+                &time,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .unwrap_err(),
             BacktestError::UnsupportedExit(_)
         ));
     }
@@ -765,7 +1008,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
             candle(2, 100, 101, 99, 103),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::EndOfData);
@@ -778,7 +1028,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert!(result.trades.is_empty());
     }
@@ -801,7 +1058,14 @@ mod tests {
             candle(2, 100, 101, 99, 160),
             candle(3, 105, 106, 104, 105),
         ]);
-        let result = run_backtest(&strategy, &primary, None, &config()).unwrap();
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::Signal);
@@ -814,6 +1078,267 @@ mod tests {
             primary.candles[3].open_time
         );
         assert_eq!(result.trades[0].exit_price, d(105));
+    }
+
+    /// #44 (HIGH) regression — the named scenario (AC-10). A signal-exit fired on
+    /// bar N's close is scheduled to fill at bar N+1's open. On bar N+1 the open
+    /// sits **inside** the stop/TP channel, but the bar's intra-bar **low later
+    /// reaches the stop**. The fix: the position exits as `Signal` at the **open
+    /// price**, NOT as `StopLoss` at the stop — the intra-bar post-open SL/TP
+    /// cannot preempt a signal-exit filling at the open (C6). Before the fix the
+    /// old ordering ran `price_exit` first and mislabeled this as a `StopLoss`.
+    #[test]
+    fn signal_exit_fills_at_open_even_when_intrabar_stop_is_touched() {
+        let strategy = compiled(
+            price_entry(),
+            vec![
+                stop(),
+                tp(10),
+                ExitRule::SignalExit {
+                    condition: signal_on_high_close(),
+                },
+            ],
+        );
+        // bar2: entry fills at open=100 → stop=95, tp=150. close=160 fires the
+        //       signal-exit (close > 150) without any intra-bar level breach
+        //       (high 101 < tp, low 99 > stop). pending_exit is set.
+        // bar3: the exit bar. open=100 is inside the channel (95 < 100 < 150), but
+        //       the intra-bar low=90 dips through the stop (95). The #44 fix must
+        //       fill at the open as Signal, ignoring the intra-bar stop.
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 101, 99, 160),
+            candle(3, 100, 101, 90, 100),
+        ]);
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let trade = &result.trades[0];
+        assert_eq!(
+            trade.exit_reason,
+            ExitReason::Signal,
+            "a signal-exit at the open is NOT preempted by the bar's intra-bar stop (#44)"
+        );
+        assert_eq!(
+            trade.exit_price,
+            d(100),
+            "fills at bar N+1's open price, not at the stop"
+        );
+        assert_eq!(
+            trade.exit_fill_time, primary.candles[3].open_time,
+            "fills at bar N+1's open time"
+        );
+        assert_eq!(
+            trade.exit_signal_time, primary.candles[2].close_time,
+            "the inside-channel signal-exit keeps the prior bar-close signal time"
+        );
+    }
+
+    /// #44 symmetric gap labeling (C6): when the exit bar's **open** gaps above the
+    /// take-profit, a signal-exit filling at the open is labeled `TakeProfit` (the
+    /// price event at the open), still at the open price — only the reason differs.
+    #[test]
+    fn signal_exit_open_gapping_through_tp_is_labeled_take_profit() {
+        let strategy = compiled(
+            price_entry(),
+            vec![
+                stop(),
+                tp(10),
+                ExitRule::SignalExit {
+                    condition: signal_on_high_close(),
+                },
+            ],
+        );
+        // bar2: entry at open=100 → stop=95, tp=150; close=160 fires the signal.
+        // bar3: open=160 gaps above tp (150) → labeled TakeProfit, fills at open.
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 101, 99, 160),
+            candle(3, 160, 161, 159, 160),
+        ]);
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let trade = &result.trades[0];
+        assert_eq!(trade.exit_reason, ExitReason::TakeProfit);
+        assert_eq!(trade.exit_price, d(160), "fills at the gapped-open price");
+        assert_eq!(trade.exit_signal_time, primary.candles[3].open_time);
+    }
+
+    /// #44 symmetric gap labeling (C6), stop side: an exit-bar **open** gapping
+    /// below the stop on a signal-exit is labeled `StopLoss`, filling at the open.
+    /// (This is the open gap — distinct from the intra-bar stop the fix ignores.)
+    #[test]
+    fn signal_exit_open_gapping_through_stop_is_labeled_stop_loss() {
+        let strategy = compiled(
+            price_entry(),
+            vec![
+                stop(),
+                tp(10),
+                ExitRule::SignalExit {
+                    condition: signal_on_high_close(),
+                },
+            ],
+        );
+        // bar2: entry at open=100 → stop=95; close=160 fires the signal.
+        // bar3: open=90 gaps below stop (95) → labeled StopLoss, fills at open=90.
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 101, 99, 160),
+            candle(3, 90, 95, 89, 92),
+        ]);
+        let result = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let trade = &result.trades[0];
+        assert_eq!(trade.exit_reason, ExitReason::StopLoss);
+        assert_eq!(trade.exit_price, d(90), "fills at the gapped-open price");
+        assert_eq!(trade.exit_signal_time, primary.candles[3].open_time);
+    }
+
+    /// C6 audit: an `EndOfData` force-closed trade carries non-default
+    /// `mfe_r`/`mae_r` (AC-10b). The final bar is folded by `update_excursion`
+    /// in the loop's last iteration before the out-of-loop `close_end_of_data`
+    /// runs, so the running excursion reaches the recorded trade. Guards against a
+    /// future refactor that closes outside the folded path.
+    #[test]
+    fn end_of_data_trade_carries_running_mfe_and_mae_excursion() {
+        // Entry at bar2 open=100 → stop=95, stop_distance=5. The held bars swing
+        // up to 110 (fav = (110-100)/5 = 2R) and down to 96 (adv = (96-100)/5 =
+        // -0.8R) WITHOUT touching the stop (95) or tp (150), so the position is
+        // still open at series end and force-closes as EndOfData.
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 110, 96, 105),
+        ]);
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let trade = &result.trades[0];
+        assert_eq!(trade.exit_reason, ExitReason::EndOfData);
+        // Non-default (non-zero) excursion proves the EndOfData close folded the
+        // running values, not the Trade-literal defaults.
+        assert_ne!(trade.mfe_r, Decimal::ZERO, "EndOfData trade carries MFE");
+        assert_ne!(trade.mae_r, Decimal::ZERO, "EndOfData trade carries MAE");
+        // Exact excursion from the single held (entry+exit) bar.
+        assert_eq!(trade.mfe_r, d(2), "(110-100)/5 = 2R favorable");
+        assert_eq!(
+            trade.mae_r,
+            Decimal::new(-8, 1),
+            "(96-100)/5 = -0.8R adverse"
+        );
+    }
+
+    /// C5 invariant on a real run: every completed trade satisfies
+    /// `mfe_r >= 0 ∧ mae_r <= 0` (holds by the init-0 running sample). A direct
+    /// engine-level check complementing the golden-fixture assertion.
+    #[test]
+    fn completed_trades_have_nonneg_mfe_nonpos_mae() {
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 99, 100),
+            candle(2, 100, 130, 90, 100),
+            candle(3, 100, 101, 99, 100),
+        ]);
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
+
+        assert!(!result.trades.is_empty());
+        for trade in &result.trades {
+            assert!(trade.mfe_r >= Decimal::ZERO, "mfe_r must be >= 0");
+            assert!(trade.mae_r <= Decimal::ZERO, "mae_r must be <= 0");
+        }
+    }
+
+    proptest! {
+        /// C5 invariant proptest: over randomized synthetic OHLC bars (long and
+        /// short), the running excursion sample keeps `mfe_r >= 0 ∧ mae_r <= 0` for
+        /// any sequence of held bars (the init-0 sample guarantees it regardless of
+        /// price path). Operates directly on `update_excursion` to exercise the
+        /// math over arbitrary candles without a full strategy harness.
+        #[test]
+        fn prop_excursion_invariant_holds_over_arbitrary_bars(
+            is_long in any::<bool>(),
+            entry_cents in 50_000i64..200_000,
+            stop_off in 1i64..40_000,
+            bars in proptest::collection::vec(
+                (0i64..50_000, 0i64..50_000, 0i64..50_000),
+                1..12,
+            ),
+        ) {
+            let entry = Decimal::new(entry_cents, 2);
+            let direction = if is_long { Direction::Long } else { Direction::Short };
+            // Stop on the losing side; distance is strictly positive.
+            let stop = if is_long {
+                entry - Decimal::new(stop_off, 2)
+            } else {
+                entry + Decimal::new(stop_off, 2)
+            };
+            let mut position = OpenPosition {
+                direction,
+                qty: Decimal::ONE,
+                entry_price: entry,
+                stop_price: stop,
+                take_profit_price: None,
+                entry_signal_time: 0,
+                entry_fill_time: 0,
+                entry_fee: Decimal::ZERO,
+                entry_slippage: Decimal::ZERO,
+                mfe_r: Decimal::ZERO,
+                mae_r: Decimal::ZERO,
+                regime: Regime::Unknown,
+            };
+            for (lo_off, span, up_off) in &bars {
+                // Build a coherent OHLC bar around the entry price: low <= open,
+                // close <= high; low <= high by construction. The bar index is
+                // irrelevant to the excursion math (it reads OHLC only), so a
+                // fixed index is fine here.
+                let low = entry - Decimal::new(*lo_off, 2);
+                let high = low + Decimal::new(*span, 2) + Decimal::new(*up_off, 2);
+                let bar = candle_dec(0, entry, high, low, entry);
+                update_excursion(&mut position, &bar);
+            }
+            prop_assert!(position.mfe_r >= Decimal::ZERO, "mfe_r must be >= 0");
+            prop_assert!(position.mae_r <= Decimal::ZERO, "mae_r must be <= 0");
+        }
     }
 
     #[test]
@@ -865,7 +1390,14 @@ mod tests {
             candle(0, 100, 101, 99, 100),
             candle(1, 100, 101, 99, 100),
         ]);
-        let err = run_backtest(&base_strategy(), &primary, None, &bad).unwrap_err();
+        let err = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &bad,
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BacktestError::InvalidConfig(_)));
     }
 
@@ -888,7 +1420,14 @@ mod tests {
             candle(1, 100, 101, 99, 100),
         ]);
 
-        let err = run_backtest(&strategy, &primary, None, &config()).unwrap_err();
+        let err = run_backtest(
+            &strategy,
+            &primary,
+            None,
+            &config(),
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap_err();
         assert!(matches!(err, BacktestError::ImpossibleTakeProfit(_)));
     }
 
@@ -901,7 +1440,16 @@ mod tests {
             candle(1, 100, 101, 99, 100),
         ]);
         // Must not error at plan construction (it may simply produce no trades).
-        assert!(run_backtest(&strategy, &primary, None, &config()).is_ok());
+        assert!(
+            run_backtest(
+                &strategy,
+                &primary,
+                None,
+                &config(),
+                &SymbolFilters::unconstrained()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -920,7 +1468,14 @@ mod tests {
             candle(2, 100, 105, 99, 100),
             funding_candle(3, 100, 105, 99, 103),
         ]);
-        let result = run_backtest(&base_strategy(), &primary, None, &cfg).unwrap();
+        let result = run_backtest(
+            &base_strategy(),
+            &primary,
+            None,
+            &cfg,
+            &SymbolFilters::unconstrained(),
+        )
+        .unwrap();
 
         assert_eq!(result.trades.len(), 1);
         let trade = &result.trades[0];

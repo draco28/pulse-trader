@@ -16,6 +16,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use super::regime::Regime;
 use crate::domain::Direction;
 
 /// Why a trade closed. Only the four exit kinds this slice models appear —
@@ -107,10 +108,44 @@ pub struct Trade {
     /// costs can push it past −1R (G3).
     pub realized_r: Decimal,
 
+    /// Maximum **favorable** excursion in R-multiples (FR-6, C5): the largest
+    /// intra-bar move in the trade's direction across every held bar (entry-fill
+    /// to exit-fill inclusive), measured from the entry fill price and normalized
+    /// by the initial stop distance. Initialized to 0 at entry, so `mfe_r >= 0` by
+    /// construction. The **full exit-bar range** folds in (no intra-bar path
+    /// reconstruction), so `mfe_r >= realized_r` is NOT guaranteed (documented
+    /// overshoot) and is not asserted.
+    ///
+    /// **Semantics — full-bar *potential* excursion, NOT experienced excursion.**
+    /// Because the entire exit bar's high/low are folded in, a trade that exits at
+    /// the bar **open** (a signal-exit fill, or a gap-through-stop/TP at the open)
+    /// still records the rest of that bar's range — price action that occurred
+    /// *after* the position was already closed. So `mfe_r`/`mae_r` bound the
+    /// regime's *potential* excursion over the held span, not the path the trade
+    /// actually experienced. Coaching/analytics (MASTER-SPEC Phase 1 §(e)) must
+    /// read them as potential-excursion bounds, not as proof of an experienced
+    /// price path. (Deliberate v1 simplification, grill amendment 3; a separate
+    /// realized-hold excursion is deferred — see close-audit finding.)
+    pub mfe_r: Decimal,
+    /// Maximum **adverse** excursion in R-multiples (FR-6, C5): the largest
+    /// intra-bar move against the trade, measured + normalized like `mfe_r`.
+    /// Initialized to 0 at entry, so `mae_r <= 0` by construction. Same
+    /// **full-bar potential** semantics as [`mfe_r`](Self::mfe_r) — includes the
+    /// full exit bar (post-close range for an at-open exit), so it is a
+    /// potential-excursion bound, not the experienced path.
+    pub mae_r: Decimal,
+
     /// Why the trade closed.
     pub exit_reason: ExitReason,
     /// Where the trade originated.
     pub source: TradeSource,
+
+    /// The market [`Regime`] in effect at the entry-fill bar (FR-6, VS-1.2.2
+    /// work-2.04). The engine steps a [`RegimeDetector`](crate::RegimeDetector)
+    /// on the primary M15 series once per bar and tags the position with the
+    /// then-current regime at open; it is `Unknown` while the EMA200/ADX warm.
+    /// `RegimeBreakdown` aggregates `(regime, realized_pnl)` over the trade log.
+    pub regime: Regime,
 }
 
 #[cfg(test)]
@@ -118,6 +153,7 @@ pub struct Trade {
 mod tests {
     use super::{ExitReason, Fill, Trade, TradeSource};
     use crate::domain::Direction;
+    use crate::domain::backtest::Regime;
     use rust_decimal::Decimal;
 
     fn sample_trade() -> Trade {
@@ -148,8 +184,11 @@ mod tests {
             slippage_total: Decimal::new(2, 2),
             realized_pnl: Decimal::new(20, 0),
             realized_r: Decimal::new(2, 0),
+            mfe_r: Decimal::new(25, 1), // 2.5
+            mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
         }
     }
 
@@ -161,6 +200,16 @@ mod tests {
         assert!(t.entry_signal_time <= t.entry_fill_time);
         assert!(t.exit_signal_time <= t.exit_fill_time);
         assert_eq!(t.direction, Direction::Long);
+    }
+
+    #[test]
+    fn trade_carries_mfe_mae_with_correct_signs() {
+        // C5 invariant: the favorable excursion is non-negative and the adverse
+        // excursion is non-positive (holds by the init-0 running sample). The
+        // round-trip below also proves the new Decimal fields survive serde.
+        let t = sample_trade();
+        assert!(t.mfe_r >= Decimal::ZERO, "mfe_r must be >= 0");
+        assert!(t.mae_r <= Decimal::ZERO, "mae_r must be <= 0");
     }
 
     #[test]

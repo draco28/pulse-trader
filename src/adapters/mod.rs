@@ -20,6 +20,12 @@ pub(crate) mod indicators;
 // because it owns the concrete IndicatorEngine.
 pub(crate) mod backtest;
 
+// VS-1.2.2 work-2.01: the `pulse-broker` exchange-metadata adapter home.
+// `BinanceAdapter` implements the `ExchangeAdapter` port over pinned BTCUSDT
+// USD-M futures consts. `pub(crate)` (matching the sibling adapter precedent) so
+// `lib.rs` curates the public surface.
+pub(crate) mod broker;
+
 // VS-1.1.4 work-1.01: the SQLite persistence tier — the `Db` pool wrapper (WAL +
 // foreign_keys + busy_timeout connect options), the embedded `MIGRATOR`, and the
 // platform-default db-path resolver. The ONLY module tree where `sqlx` is allowed

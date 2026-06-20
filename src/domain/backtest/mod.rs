@@ -15,10 +15,13 @@ mod collision;
 mod cost;
 mod error;
 mod result;
-mod sizing;
 mod trade;
 // work-1.02: the MTF-aligned, no-look-ahead candle feed.
 mod feed;
+// VS-1.2.2 work-2.03: the pure regime value types + classification (EMA50/200 +
+// ADX14). The stateful detector that holds the indicator adapters lives in
+// `adapters::backtest::regime`; this is the zero-I/O, `Decimal`-only half.
+mod regime;
 
 // Re-exports kept at the `domain::backtest` surface so `domain/mod.rs` + `lib.rs`
 // can curate them onto the crate's public API (an un-re-exported public domain
@@ -27,6 +30,6 @@ pub use collision::{IntraBarExit, resolve_intra_bar_exit};
 pub use cost::{Side, apply_slippage, funding_payment, realized_pnl, realized_r, taker_fee};
 pub use error::BacktestError;
 pub use feed::{AlignedBar, align};
+pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
-pub use sizing::position_size;
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

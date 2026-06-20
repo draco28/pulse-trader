@@ -14,10 +14,17 @@ mod candle;
 mod clock;
 mod dsl;
 mod error;
+// VS-1.2.2 work-2.01: the dedicated exchange-port error taxonomy (audit C5).
+mod exchange;
 mod indicator;
 mod pair;
 mod port;
 mod series;
+// VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
+// BACKLOG-5) — the `pulse-broker` money-math home as a module. `pub(crate)`
+// (matching the `dsl`/`strategy`/`backtest` precedent) so `lib.rs` can curate the
+// public surface; the types leave the crate only via the explicit re-exports.
+pub(crate) mod sizing;
 // `pub(crate)` (matching the `adapters`/`cli` nested-module precedent) so the
 // curated `lib.rs` surface can re-export via the `domain::strategy::` path — the
 // types still leave the crate only through the explicit `pub use` re-exports.
@@ -32,9 +39,13 @@ mod version;
 // its lifetime is tied to the caller's `CandleSeries`.
 pub use backtest::{
     AlignedBar, BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade,
-    TradeSource, align, apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
+    TradeSource, align, apply_slippage, funding_payment, realized_pnl, realized_r,
     resolve_intra_bar_exit, taker_fee,
 };
+// VS-1.2.2 work-2.03: the pure regime surface (EMA50/200 + ADX14 classifier).
+// Re-exported here so `lib.rs` can curate the crate surface; an un-re-exported
+// public domain type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
@@ -62,8 +73,22 @@ pub use pair::Pair;
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
-pub use port::{MarketDataSource, StrategyRepository};
+pub use port::{ExchangeAdapter, MarketDataSource, StrategyRepository};
+// VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
+// `compute_position_size` is the single exchange-constrained sizing entry; the
+// `SymbolFilters` value type + its `unconstrained()` ctor, and the
+// `SizingOutcome`/`SkipReason` skip-and-count substrate (2.04 wires, 2.05
+// renders). The dedicated `ExchangeError` (audit C5) rides the `ExchangeAdapter`
+// port. Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
+// public domain type is a `dead_code` BUILD error under `deny(warnings)`.
+// NFR-3 hardening (slice-close): the pre-quantization core `risk_capped_qty` is
+// NOT re-exported — it bypasses the exchange constraints, so it stays
+// crate-internal (used only by `compute_position_size` + the in-module proptests).
+pub use exchange::ExchangeError;
 pub use series::{CandleSeries, Gap};
+pub use sizing::{
+    SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters, compute_position_size,
+};
 pub use timeframe::Timeframe;
 pub use version::DataVersion;
 

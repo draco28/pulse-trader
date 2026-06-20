@@ -30,10 +30,11 @@ use std::path::PathBuf;
 use rust_decimal::Decimal;
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::CandleStore;
 use crate::domain::{
-    BacktestResult, CandleSeries, Direction, ExitReason, Migrator, Pair, StrategyDsl, Timeframe,
-    Trade, compile, validate,
+    BacktestResult, CandleSeries, Direction, ExchangeAdapter as _, ExitReason, Migrator, Pair,
+    Regime, StrategyDsl, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -125,7 +126,14 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config)
+    // Resolve the symbol's exchange filters through the `ExchangeAdapter` port —
+    // this is where the port is exercised end-to-end (NFR-3); the engine itself
+    // is a pure function of the resolved `SymbolFilters` value.
+    let filters = BinanceAdapter::new()
+        .symbol_filters(&pair)
+        .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
+
+    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
         .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 
     if args.json {
@@ -204,16 +212,22 @@ fn load_series(store: &CandleStore, pair: &Pair, tf: Timeframe) -> anyhow::Resul
     Ok(series)
 }
 
-/// The tab-separated trade-log header (names every cost column the demo reads).
-const TRADE_HEADER: &str = "entry_time\texit_time\tdir\tentry_price\texit_price\tqty\tfees\tfunding\tslippage\tpnl\tR\texit_reason";
+/// The tab-separated trade-log header (names every cost column the demo reads,
+/// plus the per-trade MFE/MAE excursion + entry regime — VS-1.2.2 work-2.05).
+const TRADE_HEADER: &str = "entry_time\texit_time\tdir\tentry_price\texit_price\tqty\tfees\tfunding\tslippage\tpnl\tR\texit_reason\tmfe_r\tmae_r\tregime";
 
-/// Render the human-readable trade log + the cost-breakdown footer.
+/// Render the human-readable trade log + the cost-breakdown footer + the
+/// regime-breakdown block + the skipped-entries line (VS-1.2.2 work-2.05).
 fn render_human(result: &BacktestResult) {
     println!("{TRADE_HEADER}");
     for trade in &result.trades {
         println!("{}", render_trade_row(trade));
     }
     println!("{}", render_footer(result));
+    for line in render_regime_breakdown(result) {
+        println!("{line}");
+    }
+    println!("{}", render_skipped_entries(result));
 }
 
 /// One tab-separated trade row. Decimals are normalized so trailing zeros do not
@@ -232,6 +246,9 @@ fn render_trade_row(trade: &Trade) -> String {
         dec(trade.realized_pnl),
         dec(trade.realized_r),
         exit_reason_label(trade.exit_reason).to_owned(),
+        dec(trade.mfe_r),
+        dec(trade.mae_r),
+        regime_label(trade.regime).to_owned(),
     ]
     .join("\t")
 }
@@ -254,6 +271,53 @@ fn render_footer(result: &BacktestResult) -> String {
         format!("slippage_total={}", dec(result.slippage_total)),
     ]
     .join("\t")
+}
+
+/// The per-regime breakdown block (FR-5, VS-1.2.2 work-2.05): one
+/// `regime=<label>\ttrades=<n>\tnet_pnl=<dec>` line per regime that has at least
+/// one trade. `unknown` is a **first-class** cell (#16) — it is included only
+/// when it actually holds trades (pre-EMA200-warmup entries), never silently
+/// merged into `ranging`. A run with zero trades yields no lines (the
+/// `skipped_entries` line still prints separately for observability).
+fn render_regime_breakdown(result: &BacktestResult) -> Vec<String> {
+    [
+        Regime::TrendingUp,
+        Regime::TrendingDown,
+        Regime::Ranging,
+        Regime::Unknown,
+    ]
+    .into_iter()
+    .filter_map(|regime| {
+        let cell = result.regime_breakdown.cell(regime);
+        if cell.trade_count == 0 {
+            return None;
+        }
+        Some(
+            [
+                format!("regime={}", regime_label(regime)),
+                format!("trades={}", cell.trade_count),
+                format!("net_pnl={}", dec(cell.net_pnl)),
+            ]
+            .join("\t"),
+        )
+    })
+    .collect()
+}
+
+/// The skipped-entries observability line (audit C4, VS-1.2.2 work-2.05): always
+/// prints `skipped_entries=<total()>` so a user staring at a low trade count can
+/// tell "no signals" from "too small to size". When `total() > 0`, the per-reason
+/// breakdown (`sub_lot` / `sub_notional` / `leverage_capped`) is appended.
+fn render_skipped_entries(result: &BacktestResult) -> String {
+    let counts = &result.skipped_entries;
+    let total = counts.total();
+    let mut cells = vec![format!("skipped_entries={total}")];
+    if total > 0 {
+        cells.push(format!("sub_lot={}", counts.sub_lot));
+        cells.push(format!("sub_notional={}", counts.sub_notional));
+        cells.push(format!("leverage_capped={}", counts.leverage_capped));
+    }
+    cells.join("\t")
 }
 
 /// Emit the full [`BacktestResult`] as a structured JSON object (`--json`).
@@ -287,14 +351,30 @@ fn exit_reason_label(reason: ExitReason) -> &'static str {
     }
 }
 
+/// Human-readable market-regime label (mirrors [`exit_reason_label`]; matches the
+/// `snake_case` serde tags so the human + JSON readouts stay consistent).
+/// `Unknown` is a first-class label (#16), never collapsed into `ranging`.
+fn regime_label(regime: Regime) -> &'static str {
+    match regime {
+        Regime::TrendingUp => "trending_up",
+        Regime::TrendingDown => "trending_down",
+        Regime::Ranging => "ranging",
+        Regime::Unknown => "unknown",
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{TRADE_HEADER, dec, parse_dsl, reject_if_gapped, render_footer, render_trade_row};
+    use super::{
+        TRADE_HEADER, dec, parse_dsl, regime_label, reject_if_gapped, render_footer,
+        render_regime_breakdown, render_skipped_entries, render_trade_row,
+    };
     use crate::domain::{
         BacktestResult, Candle, CandleSeries, Comparator, Condition, DataVersion, Direction,
-        ExitReason, ExitRule, Fill, Pair, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
+        ExitReason, ExitRule, Fill, Pair, PriceField, Regime, RegimeBreakdown, RiskParams,
+        SchemaVersion, SkipReason, SkippedEntryCounts, StrategyDsl, SweepableValue, Timeframe,
+        Trade, TradeSource, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -372,8 +452,11 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             realized_pnl: Decimal::new(1_484, 0),
             realized_r: Decimal::new(2, 0),
+            mfe_r: Decimal::new(25, 1), // 2.5; render of MFE/MAE is 2.05's job
+            mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
         }
     }
 
@@ -389,13 +472,126 @@ mod tests {
     fn trade_row_is_tab_separated_with_all_fields() {
         let row = render_trade_row(&sample_trade());
         let cells = row.split('\t').collect::<Vec<_>>();
-        // Same arity as the header (12 columns).
+        // Same arity as the header (15 columns: 12 cost/identity + mfe_r/mae_r/regime).
         assert_eq!(cells.len(), TRADE_HEADER.split('\t').count());
         assert_eq!(cells[2], "long");
         assert_eq!(cells[6], "12"); // fees
         assert_eq!(cells[7], "1"); // funding
         assert_eq!(cells[8], "3"); // slippage
         assert_eq!(cells[11], "take_profit");
+        // The three VS-1.2.2 work-2.05 columns, trailing-zero-normalized.
+        assert_eq!(cells[12], "2.5"); // mfe_r
+        assert_eq!(cells[13], "-0.5"); // mae_r
+        assert_eq!(cells[14], "trending_up"); // regime
+    }
+
+    #[test]
+    fn header_names_mfe_mae_regime_columns() {
+        // The 2.05 readout columns the e2e/user demo reads.
+        assert!(TRADE_HEADER.contains("mfe_r"));
+        assert!(TRADE_HEADER.contains("mae_r"));
+        assert!(TRADE_HEADER.contains("regime"));
+    }
+
+    #[test]
+    fn regime_label_mirrors_snake_case_serde_tags() {
+        assert_eq!(regime_label(Regime::TrendingUp), "trending_up");
+        assert_eq!(regime_label(Regime::TrendingDown), "trending_down");
+        assert_eq!(regime_label(Regime::Ranging), "ranging");
+        // Unknown is a first-class label (#16), never collapsed into ranging.
+        assert_eq!(regime_label(Regime::Unknown), "unknown");
+    }
+
+    #[test]
+    fn regime_breakdown_renders_one_line_per_present_regime() {
+        let mut breakdown = RegimeBreakdown::new();
+        breakdown.record(Regime::TrendingUp, Decimal::new(150, 0));
+        breakdown.record(Regime::TrendingUp, Decimal::new(50, 0));
+        breakdown.record(Regime::Ranging, Decimal::new(-20, 0));
+        // Unknown deliberately left empty here → must NOT appear.
+        let result = BacktestResult {
+            trades: vec![],
+            net_pnl: Decimal::new(180, 0),
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            regime_breakdown: breakdown,
+            skipped_entries: SkippedEntryCounts::new(),
+        };
+        let lines = render_regime_breakdown(&result);
+        // Only the two regimes with trades appear (trending_down + unknown absent).
+        assert_eq!(lines.len(), 2, "lines were: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("regime=trending_up\ttrades=2\tnet_pnl=200"));
+        assert!(joined.contains("regime=ranging\ttrades=1\tnet_pnl=-20"));
+        assert!(
+            !joined.contains("trending_down"),
+            "empty regimes must be omitted"
+        );
+        assert!(
+            !joined.contains("unknown"),
+            "empty unknown cell must be omitted"
+        );
+    }
+
+    #[test]
+    fn regime_breakdown_renders_unknown_as_first_class_cell() {
+        // A trade that opened pre-warmup lands in the Unknown cell — it MUST render
+        // (#16): not silently merged into ranging, not dropped.
+        let mut breakdown = RegimeBreakdown::new();
+        breakdown.record(Regime::Unknown, Decimal::new(7, 0));
+        let result = BacktestResult {
+            trades: vec![],
+            net_pnl: Decimal::new(7, 0),
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            regime_breakdown: breakdown,
+            skipped_entries: SkippedEntryCounts::new(),
+        };
+        let lines = render_regime_breakdown(&result);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("regime=unknown\ttrades=1\tnet_pnl=7"));
+    }
+
+    #[test]
+    fn skipped_entries_line_always_prints_zero() {
+        // Observability: even with zero suppressed entries the line prints so a
+        // user can distinguish "no signals" from "too small to size".
+        let result = BacktestResult {
+            trades: vec![],
+            net_pnl: Decimal::ZERO,
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
+        };
+        let line = render_skipped_entries(&result);
+        assert_eq!(line, "skipped_entries=0");
+    }
+
+    #[test]
+    fn skipped_entries_line_breaks_down_per_reason_when_nonzero() {
+        let mut counts = SkippedEntryCounts::new();
+        counts.record(SkipReason::SubLot);
+        counts.record(SkipReason::SubLot);
+        counts.record(SkipReason::SubNotional);
+        counts.record(SkipReason::LeverageCapZero);
+        let result = BacktestResult {
+            trades: vec![],
+            net_pnl: Decimal::ZERO,
+            fees_total: Decimal::ZERO,
+            funding_total: Decimal::ZERO,
+            slippage_total: Decimal::ZERO,
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: counts,
+        };
+        let line = render_skipped_entries(&result);
+        assert!(line.contains("skipped_entries=4"), "line was: {line}");
+        assert!(line.contains("sub_lot=2"), "line was: {line}");
+        assert!(line.contains("sub_notional=1"), "line was: {line}");
+        assert!(line.contains("leverage_capped=1"), "line was: {line}");
     }
 
     #[test]
@@ -406,6 +602,8 @@ mod tests {
             fees_total: Decimal::new(12, 0),
             funding_total: Decimal::new(1, 0),
             slippage_total: Decimal::new(3, 0),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
         };
         let footer = render_footer(&result);
         assert!(footer.contains("trades=1"));

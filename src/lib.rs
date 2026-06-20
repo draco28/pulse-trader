@@ -221,9 +221,47 @@ pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_back
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
     BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
-    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
-    resolve_intra_bar_exit, taker_fee,
+    apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
 };
+
+// VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
+// BACKLOG-5) — the `pulse-broker` money-math home. `compute_position_size` is the
+// **single** sizer sim + (future v3) live execution share (NFR-3 by
+// construction). `SymbolFilters` (+ `unconstrained()`) is the exchange-filter
+// value type; `SizingOutcome`/`SkipReason` are the skip-and-count substrate (2.04
+// wires, 2.05 renders). `ExchangeAdapter` is the exchange-metadata port;
+// `ExchangeError` its dedicated error (audit C5). REQUIRED under `deny(warnings)`
+// + `pub(crate) mod domain` — an un-re-exported public domain type is a
+// `dead_code` build error, not a warning.
+//
+// NFR-3 single-sizing-path hardening (VS-1.2.2 slice-close, close-audit finding):
+// the pre-quantization core `risk_capped_qty` is **intentionally NOT re-exported**
+// — it bypasses lot_step / min_qty / min_notional / exchange max-leverage, so
+// exposing it publicly would make the single-path invariant a convention rather
+// than construction. It stays crate-internal (the `pub(crate) mod domain` gate),
+// reachable only by `compute_position_size` (its sole production caller) + the
+// in-module proptests; the ONLY public sizing entry is `compute_position_size`.
+pub use domain::{
+    ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters,
+    compute_position_size,
+};
+
+// VS-1.2.2 work-2.01: the `BinanceAdapter` exchange-metadata implementor
+// (`adapters/broker`), returning pinned BTCUSDT USD-M futures filters. REQUIRED
+// under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter type
+// unused outside its module is a `dead_code` build error. 2.04 wires it into
+// `run_backtest`'s sizing call through the `ExchangeAdapter` port.
+pub use adapters::broker::BinanceAdapter;
+
+// VS-1.2.2 work-2.03: the regime classifier surface (FR-5 / FR-6, BACKLOG-5).
+// `Regime`/`RegimeBreakdown`/`RegimeCell`/`classify`/`ADX_TREND_THRESHOLD` are
+// the pure domain half; `RegimeDetector` is the stateful adapter composing the
+// VS-1.1.3 `Ema`/`Adx` adapters. REQUIRED under `deny(warnings)` + `pub(crate)
+// mod domain`/`mod adapters` — an un-re-exported public item is a `dead_code`
+// build error, not a warning. 2.04 steps the detector over the run + aggregates
+// the breakdown onto `BacktestResult`; 2.05 renders it.
+pub use adapters::backtest::RegimeDetector;
+pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
