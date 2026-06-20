@@ -122,19 +122,22 @@ impl SymbolFilters {
 
 /// Why a candidate entry was suppressed by [`compute_position_size`] (C4).
 ///
-/// Ordering of the checks matters: a `qty` floored to `0` **by the leverage cap**
-/// is [`LeverageCapZero`](SkipReason::LeverageCapZero) (checked first, so a zero
-/// is labelled by its true cause), then sub-`min_qty` is
-/// [`SubLot`](SkipReason::SubLot), then sub-`min_notional` is
-/// [`SubNotional`](SkipReason::SubNotional).
+/// Each skip is labelled by its **true cause**: the leverage cap is the cause
+/// only when it zeroed the **pre-quantization** size (`core == 0`); a positive
+/// `core` that floors to zero (or below `min_qty`) is a sub-lot quantization
+/// skip; a sized-but-too-small order is sub-notional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkipReason {
-    /// The floored quantity is below `filters.min_qty` (`LOT_SIZE.minQty`).
+    /// The (lot-step-floored) quantity is below one tradeable lot — either
+    /// floored to `0` because the risk budget was less than `filters.lot_step`,
+    /// or below `filters.min_qty` (`LOT_SIZE.minQty`). The leverage cap did NOT
+    /// bind (`core > 0`); the size is simply too small to round to a whole lot.
     SubLot,
     /// The order notional (`qty · entry`) is below `filters.min_notional`.
     SubNotional,
-    /// The leverage cap drove the quantity to `0` (a tiny equity / large entry
-    /// price under a low cap leaves no room for even the smallest position).
+    /// The leverage cap (or a zero risk budget) drove the **pre-quantization**
+    /// size to `0` — the effective cap left no notional room for any position at
+    /// all (distinct from a positive size that merely floors below one lot).
     LeverageCapZero,
 }
 
@@ -162,13 +165,14 @@ pub enum SizingOutcome {
 /// Steps, in order (C1):
 /// 1. `cap = min(strategy_max_leverage, filters.max_leverage)`.
 /// 2. `core = risk_capped_qty(equity, risk_per_trade_pct, entry, stop, cap)`.
-/// 3. **Floor** `core` to `filters.lot_step` (`(q / step).floor() · step`,
+/// 3. If `core == 0` (the cap left no room **before** flooring) →
+///    [`LeverageCapZero`](SkipReason::LeverageCapZero).
+/// 4. **Floor** `core` to `filters.lot_step` (`(q / step).floor() · step`,
 ///    always **down**); `lot_step == 0` ⇒ no flooring.
-/// 4. Skip checks (in this order): floored `qty == 0` →
-///    [`LeverageCapZero`](SkipReason::LeverageCapZero); floored `qty <
-///    filters.min_qty` → [`SubLot`](SkipReason::SubLot); `qty·entry <
-///    filters.min_notional` → [`SubNotional`](SkipReason::SubNotional); else
-///    [`Sized(qty)`](SizingOutcome::Sized).
+/// 5. Skip checks by true cause: floored `qty == 0` (positive `core` below one
+///    lot) OR `qty < filters.min_qty` → [`SubLot`](SkipReason::SubLot);
+///    `qty·entry < filters.min_notional` → [`SubNotional`](SkipReason::SubNotional);
+///    else [`Sized(qty)`](SizingOutcome::Sized).
 ///
 /// `strategy_max_leverage` is passed **positionally** (the caller's
 /// `RiskParams.max_leverage`) — the cleaner Rust shape for a five-filter +
@@ -192,18 +196,25 @@ pub fn compute_position_size(
     // 2. The single arithmetic path (zero-stop refusal propagates).
     let core = risk_capped_qty(equity, risk_per_trade_pct, entry_price, stop_price, cap)?;
 
-    // 3. Floor to the lot step (always DOWN). `lot_step == 0` ⇒ no flooring.
+    // 3. Skip checks, labelled by TRUE cause. The leverage cap is the cause ONLY
+    //    when it drove the PRE-quantization size to zero (`core == 0`, e.g. a
+    //    zero/near-zero effective cap leaves no notional room). A positive `core`
+    //    that later floors to zero is a sub-lot quantization skip, NOT a cap skip
+    //    — so the cap check must read `core`, before flooring.
+    if core.is_zero() {
+        return Ok(SizingOutcome::Skipped(SkipReason::LeverageCapZero));
+    }
+
+    // 4. Floor to the lot step (always DOWN). `lot_step == 0` ⇒ no flooring.
     let qty = if filters.lot_step.is_zero() {
         core
     } else {
         (core / filters.lot_step).floor() * filters.lot_step
     };
 
-    // 4. Skip checks, ordered so a zero is labelled by its true cause.
-    if qty.is_zero() {
-        return Ok(SizingOutcome::Skipped(SkipReason::LeverageCapZero));
-    }
-    if !filters.min_qty.is_zero() && qty < filters.min_qty {
+    // 5. A positive `core` that floored to zero is below one lot — a sub-lot
+    //    (quantization) skip, same class as `qty < min_qty`.
+    if qty.is_zero() || (!filters.min_qty.is_zero() && qty < filters.min_qty) {
         return Ok(SizingOutcome::Skipped(SkipReason::SubLot));
     }
     if !filters.min_notional.is_zero() && qty * entry_price < filters.min_notional {
@@ -440,14 +451,15 @@ mod tests {
     }
 
     #[test]
-    fn leverage_cap_zero_skips_before_sub_lot_or_notional() {
-        // A leverage cap that floors qty to exactly 0 must be labelled
-        // LeverageCapZero, NOT SubLot/SubNotional (zero checked first).
+    fn core_below_one_lot_floors_to_zero_and_skips_with_sublot_reason() {
+        // A POSITIVE core that floors to 0 (the risk budget is less than one lot)
+        // is a SubLot quantization skip — the leverage cap did NOT bind, so it
+        // must NOT be labelled LeverageCapZero (PR #54 Codex P2: "report zero-lot
+        // skips as sub-lot").
         // equity 10, risk 1%, entry 100, stop 50 → dist 50.
-        // risk_qty = 10*0.01/50 = 0.1/50 = 0.002.
-        // cap 1x → max_qty = 10*1/100 = 0.1 → core = min(0.002, 0.1) = 0.002.
-        // lot_step 1 → floor(0.002/1)*1 = 0 → LeverageCapZero (even though
-        // min_qty 5 and min_notional 1_000 would also "fail").
+        // risk_qty = 10*0.01/50 = 0.002. cap 1x → max_qty = 10*1/100 = 0.1, so
+        // core = min(0.002, 0.1) = 0.002 (> 0: risk_qty won, cap did NOT bind).
+        // lot_step 1 → floor(0.002/1)*1 = 0 → SubLot (below one lot).
         let filters = SymbolFilters {
             lot_step: dec(1, 0),
             min_qty: dec(5, 0),
@@ -460,6 +472,31 @@ mod tests {
             dec(100, 0),
             dec(50, 0),
             dec(1, 0), // 1x strategy cap
+            &filters,
+        )
+        .unwrap();
+        assert_eq!(outcome, SizingOutcome::Skipped(SkipReason::SubLot));
+    }
+
+    #[test]
+    fn zero_effective_cap_skips_with_leverage_cap_zero_reason() {
+        // A genuine LeverageCapZero: a zero effective cap zeroes the
+        // PRE-quantization size (core == 0) — no room for ANY position, distinct
+        // from a positive core that merely floors below one lot. Exchange cap 0
+        // ⇒ effective cap min(10, 0) = 0 ⇒ max_qty = equity*0/entry = 0 ⇒
+        // core = min(risk_qty, 0) = 0 → LeverageCapZero.
+        let filters = SymbolFilters {
+            lot_step: dec(1, 3),
+            min_qty: dec(1, 3),
+            min_notional: dec(100, 0),
+            max_leverage: dec(0, 0), // exchange cap 0 wins over the strategy cap
+        };
+        let outcome = compute_position_size(
+            dec(10_000, 0),
+            dec(1, 2),
+            dec(100, 0),
+            dec(95, 0),
+            dec(10, 0), // 10x strategy cap, but the 0 exchange cap binds
             &filters,
         )
         .unwrap();
