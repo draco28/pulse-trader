@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: fmt + clippy + nextest
@@ -16,13 +19,15 @@ jobs:
       SQLX_OFFLINE: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
 
       - name: Install toolchain (pinned via rust-toolchain.toml)
         run: rustup show
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@cfdc41eb4dcb5a6d098e06c87a1e91076b799307  # nextest
 
       - name: Format check
         run: cargo fmt --check
@@ -42,7 +47,9 @@ jobs:
     name: sqlx prepare --check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - name: Install toolchain
         run: rustup show
       - name: Install sqlx-cli (pinned to the project sqlx version)
@@ -65,7 +72,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4   # SHA-pinned in Task 9
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - run: bash .github/scripts/check-no-private-docs.sh
 
   cargo-deny:
@@ -73,5 +82,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4   # SHA-pinned in Task 9
-      - uses: EmbarkStudios/cargo-deny-action@v2   # SHA-pinned in Task 9
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe  # v2
