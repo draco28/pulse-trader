@@ -115,10 +115,24 @@ pub struct Trade {
     /// construction. The **full exit-bar range** folds in (no intra-bar path
     /// reconstruction), so `mfe_r >= realized_r` is NOT guaranteed (documented
     /// overshoot) and is not asserted.
+    ///
+    /// **Semantics — full-bar *potential* excursion, NOT experienced excursion.**
+    /// Because the entire exit bar's high/low are folded in, a trade that exits at
+    /// the bar **open** (a signal-exit fill, or a gap-through-stop/TP at the open)
+    /// still records the rest of that bar's range — price action that occurred
+    /// *after* the position was already closed. So `mfe_r`/`mae_r` bound the
+    /// regime's *potential* excursion over the held span, not the path the trade
+    /// actually experienced. Coaching/analytics (MASTER-SPEC Phase 1 §(e)) must
+    /// read them as potential-excursion bounds, not as proof of an experienced
+    /// price path. (Deliberate v1 simplification, grill amendment 3; a separate
+    /// realized-hold excursion is deferred — see close-audit finding.)
     pub mfe_r: Decimal,
     /// Maximum **adverse** excursion in R-multiples (FR-6, C5): the largest
     /// intra-bar move against the trade, measured + normalized like `mfe_r`.
-    /// Initialized to 0 at entry, so `mae_r <= 0` by construction.
+    /// Initialized to 0 at entry, so `mae_r <= 0` by construction. Same
+    /// **full-bar potential** semantics as [`mfe_r`](Self::mfe_r) — includes the
+    /// full exit bar (post-close range for an at-open exit), so it is a
+    /// potential-excursion bound, not the experienced path.
     pub mae_r: Decimal,
 
     /// Why the trade closed.

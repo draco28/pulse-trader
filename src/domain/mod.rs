@@ -74,18 +74,20 @@ pub use pair::Pair;
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{ExchangeAdapter, MarketDataSource, StrategyRepository};
-// VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5). The
-// pure money-math (`risk_capped_qty` core + `compute_position_size`), the
+// VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
+// `compute_position_size` is the single exchange-constrained sizing entry; the
 // `SymbolFilters` value type + its `unconstrained()` ctor, and the
 // `SizingOutcome`/`SkipReason` skip-and-count substrate (2.04 wires, 2.05
 // renders). The dedicated `ExchangeError` (audit C5) rides the `ExchangeAdapter`
 // port. Re-exported so `lib.rs` can curate the crate surface — an un-re-exported
 // public domain type is a `dead_code` BUILD error under `deny(warnings)`.
+// NFR-3 hardening (slice-close): the pre-quantization core `risk_capped_qty` is
+// NOT re-exported — it bypasses the exchange constraints, so it stays
+// crate-internal (used only by `compute_position_size` + the in-module proptests).
 pub use exchange::ExchangeError;
 pub use series::{CandleSeries, Gap};
 pub use sizing::{
     SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters, compute_position_size,
-    risk_capped_qty,
 };
 pub use timeframe::Timeframe;
 pub use version::DataVersion;

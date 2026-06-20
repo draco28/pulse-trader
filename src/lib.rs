@@ -226,17 +226,24 @@ pub use domain::{
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
 // BACKLOG-5) — the `pulse-broker` money-math home. `compute_position_size` is the
-// single sizer sim + (future v3) live execution share (NFR-3 by construction);
-// `risk_capped_qty` is its pre-quantization core (VS-1.2.1's `position_size`,
-// moved verbatim). `SymbolFilters` (+ `unconstrained()`) is the exchange-filter
+// **single** sizer sim + (future v3) live execution share (NFR-3 by
+// construction). `SymbolFilters` (+ `unconstrained()`) is the exchange-filter
 // value type; `SizingOutcome`/`SkipReason` are the skip-and-count substrate (2.04
 // wires, 2.05 renders). `ExchangeAdapter` is the exchange-metadata port;
 // `ExchangeError` its dedicated error (audit C5). REQUIRED under `deny(warnings)`
 // + `pub(crate) mod domain` — an un-re-exported public domain type is a
 // `dead_code` build error, not a warning.
+//
+// NFR-3 single-sizing-path hardening (VS-1.2.2 slice-close, close-audit finding):
+// the pre-quantization core `risk_capped_qty` is **intentionally NOT re-exported**
+// — it bypasses lot_step / min_qty / min_notional / exchange max-leverage, so
+// exposing it publicly would make the single-path invariant a convention rather
+// than construction. It stays crate-internal (the `pub(crate) mod domain` gate),
+// reachable only by `compute_position_size` (its sole production caller) + the
+// in-module proptests; the ONLY public sizing entry is `compute_position_size`.
 pub use domain::{
     ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters,
-    compute_position_size, risk_capped_qty,
+    compute_position_size,
 };
 
 // VS-1.2.2 work-2.01: the `BinanceAdapter` exchange-metadata implementor
