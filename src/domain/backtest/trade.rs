@@ -107,6 +107,19 @@ pub struct Trade {
     /// costs can push it past −1R (G3).
     pub realized_r: Decimal,
 
+    /// Maximum **favorable** excursion in R-multiples (FR-6, C5): the largest
+    /// intra-bar move in the trade's direction across every held bar (entry-fill
+    /// to exit-fill inclusive), measured from the entry fill price and normalized
+    /// by the initial stop distance. Initialized to 0 at entry, so `mfe_r >= 0` by
+    /// construction. The **full exit-bar range** folds in (no intra-bar path
+    /// reconstruction), so `mfe_r >= realized_r` is NOT guaranteed (documented
+    /// overshoot) and is not asserted.
+    pub mfe_r: Decimal,
+    /// Maximum **adverse** excursion in R-multiples (FR-6, C5): the largest
+    /// intra-bar move against the trade, measured + normalized like `mfe_r`.
+    /// Initialized to 0 at entry, so `mae_r <= 0` by construction.
+    pub mae_r: Decimal,
+
     /// Why the trade closed.
     pub exit_reason: ExitReason,
     /// Where the trade originated.
@@ -148,6 +161,8 @@ mod tests {
             slippage_total: Decimal::new(2, 2),
             realized_pnl: Decimal::new(20, 0),
             realized_r: Decimal::new(2, 0),
+            mfe_r: Decimal::new(25, 1), // 2.5
+            mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
         }
@@ -161,6 +176,16 @@ mod tests {
         assert!(t.entry_signal_time <= t.entry_fill_time);
         assert!(t.exit_signal_time <= t.exit_fill_time);
         assert_eq!(t.direction, Direction::Long);
+    }
+
+    #[test]
+    fn trade_carries_mfe_mae_with_correct_signs() {
+        // C5 invariant: the favorable excursion is non-negative and the adverse
+        // excursion is non-positive (holds by the init-0 running sample). The
+        // round-trip below also proves the new Decimal fields survive serde.
+        let t = sample_trade();
+        assert!(t.mfe_r >= Decimal::ZERO, "mfe_r must be >= 0");
+        assert!(t.mae_r <= Decimal::ZERO, "mae_r must be <= 0");
     }
 
     #[test]
