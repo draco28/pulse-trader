@@ -16,6 +16,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use super::regime::Regime;
 use crate::domain::Direction;
 
 /// Why a trade closed. Only the four exit kinds this slice models appear —
@@ -124,6 +125,13 @@ pub struct Trade {
     pub exit_reason: ExitReason,
     /// Where the trade originated.
     pub source: TradeSource,
+
+    /// The market [`Regime`] in effect at the entry-fill bar (FR-6, VS-1.2.2
+    /// work-2.04). The engine steps a [`RegimeDetector`](crate::RegimeDetector)
+    /// on the primary M15 series once per bar and tags the position with the
+    /// then-current regime at open; it is `Unknown` while the EMA200/ADX warm.
+    /// `RegimeBreakdown` aggregates `(regime, realized_pnl)` over the trade log.
+    pub regime: Regime,
 }
 
 #[cfg(test)]
@@ -131,6 +139,7 @@ pub struct Trade {
 mod tests {
     use super::{ExitReason, Fill, Trade, TradeSource};
     use crate::domain::Direction;
+    use crate::domain::backtest::Regime;
     use rust_decimal::Decimal;
 
     fn sample_trade() -> Trade {
@@ -165,6 +174,7 @@ mod tests {
             mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
         }
     }
 

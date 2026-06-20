@@ -22,6 +22,31 @@
 //! A silent drift fails `golden_backtest_reproduces_frozen_trade_count_and_pnl`
 //! loudly; a deliberate change is a one-line, reviewed golden diff.
 //!
+//! ## Regime breakdown is DELIBERATELY NOT a frozen golden constant (audit C1+C2)
+//!
+//! Unlike `GOLDEN_NET_PNL`, the per-regime breakdown is **not** frozen as an exact
+//! constant. It is derived from EMA50/200 + ADX(14) thresholding, and those
+//! indicators round through `f64` at the convert seam (the only float allowed,
+//! VS-1.1.3), so the breakdown inherits the deferred **#29** cross-arch
+//! determinism caveat: deterministic on the v1 pinned toolchain, but NOT
+//! byte-portable across architectures. Freezing it as a constant would make this
+//! test brittle on other targets for no regression-detection gain. Instead,
+//! `golden_regime_breakdown_is_non_vacuous` asserts the structural invariant — the
+//! run produces at least one non-`Unknown` regime — so a degenerate "everything is
+//! Unknown" breakdown still fails loudly. **Do not "fix" this into a frozen
+//! constant.** (2.04 reports the actual per-regime spread in the report.md before
+//! the slice ships; it is observed, not pinned.)
+//!
+//! ## Lot-step quantization (2.04 refreeze)
+//!
+//! 2.04 wired the engine onto the exchange-constrained `compute_position_size`,
+//! which floors the sized qty DOWN to the BTCUSDT `lot_step = 0.001`. That shrinks
+//! every position slightly, so the refrozen `GOLDEN_NET_PNL` is slightly SMALLER
+//! in magnitude than the VS-1.2.1 value (same sign), explainable purely by the
+//! qty-quantization fraction. The constant-independent
+//! `golden_entry_qty_is_lot_aligned` test proves the floor actually applied,
+//! independent of whatever `GOLDEN_NET_PNL` is set to.
+//!
 //! ## Calibration (C2 — done before freezing)
 //!
 //! A param grid was swept on this exact fixture; the canonical demo params
@@ -34,8 +59,8 @@
 use std::path::PathBuf;
 
 use pulse::{
-    BacktestConfig, BacktestResult, CandleSeries, CandleStore, Migrator, Pair, Timeframe, Trade,
-    compile, run_backtest, validate,
+    BacktestConfig, BacktestResult, BinanceAdapter, CandleSeries, CandleStore, ExchangeAdapter,
+    Migrator, Pair, Regime, Timeframe, Trade, compile, run_backtest, validate,
 };
 use rust_decimal::Decimal;
 
@@ -48,13 +73,28 @@ const GOLDEN_TRADE_COUNT: usize = 6;
 /// fees/funding/slippage) across the run. Exact `Decimal` — a silent engine
 /// drift changes this and fails the golden assertion. See the module header for
 /// regeneration.
-const GOLDEN_NET_PNL: &str = "145.38478212503902969051241815";
+///
+/// **2.04 refreeze (lot-step quantization).** Was `145.38478212503902969051241815`
+/// in VS-1.2.1 (raw `risk_capped_qty`, no exchange flooring). 2.04 wired the
+/// engine onto `compute_position_size`, which floors each entry qty DOWN to the
+/// BTCUSDT `lot_step = 0.001`; that shrinks every position slightly, so the net
+/// drops to the value below — **slightly smaller in magnitude, same (positive)
+/// sign** (a 2.13% / 3.09-quote reduction, well within the per-trade sub-lot
+/// flooring bound across 6 trades). Trade count is unchanged at 6 (no entry
+/// skipped). The constant-independent `golden_entry_qty_is_lot_aligned` guard
+/// proves the floor applied regardless of this value.
+const GOLDEN_NET_PNL: &str = "142.29083294950040454";
 
 /// The RSI lookback period the canonical fixture uses. The streaming indicator
 /// engine warms RSI(period) at candle index `period + 1` (the first index where
 /// `is_warm()` becomes true; matches the CLI `rsi:14_first_row=15` readout), so
 /// the first entry CANNOT fill before then (G6 real-data readiness gate).
 const RSI_PERIOD: usize = 14;
+
+/// The BTCUSDT `LOT_SIZE.stepSize` the golden quantizes to (the pinned
+/// `BinanceAdapter` filter). Every entry qty must be a positive integer multiple
+/// of this after 2.04's exchange-constrained sizing.
+const LOT_STEP: &str = "0.001";
 
 /// Load the primary M15 candle series from the committed offline fixture store
 /// (no network / LLM / SQLite): `with_base_dir` -> `read_head` -> `read_snapshot`.
@@ -83,10 +123,23 @@ fn run_golden(primary: &CandleSeries) -> BacktestResult {
     let loaded = Migrator::v1().load(&json).expect("load (migrate) strategy");
     let validated = validate(&loaded.dsl).expect("strategy validates");
     let compiled = compile(&validated).expect("strategy compiles");
+    // Resolve the REAL BTCUSDT USD-M filters through the `BinanceAdapter`
+    // exchange-metadata port (NFR-3 end-to-end): the golden quantizes the sized
+    // qty to `lot_step = 0.001` — this is what the 2.04 refreeze captures, vs. the
+    // engine unit tests' `SymbolFilters::unconstrained()`.
+    let filters = BinanceAdapter::new()
+        .symbol_filters(&Pair::new("BTCUSDT"))
+        .expect("BTCUSDT filters resolve through the port");
     // Single-TF M15: no HTF feed (htf = None). Default cost model: 4bps taker
     // fee, 1bp slippage, 10_000 starting equity.
-    run_backtest(&compiled, primary, None, &BacktestConfig::default())
-        .expect("backtest runs over the fixture")
+    run_backtest(
+        &compiled,
+        primary,
+        None,
+        &BacktestConfig::default(),
+        &filters,
+    )
+    .expect("backtest runs over the fixture")
 }
 
 /// Whether a trade's hold crossed at least one 8h funding boundary: a fixture
@@ -215,6 +268,63 @@ fn first_entry_respects_rsi_warmup() {
     );
 }
 
+/// 2.04 lot-step structural guard (constant-independent): every entry qty the
+/// golden produces is a **positive integer multiple of `lot_step` (0.001)**. This
+/// proves the exchange-constrained sizer's flooring actually applied — regardless
+/// of what `GOLDEN_NET_PNL` is frozen to (so it survives a refreeze and catches a
+/// laundered regression where the floor silently stops running). `qty / lot_step`
+/// must be a whole number (zero fractional part) and strictly positive.
+#[test]
+fn golden_entry_qty_is_lot_aligned() {
+    let primary = load_primary();
+    let result = run_golden(&primary);
+    let lot_step = Decimal::from_str_exact(LOT_STEP).expect("LOT_STEP parses");
+
+    assert!(
+        !result.trades.is_empty(),
+        "the golden run must produce trades for lot-alignment to be meaningful"
+    );
+    for (i, trade) in result.trades.iter().enumerate() {
+        assert!(
+            trade.qty > Decimal::ZERO,
+            "trade {i}: entry qty must be strictly positive, got {}",
+            trade.qty
+        );
+        let multiples = trade.qty / lot_step;
+        assert_eq!(
+            multiples.fract(),
+            Decimal::ZERO,
+            "trade {i}: entry qty {} is not a multiple of lot_step {lot_step} \
+             (qty/lot_step = {multiples}); the exchange flooring did not apply",
+            trade.qty
+        );
+    }
+}
+
+/// 2.04 regime non-vacuity (audit C1+C2): the golden run tags at least one trade
+/// with a **non-`Unknown`** regime — so a degenerate "every trade is Unknown"
+/// breakdown fails loudly rather than passing as "expected" (mirrors the
+/// VS-1.2.1 C2 non-vacuity guard). The breakdown itself is DELIBERATELY NOT a
+/// frozen constant (see the module header, #29 cross-arch caveat); this asserts
+/// only the structural invariant.
+#[test]
+fn golden_regime_breakdown_is_non_vacuous() {
+    let primary = load_primary();
+    let result = run_golden(&primary);
+
+    let non_unknown: usize = [Regime::TrendingUp, Regime::TrendingDown, Regime::Ranging]
+        .iter()
+        .map(|&r| result.regime_breakdown.cell(r).trade_count)
+        .sum();
+
+    assert!(
+        non_unknown >= 1,
+        "expected >= 1 trade in a non-Unknown regime (non-vacuous breakdown), got \
+         {non_unknown}; the EMA200/ADX warm at ~bar 200 of the 31-day fixture, so \
+         later entries should classify into a real regime"
+    );
+}
+
 /// Regeneration probe (ignored by default): prints the golden trade count, exact
 /// net P&L, funding-crossing count, and cost roll-ups. Run with `--ignored
 /// --nocapture` after a deliberate engine change; copy the emitted constants up.
@@ -235,6 +345,24 @@ fn print_golden_for_regeneration() {
     eprintln!("funding_total = {}", result.funding_total);
     eprintln!("fees_total = {}", result.fees_total);
     eprintln!("slippage_total = {}", result.slippage_total);
+    // Per-regime spread (counts + net P&L) — observed, NOT frozen (see header).
+    for (label, regime) in [
+        ("trending_up", Regime::TrendingUp),
+        ("trending_down", Regime::TrendingDown),
+        ("ranging", Regime::Ranging),
+        ("unknown", Regime::Unknown),
+    ] {
+        let cell = result.regime_breakdown.cell(regime);
+        eprintln!(
+            "regime[{label}] = count {} net_pnl {}",
+            cell.trade_count, cell.net_pnl
+        );
+    }
+    // Per-trade entry qty (proves lot-step alignment in the probe output).
+    for (i, t) in result.trades.iter().enumerate() {
+        eprintln!("trade[{i}] qty = {} regime = {:?}", t.qty, t.regime);
+    }
+    eprintln!("skipped_entries.total = {}", result.skipped_entries.total());
     eprintln!(
         "first_entry_fill_index = {}",
         first_entry_fill_index(&primary, &result)

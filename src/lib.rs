@@ -221,8 +221,7 @@ pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_back
 // MTF feed extends the same `backtest` tree at the R1→R2 merge).
 pub use domain::{
     BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
-    apply_slippage, funding_payment, position_size, realized_pnl, realized_r,
-    resolve_intra_bar_exit, taker_fee,
+    apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
 };
 
 // VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
@@ -236,7 +235,7 @@ pub use domain::{
 // + `pub(crate) mod domain` — an un-re-exported public domain type is a
 // `dead_code` build error, not a warning.
 pub use domain::{
-    ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SymbolFilters,
+    ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters,
     compute_position_size, risk_capped_qty,
 };
 

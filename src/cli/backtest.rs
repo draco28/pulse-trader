@@ -30,10 +30,11 @@ use std::path::PathBuf;
 use rust_decimal::Decimal;
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
+use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::CandleStore;
 use crate::domain::{
-    BacktestResult, CandleSeries, Direction, ExitReason, Migrator, Pair, StrategyDsl, Timeframe,
-    Trade, compile, validate,
+    BacktestResult, CandleSeries, Direction, ExchangeAdapter as _, ExitReason, Migrator, Pair,
+    StrategyDsl, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -125,7 +126,14 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config)
+    // Resolve the symbol's exchange filters through the `ExchangeAdapter` port —
+    // this is where the port is exercised end-to-end (NFR-3); the engine itself
+    // is a pure function of the resolved `SymbolFilters` value.
+    let filters = BinanceAdapter::new()
+        .symbol_filters(&pair)
+        .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
+
+    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
         .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 
     if args.json {
@@ -293,8 +301,9 @@ mod tests {
     use super::{TRADE_HEADER, dec, parse_dsl, reject_if_gapped, render_footer, render_trade_row};
     use crate::domain::{
         BacktestResult, Candle, CandleSeries, Comparator, Condition, DataVersion, Direction,
-        ExitReason, ExitRule, Fill, Pair, PriceField, RiskParams, SchemaVersion, StrategyDsl,
-        SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
+        ExitReason, ExitRule, Fill, Pair, PriceField, Regime, RegimeBreakdown, RiskParams,
+        SchemaVersion, SkippedEntryCounts, StrategyDsl, SweepableValue, Timeframe, Trade,
+        TradeSource, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -376,6 +385,7 @@ mod tests {
             mae_r: Decimal::new(-5, 1), // -0.5
             exit_reason: ExitReason::TakeProfit,
             source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
         }
     }
 
@@ -408,6 +418,8 @@ mod tests {
             fees_total: Decimal::new(12, 0),
             funding_total: Decimal::new(1, 0),
             slippage_total: Decimal::new(3, 0),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
         };
         let footer = render_footer(&result);
         assert!(footer.contains("trades=1"));

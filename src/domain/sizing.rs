@@ -2,8 +2,9 @@
 //!
 //! This is the `pulse-broker` money-math home, realized as a **module** this
 //! slice (the crate split is later). It promotes VS-1.2.1's inline
-//! [`position_size`](crate::domain::backtest::position_size) into a single,
-//! shared, pure sizer that applies **exchange constraints** (lot step / min qty /
+//! `position_size` (now [`risk_capped_qty`], its pre-quantization core moved here
+//! verbatim) into a single, shared, pure sizer that applies **exchange
+//! constraints** (lot step / min qty /
 //! min notional / exchange max-leverage). There is exactly **one** sizing
 //! function, so simulation and (future v3) live execution call the same code and
 //! cannot diverge — NFR-3 (the sizing identity) is enforced **by construction**,
@@ -212,10 +213,61 @@ pub fn compute_position_size(
     Ok(SizingOutcome::Sized(qty))
 }
 
+/// Bounded O(1) per-reason tally of entries [`compute_position_size`] suppressed
+/// over a backtest run (audit C4).
+///
+/// One `usize` counter per [`SkipReason`] — **not** an unbounded `Vec` of skip
+/// events: the engine (`crate::adapters::backtest`) holds one of these on its
+/// loop state and calls [`record`](SkippedEntryCounts::record) each time a
+/// candidate entry returns [`SizingOutcome::Skipped`], then surfaces it on the
+/// run result (2.04 wires, 2.05 renders). `Decimal`-free (pure counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SkippedEntryCounts {
+    /// Entries skipped because the floored qty was below `filters.min_qty`
+    /// ([`SkipReason::SubLot`]).
+    pub sub_lot: usize,
+    /// Entries skipped because the order notional was below
+    /// `filters.min_notional` ([`SkipReason::SubNotional`]).
+    pub sub_notional: usize,
+    /// Entries skipped because the leverage cap floored the qty to `0`
+    /// ([`SkipReason::LeverageCapZero`]).
+    pub leverage_capped: usize,
+}
+
+impl SkippedEntryCounts {
+    /// A fresh, all-zero tally.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Increment the cell matching `reason` (the engine calls this on each
+    /// [`SizingOutcome::Skipped`]).
+    pub fn record(&mut self, reason: SkipReason) {
+        let cell = match reason {
+            SkipReason::SubLot => &mut self.sub_lot,
+            SkipReason::SubNotional => &mut self.sub_notional,
+            SkipReason::LeverageCapZero => &mut self.leverage_capped,
+        };
+        *cell = cell.saturating_add(1);
+    }
+
+    /// Total entries suppressed across all reasons.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.sub_lot
+            .saturating_add(self.sub_notional)
+            .saturating_add(self.leverage_capped)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{SizingOutcome, SkipReason, SymbolFilters, compute_position_size, risk_capped_qty};
+    use super::{
+        SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters, compute_position_size,
+        risk_capped_qty,
+    };
     use crate::domain::backtest::BacktestError;
     use rust_decimal::Decimal;
 
@@ -452,6 +504,41 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BacktestError::NoStopLoss);
+    }
+
+    // --- SkippedEntryCounts: bounded O(1) per-reason tally (audit C4, 2.04). ---
+
+    #[test]
+    fn skipped_entry_counts_record_increments_matching_cell() {
+        let mut counts = SkippedEntryCounts::new();
+        assert_eq!(counts, SkippedEntryCounts::default());
+        counts.record(SkipReason::SubLot);
+        counts.record(SkipReason::SubLot);
+        counts.record(SkipReason::SubNotional);
+        counts.record(SkipReason::LeverageCapZero);
+        assert_eq!(counts.sub_lot, 2);
+        assert_eq!(counts.sub_notional, 1);
+        assert_eq!(counts.leverage_capped, 1);
+    }
+
+    #[test]
+    fn skipped_entry_counts_total_sums_all_reasons() {
+        let mut counts = SkippedEntryCounts::new();
+        assert_eq!(counts.total(), 0);
+        counts.record(SkipReason::SubLot);
+        counts.record(SkipReason::SubNotional);
+        counts.record(SkipReason::LeverageCapZero);
+        assert_eq!(counts.total(), 3);
+    }
+
+    #[test]
+    fn skipped_entry_counts_serde_round_trips() {
+        let mut counts = SkippedEntryCounts::new();
+        counts.record(SkipReason::SubNotional);
+        let json = serde_json::to_string(&counts).expect("serialize SkippedEntryCounts");
+        let back: SkippedEntryCounts =
+            serde_json::from_str(&json).expect("deserialize SkippedEntryCounts");
+        assert_eq!(counts, back);
     }
 }
 
