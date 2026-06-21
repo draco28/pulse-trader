@@ -78,6 +78,7 @@ pub fn run_indicators(args: &IndicatorsArgs) -> anyhow::Result<()> {
         "{}",
         render_summary(series.candles.len(), &columns, &first_rows)
     );
+    println!("\u{26a0} Not financial advice \u{2014} hypothetical results. See DISCLAIMER.md");
     Ok(())
 }
 
