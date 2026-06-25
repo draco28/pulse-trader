@@ -91,6 +91,16 @@ pub fn run_backtest(
     let mut state = LoopState::default();
     let direction = compiled.direction();
 
+    // D6 (NFR-1): build the funding-event index ONCE, before the trade loop, so
+    // funding accrual is O(trades × (log E + k)) over the ~1095 funding events
+    // instead of the old O(trades × candles) full rescan of ~35k bars. The index
+    // is `(open_time, rate)` for ONLY the funding-bearing candles; because the
+    // store guarantees gap-free chronological-ascending `open_time`, the index is
+    // sorted by construction (it preserves source order) — we assert/document
+    // this rather than re-sorting. Threaded by borrow through the close chain;
+    // built here, never per close.
+    let funding_index = build_funding_index(primary);
+
     for bar in align(primary, htf) {
         // The regime in effect for an entry filling at THIS bar's open is the one
         // determined by already-closed bars (the detector is stepped at the
@@ -113,7 +123,7 @@ pub fn run_backtest(
             // it. C5: after fill, before close.
             update_excursion(position, bar.primary);
         }
-        close_on_bar_open_or_price(&mut state, primary, bar.primary, config)?;
+        close_on_bar_open_or_price(&mut state, &funding_index, bar.primary, config)?;
 
         engine.step(bar.primary);
         // Advance the regime detector in lock-step with the indicator engine, once
@@ -144,7 +154,7 @@ pub fn run_backtest(
         }
     }
 
-    close_end_of_data(&mut state, primary, config)?;
+    close_end_of_data(&mut state, primary, &funding_index, config)?;
     Ok(state.into_result())
 }
 
@@ -357,7 +367,7 @@ fn update_excursion(position: &mut OpenPosition, candle: &Candle) {
 
 fn close_on_bar_open_or_price(
     state: &mut LoopState,
-    primary: &CandleSeries,
+    funding_index: &[(i64, Decimal)],
     candle: &Candle,
     config: &BacktestConfig,
 ) -> Result<(), BacktestError> {
@@ -390,14 +400,14 @@ fn close_on_bar_open_or_price(
                 reason: pending.reason,
             },
         };
-        close_position(state, primary, exit, config)?;
+        close_position(state, funding_index, exit, config)?;
         return Ok(());
     }
 
     // No pending signal-exit: the existing intra-bar SL/TP resolution runs
     // unchanged.
     if let Some(exit) = price_exit(candle, &position) {
-        close_position(state, primary, exit, config)?;
+        close_position(state, funding_index, exit, config)?;
     }
     Ok(())
 }
@@ -435,6 +445,7 @@ fn open_gap_reason(open: Decimal, position: &OpenPosition) -> Option<ExitReason>
 fn close_end_of_data(
     state: &mut LoopState,
     primary: &CandleSeries,
+    funding_index: &[(i64, Decimal)],
     config: &BacktestConfig,
 ) -> Result<(), BacktestError> {
     let Some(last) = primary.candles.last() else {
@@ -449,7 +460,7 @@ fn close_end_of_data(
         raw_price: last.close,
         reason: ExitReason::EndOfData,
     };
-    close_position(state, primary, exit, config)
+    close_position(state, funding_index, exit, config)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,7 +515,7 @@ fn stop_only_exit(candle: &Candle, position: &OpenPosition) -> Option<IntraBarEx
 
 fn close_position(
     state: &mut LoopState,
-    primary: &CandleSeries,
+    funding_index: &[(i64, Decimal)],
     exit: ExitFill,
     config: &BacktestConfig,
 ) -> Result<(), BacktestError> {
@@ -518,7 +529,7 @@ fn close_position(
         Side::Exit,
     );
     let exit_fee = taker_fee(position.qty * exit_price, config.taker_fee_bps);
-    let funding_total = funding_between(primary, &position, exit.fill_time);
+    let funding_total = funding_between(funding_index, &position, exit.fill_time);
     let fees_total = position.entry_fee + exit_fee;
     let slippage_total =
         position.entry_slippage + (exit.raw_price - exit_price).abs() * position.qty;
@@ -582,20 +593,56 @@ fn close_position(
     Ok(())
 }
 
+/// Build the once-per-run funding-event index (D6, NFR-1).
+///
+/// `(open_time, rate)` for ONLY the funding-bearing candles (`funding_rate.is_some()`),
+/// in source order. The store guarantees gap-free chronological-ascending
+/// `open_time`, so filtering preserves that order ⇒ the index is sorted **by
+/// construction** (no re-sort). A `debug_assert!` documents and checks the
+/// ascending-`open_time` invariant the windowed binary search in
+/// [`funding_between`] relies on. Built ONCE in `run_backtest` before the trade
+/// loop and threaded by borrow through the close chain — never rebuilt per close.
+fn build_funding_index(primary: &CandleSeries) -> Vec<(i64, Decimal)> {
+    let index: Vec<(i64, Decimal)> = primary
+        .candles
+        .iter()
+        .filter_map(|candle| candle.funding_rate.map(|rate| (candle.open_time, rate)))
+        .collect();
+    debug_assert!(
+        index.windows(2).all(|w| w[0].0 <= w[1].0),
+        "funding index must be ascending by open_time (store guarantees gap-free \
+         chronological candles); windowed binary search depends on it",
+    );
+    index
+}
+
+/// Sum the per-event funding payments accrued over a position's holding window.
+///
+/// Windowed binary search over the precomputed funding-event index (D6): the
+/// half-open `(entry_fill_time, exit_fill_time]` window is located with two
+/// `partition_point` probes (`open_time > entry_fill_time` lower bound,
+/// `open_time <= exit_fill_time` upper bound) — O(log E + k) instead of the old
+/// O(candles) rescan. The fold is **byte-identical by construction**: it visits
+/// the identical event set in the identical ascending order and computes
+/// `funding_payment(rate, notional, direction)` per event with the SAME per-event
+/// rounding as the prior `.filter(..).filter_map(..).map(..).sum()` chain.
+/// `notional = qty * entry_price` stays strictly per-trade (entry-notional, G4);
+/// it is NOT factored out into a size-scaled prefix-sum — that would reorder the
+/// `Decimal` multiply/round/add sequence and break the 3.04 cross-arch hash.
 fn funding_between(
-    primary: &CandleSeries,
+    funding_index: &[(i64, Decimal)],
     position: &OpenPosition,
     exit_fill_time: i64,
 ) -> Decimal {
     let notional = position.qty * position.entry_price;
-    primary
-        .candles
+    // `(entry_fill_time, exit_fill_time]`: lower bound is the first event with
+    // `open_time > entry_fill_time` (entry boundary EXCLUDED); upper bound is the
+    // first event with `open_time > exit_fill_time` (exit boundary INCLUDED).
+    let lo = funding_index.partition_point(|&(open_time, _)| open_time <= position.entry_fill_time);
+    let hi = funding_index.partition_point(|&(open_time, _)| open_time <= exit_fill_time);
+    funding_index[lo..hi]
         .iter()
-        .filter(|candle| {
-            candle.open_time > position.entry_fill_time && candle.open_time <= exit_fill_time
-        })
-        .filter_map(|candle| candle.funding_rate)
-        .map(|rate| funding_payment(rate, notional, position.direction))
+        .map(|&(_, rate)| funding_payment(rate, notional, position.direction))
         .sum()
 }
 
@@ -668,7 +715,10 @@ fn reject_unsupported(exits: &[CompiledExit]) -> Result<(), BacktestError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{BacktestConfig, OpenPosition, run_backtest, update_excursion};
+    use super::{
+        BacktestConfig, OpenPosition, build_funding_index, funding_between, run_backtest,
+        update_excursion,
+    };
     use crate::domain::{
         BacktestError, Candle, CandleSeries, Comparator, CompiledStrategy, Condition, DataVersion,
         Direction, ExitReason, ExitRule, Pair, PriceField, Regime, RiskParams, SchemaVersion,
@@ -936,6 +986,130 @@ mod tests {
         assert_eq!(result.trades.len(), 1);
         assert_eq!(result.trades[0].exit_reason, ExitReason::StopLoss);
         assert_eq!(result.trades[0].funding_total, d(-2));
+    }
+
+    /// A funding candle carrying an explicit (per-bar distinct) rate, so the
+    /// index-order and per-event-fold assertions below are non-degenerate.
+    fn funding_candle_rate(idx: i64, funding: Decimal) -> Candle {
+        Candle {
+            funding_rate: Some(funding),
+            ..candle(idx, 100, 101, 99, 100)
+        }
+    }
+
+    /// Reference implementation: the PRE-3.05 O(candles) full-rescan fold, exactly
+    /// as `funding_between` was written before the index refactor. The new
+    /// windowed-binary-search `funding_between` MUST equal this bit-for-bit for any
+    /// window — that equality is the byte-identity contract (D6).
+    fn funding_between_full_rescan(
+        primary: &CandleSeries,
+        position: &OpenPosition,
+        exit_fill_time: i64,
+    ) -> Decimal {
+        let notional = position.qty * position.entry_price;
+        primary
+            .candles
+            .iter()
+            .filter(|candle| {
+                candle.open_time > position.entry_fill_time && candle.open_time <= exit_fill_time
+            })
+            .filter_map(|candle| candle.funding_rate)
+            .map(|rate| super::funding_payment(rate, notional, position.direction))
+            .sum()
+    }
+
+    fn position_at(entry_fill_time: i64, direction: Direction) -> OpenPosition {
+        OpenPosition {
+            direction,
+            qty: d(3),
+            entry_price: d(100),
+            stop_price: d(95),
+            take_profit_price: None,
+            entry_signal_time: 0,
+            entry_fill_time,
+            entry_fee: Decimal::ZERO,
+            entry_slippage: Decimal::ZERO,
+            mfe_r: Decimal::ZERO,
+            mae_r: Decimal::ZERO,
+            regime: Regime::Unknown,
+        }
+    }
+
+    /// D6 unit coverage: (a) the funding-event index contains EXACTLY the
+    /// funding-bearing candles, in ascending `open_time` order; and (b) the new
+    /// windowed binary-search `funding_between` equals the old O(candles)
+    /// full-rescan fold bit-for-bit for representative `(entry, exit]` windows —
+    /// including the boundary-exclusion (entry) / boundary-inclusion (exit) edges,
+    /// the empty window, and both directions. This is the in-slice money-math
+    /// proof that the perf refactor is byte-identical (NFR-2).
+    #[test]
+    fn funding_index_contents_and_windowed_fold_match_full_rescan() {
+        // open_time = idx * 60_000 (see `candle`). Funding on bars 1, 3, 4, 6;
+        // plain bars at 0, 2, 5 must be excluded from the index. Distinct rates
+        // (including a negative one) make order + per-event arithmetic load-bearing.
+        let r1 = rate(1, 3); // 0.001
+        let r3 = rate(2, 3); // 0.002
+        let r4 = rate(-5, 4); // -0.0005
+        let r6 = rate(3, 3); // 0.003
+        let primary = series(vec![
+            candle(0, 100, 101, 99, 100),
+            funding_candle_rate(1, r1),
+            candle(2, 100, 101, 99, 100),
+            funding_candle_rate(3, r3),
+            funding_candle_rate(4, r4),
+            candle(5, 100, 101, 99, 100),
+            funding_candle_rate(6, r6),
+        ]);
+
+        // (a) index = exactly the funding-bearing candles, in ascending open_time.
+        let index = build_funding_index(&primary);
+        assert_eq!(
+            index,
+            vec![
+                (60_000, r1),
+                (3 * 60_000, r3),
+                (4 * 60_000, r4),
+                (6 * 60_000, r6),
+            ],
+            "index must hold exactly the funding-bearing candles, in source (ascending) order"
+        );
+        assert!(
+            index.windows(2).all(|w| w[0].0 < w[1].0),
+            "index open_times must be strictly ascending"
+        );
+
+        // (b) windowed fold == full-rescan fold, over representative windows and
+        // both directions. Each window is `(entry_fill_time, exit_fill_time]`.
+        let windows = [
+            (0, 6 * 60_000),          // whole series: all four events
+            (60_000, 4 * 60_000), // entry ON a funding bar (1 EXCLUDED), exit ON one (4 INCLUDED): {3,4}
+            (3 * 60_000, 6 * 60_000), // {4,6}
+            (4 * 60_000, 5 * 60_000), // exit between events, after the last in-range one: {}
+            (6 * 60_000, 9 * 60_000), // entry at/after the last event: {} (empty upper tail)
+            (0, 0),               // degenerate empty window
+        ];
+        for direction in [Direction::Long, Direction::Short] {
+            for &(entry_fill_time, exit_fill_time) in &windows {
+                let position = position_at(entry_fill_time, direction);
+                let windowed = funding_between(&index, &position, exit_fill_time);
+                let rescan = funding_between_full_rescan(&primary, &position, exit_fill_time);
+                assert_eq!(
+                    windowed, rescan,
+                    "windowed fold must equal full-rescan fold byte-for-byte \
+                     (dir={direction:?}, window=({entry_fill_time}, {exit_fill_time}])"
+                );
+            }
+        }
+
+        // Spot-check a concrete value so the test is not purely self-referential:
+        // long over the whole series folds -(r1+r3+r4+r6) * notional per event.
+        let long_whole = funding_between(&index, &position_at(0, Direction::Long), 6 * 60_000);
+        let notional = d(3) * d(100);
+        let expected = -(r1 * notional) - (r3 * notional) - (r4 * notional) - (r6 * notional);
+        assert_eq!(
+            long_whole, expected,
+            "long funding folds -rate*notional per event, in order"
+        );
     }
 
     #[test]
