@@ -6,10 +6,10 @@ use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, Direction, ExitReason, Fill, IntraBarExit, Regime, RegimeBreakdown, Side,
-    SizingOutcome, SkippedEntryCounts, SymbolFilters, Trade, TradeSource, align, apply_slippage,
-    compute_position_size, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit,
-    stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, Direction, EngineFingerprint, ExitReason, Fill, IntraBarExit, Regime,
+    RegimeBreakdown, Side, SizingOutcome, SkippedEntryCounts, SymbolFilters, Trade, TradeSource,
+    align, apply_slippage, compute_position_size, funding_payment, realized_pnl, realized_r,
+    resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -211,6 +211,10 @@ impl LoopState {
             slippage_total: Decimal::ZERO,
             regime_breakdown,
             skipped_entries: self.skipped_entries,
+            // FR-7 / NFR-2 (3.03): stamp every run with the build-time engine
+            // identity. EXCLUDED from the content hash (D4) — it is the cross-run
+            // comparison key, not part of the determinism oracle.
+            engine_fingerprint: EngineFingerprint::current(),
         };
         for trade in &result.trades {
             result.net_pnl += trade.realized_pnl;
