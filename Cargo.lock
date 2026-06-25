@@ -2668,6 +2668,7 @@ dependencies = [
  "hex",
  "polars",
  "proptest",
+ "rayon",
  "reqwest",
  "rust_decimal",
  "serde",

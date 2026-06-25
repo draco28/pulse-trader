@@ -19,6 +19,25 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+// VS-1.2.3 work-3.01 (D5): the SAME `schema_version_const.rs` that `build.rs`
+// `include!`s into the build-time `engine_fingerprint`. Pulling `DSL_SCHEMA_VERSION`
+// into this module via `include!` (not `mod`) keeps the const a single source of
+// truth across the build-script ↔ crate seam — the non-drift test below asserts
+// `SchemaVersion::CURRENT.to_string() == DSL_SCHEMA_VERSION`, so the structured
+// triple and the fingerprint's schema input can never desync.
+include!("schema_version_const.rs");
+
+// Compile-time consumption of the `include!`'d const in NON-test builds: the
+// production consumer of `DSL_SCHEMA_VERSION` is `build.rs` (a separate
+// compilation), so within the crate it would otherwise be `dead_code` under
+// `deny(warnings)`. This `const` assertion both keeps it live and statically
+// guarantees the shared schema string is non-empty (a blank schema version would
+// poison the build-time `engine_fingerprint`).
+const _: () = assert!(
+    !DSL_SCHEMA_VERSION.is_empty(),
+    "DSL_SCHEMA_VERSION (the build.rs ↔ crate fingerprint seam) must be non-empty"
+);
+
 /// The semantic version of a strategy DSL document.
 ///
 /// Ordering is derived from the field declaration order (major, then minor,
@@ -97,8 +116,23 @@ impl TryFrom<String> for SchemaVersion {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::SchemaVersion;
+    use super::{DSL_SCHEMA_VERSION, SchemaVersion};
     use std::str::FromStr;
+
+    /// VS-1.2.3 work-3.01 (D5): the build.rs ↔ crate seam non-drift guard. The
+    /// shared `schema_version_const.rs` (`include!`'d here AND into `build.rs`) is
+    /// the single source of the schema string folded into the build-time
+    /// `engine_fingerprint`; this asserts it stays byte-for-byte in lock-step with
+    /// the structured `SchemaVersion::CURRENT`, so the two can never desync.
+    #[test]
+    fn schema_const_matches_current_version() {
+        assert_eq!(SchemaVersion::CURRENT.to_string(), DSL_SCHEMA_VERSION);
+        // CURRENT parses back from the shared const (round-trip through the seam).
+        let parsed: SchemaVersion = DSL_SCHEMA_VERSION
+            .parse()
+            .expect("DSL_SCHEMA_VERSION parses as a SchemaVersion");
+        assert_eq!(parsed, SchemaVersion::CURRENT);
+    }
 
     /// AC-7: `CURRENT` serializes to a `"MAJOR.MINOR.PATCH"` string and
     /// round-trips; deserializing `"1.0.0"` equals `CURRENT`.
