@@ -68,6 +68,18 @@ impl EngineFingerprint {
         env!("PULSE_TARGET_TRIPLE")
     }
 
+    /// Test-only constructor for an arbitrary fingerprint value.
+    ///
+    /// Used by sibling-module determinism tests (e.g. `result::tests`) that must
+    /// build two results differing ONLY in their fingerprint to prove the content
+    /// hash excludes it (D4). Not part of the public surface — `current()` is the
+    /// sole production constructor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_raw_for_test(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
+
     /// FR-7 cross-fingerprint comparison.
     ///
     /// Returns [`None`] when `self` and `other` are byte-equal (the runs share an

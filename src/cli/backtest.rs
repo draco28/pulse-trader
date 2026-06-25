@@ -33,8 +33,8 @@ use crate::adapters::backtest::{BacktestConfig, run_backtest};
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::store::CandleStore;
 use crate::domain::{
-    BacktestResult, CandleSeries, Direction, ExchangeAdapter as _, ExitReason, Migrator, Pair,
-    Regime, StrategyDsl, Timeframe, Trade, compile, validate,
+    BacktestResult, CandleSeries, Direction, EngineFingerprint, ExchangeAdapter as _, ExitReason,
+    Migrator, Pair, Regime, StrategyDsl, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -269,6 +269,13 @@ fn render_footer(result: &BacktestResult) -> String {
         format!("fees_total={}", dec(result.fees_total)),
         format!("funding_total={}", dec(result.funding_total)),
         format!("slippage_total={}", dec(result.slippage_total)),
+        // FR-7 / NFR-2 (3.03): surface the build-time engine identity — the hex
+        // fingerprint plus the target triple (arch) — and the byte-stable content
+        // hash, so two runs are comparable (matching fingerprint) and reproducible
+        // (matching content hash). The content hash EXCLUDES the fingerprint (D4).
+        format!("engine_fingerprint={}", result.engine_fingerprint.as_str()),
+        format!("target={}", EngineFingerprint::target()),
+        format!("content_hash={}", result.result_content_hash()),
     ]
     .join("\t")
 }
@@ -366,6 +373,7 @@ fn regime_label(regime: Regime) -> &'static str {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::{EngineFingerprint, render_json};
     use super::{
         TRADE_HEADER, dec, parse_dsl, regime_label, reject_if_gapped, render_footer,
         render_regime_breakdown, render_skipped_entries, render_trade_row,
@@ -517,6 +525,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
         };
         let lines = render_regime_breakdown(&result);
         // Only the two regimes with trades appear (trending_down + unknown absent).
@@ -548,6 +557,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
         };
         let lines = render_regime_breakdown(&result);
         assert_eq!(lines.len(), 1);
@@ -566,6 +576,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
         };
         let line = render_skipped_entries(&result);
         assert_eq!(line, "skipped_entries=0");
@@ -586,6 +597,7 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: counts,
+            engine_fingerprint: EngineFingerprint::current(),
         };
         let line = render_skipped_entries(&result);
         assert!(line.contains("skipped_entries=4"), "line was: {line}");
@@ -604,6 +616,7 @@ mod tests {
             slippage_total: Decimal::new(3, 0),
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
         };
         let footer = render_footer(&result);
         assert!(footer.contains("trades=1"));
@@ -612,6 +625,57 @@ mod tests {
         // before costs = net + fees − funding + slippage = 1484 + 12 − 1 + 3 = 1498.
         assert!(footer.contains("gross_pnl=1498"), "footer was: {footer}");
         assert!(footer.contains("fees_total=12"));
+    }
+
+    /// AC-4 (`render_includes_fingerprint`): the engine fingerprint reaches BOTH
+    /// render surfaces — the human footer (`render_footer`) carries a non-empty
+    /// `engine_fingerprint=…`, the target arch (`target=…`), and the byte-stable
+    /// `content_hash=…`; and the `--json` object (the exact serialization
+    /// `render_json` emits) carries the `engine_fingerprint` field. FR-7 / NFR-2.
+    #[test]
+    fn render_includes_fingerprint() {
+        let result = BacktestResult {
+            trades: vec![sample_trade()],
+            net_pnl: Decimal::new(1_484, 0),
+            fees_total: Decimal::new(12, 0),
+            funding_total: Decimal::new(1, 0),
+            slippage_total: Decimal::new(3, 0),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
+        };
+
+        // Human footer: the fingerprint, the target arch, and the content hash.
+        let footer = render_footer(&result);
+        let fp = EngineFingerprint::current();
+        assert!(
+            footer.contains(&format!("engine_fingerprint={}", fp.as_str())),
+            "footer must carry the engine fingerprint, was: {footer}"
+        );
+        assert!(!fp.as_str().is_empty(), "fingerprint must be non-empty");
+        assert!(
+            footer.contains(&format!("target={}", EngineFingerprint::target())),
+            "footer must carry the target arch, was: {footer}"
+        );
+        assert!(
+            footer.contains(&format!("content_hash={}", result.result_content_hash())),
+            "footer must carry the byte-stable content hash, was: {footer}"
+        );
+
+        // `--json`: the field flows through the whole-result serialization that
+        // `render_json` emits. Assert against the identical serializer call so the
+        // `--json` object demonstrably carries the fingerprint.
+        let json = serde_json::to_string_pretty(&result).expect("serialize result");
+        assert!(
+            json.contains("engine_fingerprint"),
+            "json must carry the engine_fingerprint field, was: {json}"
+        );
+        assert!(
+            json.contains(fp.as_str()),
+            "json must carry the fingerprint hex value, was: {json}"
+        );
+        // `render_json` itself succeeds (prints to stdout, returns Ok).
+        render_json(&result).expect("render_json must succeed");
     }
 
     #[test]

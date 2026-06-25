@@ -6,11 +6,15 @@
 //! VS-1.2.4. All money figures are `Decimal` (NFR-2). 1.01 defines the shape;
 //! 1.03 populates it; 1.04 renders it to stdout.
 
+use std::fmt::Write as _;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use super::regime::RegimeBreakdown;
+use super::regime::{RegimeBreakdown, RegimeCell};
 use super::trade::Trade;
+use crate::domain::fingerprint::EngineFingerprint;
 use crate::domain::sizing::SkippedEntryCounts;
 
 /// The result of one backtest run: the trade log plus run-level totals.
@@ -44,12 +48,205 @@ pub struct BacktestResult {
     /// the run (audit C4): a bounded O(1) [`SkippedEntryCounts`] (sub-lot /
     /// sub-notional / leverage-capped), populated in `into_result`. 2.05 renders.
     pub skipped_entries: SkippedEntryCounts,
+
+    /// The build-time identity of the engine that produced this run (FR-7 /
+    /// NFR-2, VS-1.2.3 work-3.03). Populated from [`EngineFingerprint::current`]
+    /// at construction in `LoopState::into_result`; surfaced in the human footer
+    /// and the `--json` object. **Deliberately EXCLUDED from both
+    /// [`result_content_hash`](BacktestResult::result_content_hash) and
+    /// [`money_math_hash`](BacktestResult::money_math_hash)** (D4): the fingerprint
+    /// encodes the per-target triple, so including it would make two architectures
+    /// running the same backtest hash differently — it is the cross-run comparison
+    /// *key*, not part of the byte-identity determinism oracle.
+    pub engine_fingerprint: EngineFingerprint,
+}
+
+impl BacktestResult {
+    /// The **money-math** content hash: a SHA-256 over the byte-exact `Decimal` +
+    /// `usize` + enum money output ONLY — the trade log, the four run-level
+    /// `Decimal` totals (`net_pnl` / `fees_total` / `funding_total` /
+    /// `slippage_total`), and the `skipped_entries` counts. **Excludes the
+    /// `regime_breakdown`** (the f64-derived component) and **excludes the
+    /// `engine_fingerprint`** (D4).
+    ///
+    /// This is the always-byte-exact half of the structured/composable pair (D3):
+    /// every input is a `Decimal` (rendered through [`Decimal::normalize`] so
+    /// `0.10` and `0.1` hash identically — no `-0`/`NaN`/`Inf` to canonicalize),
+    /// a `usize`, an `i64`, or an enum — never a serialized `f64`. 3.04's
+    /// conservative fallback (carve regime out of the determinism oracle if a
+    /// cross-arch regime-classification divergence is ever observed) is the
+    /// one-line swap of [`result_content_hash`](Self::result_content_hash) for
+    /// this function.
+    #[must_use]
+    pub fn money_math_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        Self::feed_money_math(&mut hasher, self);
+        finalize_hex(hasher)
+    }
+
+    /// The **full** content hash (the determinism oracle 3.04 asserts on, D2): the
+    /// money-math base (see [`money_math_hash`](Self::money_math_hash)) with the
+    /// `regime_breakdown` folded in. **Excludes the `engine_fingerprint`** (D4) so
+    /// two architectures running the same backtest yield the SAME content hash —
+    /// the fingerprint is the cross-run comparison key, not part of the oracle.
+    ///
+    /// Composability (D3): the money-math feed is byte-identical to
+    /// [`money_math_hash`](Self::money_math_hash)'s, then the regime breakdown is
+    /// appended; the regime cells are `{ trade_count: usize, net_pnl: Decimal }`
+    /// over the four fixed `Regime` variants in a fixed order, so no `f64` enters
+    /// the digest — the regime path contributes only through byte-exact
+    /// `Decimal`/`usize` values whose *classification* 3.02 makes deterministic.
+    #[must_use]
+    pub fn result_content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        Self::feed_money_math(&mut hasher, self);
+        Self::feed_regime_breakdown(&mut hasher, &self.regime_breakdown);
+        finalize_hex(hasher)
+    }
+
+    /// Feed the money-math component into `hasher`: the trade log, the four
+    /// run-level `Decimal` totals, and the skipped-entry counts. Field order is
+    /// fixed and every field is length-delimited or fixed-width so no two distinct
+    /// results collide via boundary ambiguity (mirrors the canonical encoding in
+    /// `crate::adapters::store::version`). The `engine_fingerprint` is NOT fed
+    /// (D4).
+    fn feed_money_math(hasher: &mut Sha256, result: &Self) {
+        hasher.update((result.trades.len() as u64).to_be_bytes());
+        for trade in &result.trades {
+            feed_trade(hasher, trade);
+        }
+        feed_decimal(hasher, result.net_pnl);
+        feed_decimal(hasher, result.fees_total);
+        feed_decimal(hasher, result.funding_total);
+        feed_decimal(hasher, result.slippage_total);
+        feed_usize(hasher, result.skipped_entries.sub_lot);
+        feed_usize(hasher, result.skipped_entries.sub_notional);
+        feed_usize(hasher, result.skipped_entries.leverage_capped);
+    }
+
+    /// Feed the f64-derived regime breakdown into `hasher`: the four fixed
+    /// [`Regime`](crate::domain::Regime) cells in a fixed order, each contributing
+    /// its `trade_count: usize` + `net_pnl: Decimal` (both byte-exact — no `f64`).
+    fn feed_regime_breakdown(hasher: &mut Sha256, breakdown: &RegimeBreakdown) {
+        for cell in [
+            breakdown.trending_up(),
+            breakdown.trending_down(),
+            breakdown.ranging(),
+            breakdown.unknown(),
+        ] {
+            feed_regime_cell(hasher, cell);
+        }
+    }
+}
+
+/// Feed one [`Trade`]'s byte-exact fields into `hasher` in a fixed order. Every
+/// field is `Decimal` / `i64` / enum — never an `f64`. `Decimal`s go through
+/// [`feed_decimal`] (normalized); enums via their fixed `u8` discriminant tag;
+/// the fill log is length-prefixed.
+fn feed_trade(hasher: &mut Sha256, trade: &Trade) {
+    hasher.update([direction_tag(trade.direction)]);
+    feed_decimal(hasher, trade.qty);
+    feed_decimal(hasher, trade.entry_price);
+    feed_decimal(hasher, trade.exit_price);
+    hasher.update(trade.entry_signal_time.to_be_bytes());
+    hasher.update(trade.entry_fill_time.to_be_bytes());
+    hasher.update(trade.exit_signal_time.to_be_bytes());
+    hasher.update(trade.exit_fill_time.to_be_bytes());
+    hasher.update((trade.fills.len() as u64).to_be_bytes());
+    for fill in &trade.fills {
+        feed_decimal(hasher, fill.price);
+        feed_decimal(hasher, fill.qty);
+        hasher.update(fill.time_ms.to_be_bytes());
+        feed_decimal(hasher, fill.fee);
+    }
+    feed_decimal(hasher, trade.fees_total);
+    feed_decimal(hasher, trade.funding_total);
+    feed_decimal(hasher, trade.slippage_total);
+    feed_decimal(hasher, trade.realized_pnl);
+    feed_decimal(hasher, trade.realized_r);
+    feed_decimal(hasher, trade.mfe_r);
+    feed_decimal(hasher, trade.mae_r);
+    hasher.update([exit_reason_tag(trade.exit_reason)]);
+    hasher.update([trade_source_tag(trade.source)]);
+    hasher.update([regime_tag(trade.regime)]);
+}
+
+/// Feed one [`RegimeCell`] (`{ trade_count: usize, net_pnl: Decimal }`).
+fn feed_regime_cell(hasher: &mut Sha256, cell: RegimeCell) {
+    feed_usize(hasher, cell.trade_count);
+    feed_decimal(hasher, cell.net_pnl);
+}
+
+/// Length-prefixed feed of a `Decimal` in its **normalized** UTF-8 string form so
+/// two arithmetically-equal totals (`0.10` vs `0.1`) hash identically. `Decimal`
+/// has no `-0`/`NaN`/`Inf`, so `.normalize()` is a total canonicalization.
+fn feed_decimal(hasher: &mut Sha256, value: Decimal) {
+    feed_str(hasher, &value.normalize().to_string());
+}
+
+/// Length-prefixed `usize` feed (fixed-width as a `u64` big-endian).
+fn feed_usize(hasher: &mut Sha256, value: usize) {
+    hasher.update((value as u64).to_be_bytes());
+}
+
+/// Length-prefixed string feed: an 8-byte big-endian length then the UTF-8 bytes,
+/// so concatenation is unambiguous (mirrors `store::version::feed_str`).
+fn feed_str(hasher: &mut Sha256, s: &str) {
+    hasher.update((s.len() as u64).to_be_bytes());
+    hasher.update(s.as_bytes());
+}
+
+/// Finalize the digest into a 64-char lowercase hex string.
+fn finalize_hex(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // `write!` to a String is infallible; the result is discarded.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Fixed `u8` discriminant tag for [`Direction`](crate::domain::Direction).
+fn direction_tag(direction: crate::domain::Direction) -> u8 {
+    match direction {
+        crate::domain::Direction::Long => 0,
+        crate::domain::Direction::Short => 1,
+    }
+}
+
+/// Fixed `u8` discriminant tag for [`super::ExitReason`].
+fn exit_reason_tag(reason: super::ExitReason) -> u8 {
+    match reason {
+        super::ExitReason::StopLoss => 0,
+        super::ExitReason::TakeProfit => 1,
+        super::ExitReason::Signal => 2,
+        super::ExitReason::EndOfData => 3,
+    }
+}
+
+/// Fixed `u8` discriminant tag for [`super::TradeSource`].
+fn trade_source_tag(source: super::TradeSource) -> u8 {
+    match source {
+        super::TradeSource::Backtest => 0,
+    }
+}
+
+/// Fixed `u8` discriminant tag for [`Regime`](crate::domain::Regime).
+fn regime_tag(regime: crate::domain::Regime) -> u8 {
+    match regime {
+        crate::domain::Regime::TrendingUp => 0,
+        crate::domain::Regime::TrendingDown => 1,
+        crate::domain::Regime::Ranging => 2,
+        crate::domain::Regime::Unknown => 3,
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::BacktestResult;
+    use crate::domain::fingerprint::EngineFingerprint;
     use rust_decimal::Decimal;
 
     fn empty_result() -> BacktestResult {
@@ -61,6 +258,58 @@ mod tests {
             slippage_total: Decimal::ZERO,
             regime_breakdown: crate::domain::backtest::RegimeBreakdown::new(),
             skipped_entries: crate::domain::sizing::SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
+        }
+    }
+
+    /// A non-vacuous result: one trade, non-zero totals, and a populated regime
+    /// cell, so the structured hash actually exercises every feed branch (trades,
+    /// the four totals, skipped-entry counts, and the folded regime breakdown).
+    fn nonempty_result() -> BacktestResult {
+        use crate::domain::backtest::RegimeBreakdown;
+        use crate::domain::sizing::{SkipReason, SkippedEntryCounts};
+        use crate::domain::{Direction, ExitReason, Regime};
+        use crate::domain::{Fill, Trade, TradeSource};
+
+        let trade = Trade {
+            direction: Direction::Long,
+            qty: Decimal::new(5, 1),
+            entry_price: Decimal::new(30_000, 0),
+            exit_price: Decimal::new(33_000, 0),
+            entry_signal_time: 1,
+            entry_fill_time: 2,
+            exit_signal_time: 3,
+            exit_fill_time: 4,
+            fills: vec![Fill {
+                price: Decimal::new(30_000, 0),
+                qty: Decimal::new(5, 1),
+                time_ms: 2,
+                fee: Decimal::new(6, 0),
+            }],
+            fees_total: Decimal::new(12, 0),
+            funding_total: Decimal::new(1, 0),
+            slippage_total: Decimal::new(3, 0),
+            realized_pnl: Decimal::new(1_484, 0),
+            realized_r: Decimal::new(2, 0),
+            mfe_r: Decimal::new(25, 1),
+            mae_r: Decimal::new(-5, 1),
+            exit_reason: ExitReason::TakeProfit,
+            source: TradeSource::Backtest,
+            regime: Regime::TrendingUp,
+        };
+        let mut regime_breakdown = RegimeBreakdown::new();
+        regime_breakdown.record(Regime::TrendingUp, trade.realized_pnl);
+        let mut skipped_entries = SkippedEntryCounts::new();
+        skipped_entries.record(SkipReason::SubLot);
+        BacktestResult {
+            trades: vec![trade.clone()],
+            net_pnl: trade.realized_pnl,
+            fees_total: trade.fees_total,
+            funding_total: trade.funding_total,
+            slippage_total: trade.slippage_total,
+            regime_breakdown,
+            skipped_entries,
+            engine_fingerprint: EngineFingerprint::current(),
         }
     }
 
@@ -74,9 +323,139 @@ mod tests {
 
     #[test]
     fn result_serde_round_trips() {
-        let r = empty_result();
+        let r = nonempty_result();
         let json = serde_json::to_string(&r).expect("serialize BacktestResult");
         let back: BacktestResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(r, back);
+    }
+
+    /// AC-1 (`result_hash`): `result_content_hash()` is a well-formed SHA-256 hex
+    /// digest (64 lowercase hex chars) over a non-vacuous result, and a DIFFERENT
+    /// math output yields a DIFFERENT hash (the oracle is content-sensitive, not a
+    /// constant). NFR-2: this is the cross-arch byte-identity oracle 3.04 asserts on.
+    #[test]
+    fn result_hash_is_well_formed_and_content_sensitive() {
+        let r = nonempty_result();
+        let hash = r.result_content_hash();
+        assert_eq!(
+            hash.len(),
+            64,
+            "content hash must be a 64-char sha2-256 hex"
+        );
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "content hash must be lowercase hex, got {hash:?}"
+        );
+        // A different money output must move the hash.
+        let mut other = r.clone();
+        other.net_pnl += Decimal::ONE;
+        assert_ne!(
+            hash,
+            other.result_content_hash(),
+            "a different net_pnl must change the content hash"
+        );
+        // And so must a different regime breakdown (the folded f64-derived part).
+        let mut regime_diff = r.clone();
+        regime_diff
+            .regime_breakdown
+            .record(crate::domain::Regime::Ranging, Decimal::new(7, 0));
+        assert_ne!(
+            hash,
+            regime_diff.result_content_hash(),
+            "a different regime breakdown must change the content hash (D2)"
+        );
+    }
+
+    /// AC-2 (`hash_is_stable`): the same result hashes IDENTICALLY across repeated
+    /// calls (the determinism oracle is a pure function of the result, with the
+    /// Decimal `.normalize()` canonicalization making `0.10` and `0.1` collide).
+    /// NFR-2.
+    #[test]
+    fn content_hash_is_stable_across_repeated_calls() {
+        let r = nonempty_result();
+        let first = r.result_content_hash();
+        for _ in 0..8 {
+            assert_eq!(
+                first,
+                r.result_content_hash(),
+                "result_content_hash must be a stable pure function of the result"
+            );
+        }
+        // Decimal canonicalization: 0.10 and 0.1 are arithmetically equal and MUST
+        // hash identically (the `.normalize()` discipline).
+        let mut a = r.clone();
+        a.net_pnl = Decimal::from_str_exact("0.10").expect("parse 0.10");
+        let mut b = r.clone();
+        b.net_pnl = Decimal::from_str_exact("0.1").expect("parse 0.1");
+        assert_eq!(
+            a.result_content_hash(),
+            b.result_content_hash(),
+            "0.10 and 0.1 must hash identically (normalized Decimal canonicalization)"
+        );
+    }
+
+    /// AC-3 (`money_math_hash`): the composable money-only half (D3). It is a
+    /// well-formed hex digest, it is STABLE, and — crucially — it is INDEPENDENT of
+    /// the `regime_breakdown` (so 3.04's fallback can swap to it in one line) while
+    /// `result_content_hash()` is NOT independent of regime. NFR-2.
+    #[test]
+    fn money_math_hash_is_composable_and_regime_independent() {
+        let r = nonempty_result();
+        let money = r.money_math_hash();
+        assert_eq!(money.len(), 64, "money_math_hash must be a 64-char hex");
+        assert_eq!(money, r.money_math_hash(), "money_math_hash must be stable");
+
+        // Changing ONLY the regime breakdown must NOT move money_math_hash (it
+        // excludes regime) but MUST move result_content_hash (it folds regime in).
+        let mut regime_diff = r.clone();
+        regime_diff
+            .regime_breakdown
+            .record(crate::domain::Regime::Ranging, Decimal::new(9, 0));
+        assert_eq!(
+            money,
+            regime_diff.money_math_hash(),
+            "money_math_hash must exclude the regime breakdown (D3)"
+        );
+        assert_ne!(
+            r.result_content_hash(),
+            regime_diff.result_content_hash(),
+            "result_content_hash must fold the regime breakdown in (D2)"
+        );
+        // Changing the money math MUST move money_math_hash.
+        let mut money_diff = r.clone();
+        money_diff.fees_total += Decimal::ONE;
+        assert_ne!(
+            money,
+            money_diff.money_math_hash(),
+            "a different fees_total must change money_math_hash"
+        );
+    }
+
+    /// D4 (`content_hash_excludes_fingerprint`): two results that differ ONLY in
+    /// their `engine_fingerprint` produce the SAME `result_content_hash()` AND the
+    /// same `money_math_hash()` — so two architectures running the same backtest
+    /// agree on the content hash. The fingerprint is the cross-run comparison key,
+    /// never part of the determinism oracle. NFR-2.
+    #[test]
+    fn content_hash_excludes_fingerprint() {
+        let base = nonempty_result();
+        let mut other = base.clone();
+        // A clearly-different (and clearly non-current) fingerprint.
+        other.engine_fingerprint = EngineFingerprint::from_raw_for_test("f".repeat(64));
+        assert_ne!(
+            base.engine_fingerprint, other.engine_fingerprint,
+            "the two results must genuinely differ in their fingerprint"
+        );
+        assert_eq!(
+            base.result_content_hash(),
+            other.result_content_hash(),
+            "result_content_hash must EXCLUDE engine_fingerprint (D4)"
+        );
+        assert_eq!(
+            base.money_math_hash(),
+            other.money_math_hash(),
+            "money_math_hash must EXCLUDE engine_fingerprint (D4)"
+        );
     }
 }
