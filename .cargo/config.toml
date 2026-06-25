@@ -8,3 +8,46 @@
 # is a plain flag, not a path.
 [env]
 SQLX_OFFLINE = "true"
+
+# -----------------------------------------------------------------------------
+# VS-1.2.3 work-3.02 -- floating-point determinism contract (NFR-2). Resolves #29
+# (FMA-off / guard half; the cross-arch CI matrix half is work-3.04).
+#
+# This is a DOCUMENTED GUARD SURFACE, not a magic flag. There is intentionally
+# NO `[build] rustflags` / `target-feature` entry here, and there MUST NOT be --
+# adding `+fma`, an `-ffast-math`-equivalent, or any `llvm-args` fp-contraction
+# switch would BREAK the cross-arch byte-identity this contract exists to
+# protect. The stance is enforced by ABSENCE, then guarded by a test.
+#
+# Why no flag is the correct lever (stable-Rust reality, NOT just an assertion):
+#   - Stable Rust/LLVM does NOT contract `a*b + c` into a fused multiply-add
+#     unless `f64::mul_add` is called EXPLICITLY. So FMA is opt-in at the call
+#     site, never an ambient codegen decision we must flag off.
+#   - Stable Rust exposes NO `-ffast-math`-equivalent / fp-contraction flag to
+#     turn on. There is nothing to disable; there is only something to NOT add.
+#   - The x87 80-bit-intermediate excess-precision hazard is a non-issue:
+#     `x86_64` uses SSE2 scalar f64 by default (no excess precision), matching
+#     aarch64's IEEE-754 binary64.
+#
+# The FP portability contract (D2):
+#   IEEE-754 `+  -  *  /` and `sqrt` are correctly-rounded by the standard ==>
+#   bit-identical on any compliant target. THEREFORE in the indicator / regime /
+#   backtest f64 math paths:
+#     - `sqrt`            -> ALLOWED  (correctly-rounded; e.g. future stddev).
+#     - `mul_add`         -> BANNED   (contracts to an FMA; different rounding).
+#     - transcendentals   -> BANNED   (`exp` `ln` `log` `powf` `powi` `sin`
+#                                      `cos` `tan` -- not standardized to the last
+#                                      ulp across libm implementations).
+#
+# Enforcement & authority:
+#   - Tripwire (advisory): `tests/determinism_guard.rs` scans the f64 math
+#     source for the banned call-forms (word-boundaried, call-form `(`-anchored,
+#     method + path/free-function forms) AND for shared-mutable / interior-
+#     mutable state (`static mut`, `thread_rng`, `lazy_static`, `OnceCell` /
+#     `OnceLock`, `Mutex` / `RwLock`, `RefCell` / `Cell<`) that would make
+#     `run_backtest` non-reentrant and flake 3.04's parallel arm.
+#   - Authority (proof): work-3.04's 100x-both-arches cross-arch CI compare is
+#     the AUTHORITATIVE determinism gate. A source scan only proves a token is
+#     absent, never that an f64 result is bit-identical -- do not read a green
+#     guard as the determinism guarantee.
+# -----------------------------------------------------------------------------
