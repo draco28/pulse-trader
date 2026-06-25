@@ -76,6 +76,12 @@ tempfile = "3"
 # VS-1.1.2 work-2.01 — property-based DSL serde round-trip harness (dev-only;
 # not in engine_fingerprint, so a floating "1" pin is fine).
 proptest = "1"
+# VS-1.2.3 work-3.04 — the 100x-parallel arm of the determinism proof
+# (`tests/determinism.rs`): `into_par_iter` runs `run_backtest` concurrently over
+# the REUSED golden fixture to exercise reentrancy (audit C4: no shared mutable
+# state). DEV-ONLY — never enters the runtime dep surface or the engine_fingerprint,
+# so a floating major-1 pin ("1") is fine (mirrors proptest/tempfile).
+rayon = "1"
 
 # Lints: deny(warnings) + clippy all + pedantic (MASTER-SPEC §7.1, audit C4).
 # unwrap/expect denied so library paths cannot panic (audit C5 / AC-7).
