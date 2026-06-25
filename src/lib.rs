@@ -24,6 +24,15 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
+// NFR-2). `current()` is the sha2-256 hex baked in by `build.rs`; `target()` is the
+// compiled triple (the arch tag for the cross-arch story); `compare()` is the FR-7
+// cross-fingerprint warning mechanism (built-but-unwired this slice — VS-1.2.4
+// surfaces it). REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an
+// un-re-exported public domain type is a `dead_code` build error, not a warning.
+// 3.03 attaches it to `BacktestResult` and reaches it through this re-export.
+pub use domain::EngineFingerprint;
+
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5). REQUIRED under
 // `deny(warnings)` + `pub(crate) mod domain` — a new public domain type unused
 // outside its module is a `dead_code` build error, not a warning (VS-1.1.2
