@@ -60,6 +60,14 @@ sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-toki
 # not in the engine/dep fingerprint, unlike sqlx.
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
+# the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock
+# as direct/transitive deps (sha2 "0.11", hex "0.4") — no lockfile churn. These are
+# build-script-only and do NOT enter the crate's runtime dependency surface.
+[build-dependencies]
+sha2 = "0.11"
+hex = "0.4"
+
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

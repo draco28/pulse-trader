@@ -14,6 +14,11 @@ mod candle;
 mod clock;
 mod dsl;
 mod error;
+// VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
+// NFR-2). Pure accessor over `build.rs`-baked env (`PULSE_ENGINE_FINGERPRINT` /
+// `PULSE_TARGET_TRIPLE`) plus the FR-7 `compare()` warning mechanism (built but
+// unwired this slice — VS-1.2.4 surfaces it).
+mod fingerprint;
 // VS-1.2.2 work-2.01: the dedicated exchange-port error taxonomy (audit C5).
 mod exchange;
 mod indicator;
@@ -68,6 +73,10 @@ pub use dsl::{
     EvalContext, compile, stop_price, take_profit_price,
 };
 pub use error::{DataError, ValidationError};
+// VS-1.2.3 work-3.01: the build-time engine identity (FR-7 / NFR-2). Re-exported
+// here so `lib.rs` can curate the crate surface; an un-re-exported public domain
+// type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use fingerprint::EngineFingerprint;
 pub use pair::Pair;
 // VS-1.1.4 work-1.02: the `StrategyRepository` port (FR-4 / FR-11) alongside
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
