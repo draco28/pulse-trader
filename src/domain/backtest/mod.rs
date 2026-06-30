@@ -26,6 +26,11 @@ mod regime;
 // NFR-2). Pure Decimal/usize folds over the already-final trade log + run totals;
 // oracle-excluded (README C3) so the frozen baseline stays frozen by construction.
 mod stats;
+// VS-1.2.4 work-4.04: the persisted backtest-run projection types (FR-6 / FR-7 /
+// NFR-2). `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back
+// projections of a persisted run (explicit columns per README C4, NOT a
+// `BacktestResult` blob — #68 / D1). `SqliteBacktestRunRepo` writes/reads them.
+mod run;
 
 // Re-exports kept at the `domain::backtest` surface so `domain/mod.rs` + `lib.rs`
 // can curate them onto the crate's public API (an un-re-exported public domain
@@ -36,5 +41,6 @@ pub use error::BacktestError;
 pub use feed::{AlignedBar, align};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
+pub use run::{BacktestRunId, PersistedRun, RunSummary};
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

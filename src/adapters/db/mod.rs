@@ -14,6 +14,10 @@
 
 mod paths;
 pub mod strategy_repo;
+// VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter (FR-6 / FR-7).
+// `query!` macros for `backtest_run`/`trade` are confined here (the `.sqlx` cache
+// is keyed to this file). Append-only beside `strategy_repo` (keep-both at merge).
+pub mod backtest_run_repo;
 
 // VS-1.1.4 work-1.05 (§4a-3): the CLI dispatch resolves the default `pulse.db`
 // path BEFORE calling `open_migrated` (migrate-then-open), so it must reach
@@ -24,6 +28,11 @@ pub mod strategy_repo;
 pub(crate) use paths::default_db_path;
 
 pub use strategy_repo::SqliteStrategyRepo;
+// VS-1.2.4 work-4.04: the run-repo adapter type. REQUIRED under `deny(warnings)` —
+// a `pub` type unused outside its module is a `dead_code` BUILD error (the
+// `db/mod.rs` re-export is necessary but not sufficient; lib.rs mirrors it).
+// Append-only (keep-both with strategy_repo's re-export at merge).
+pub use backtest_run_repo::SqliteBacktestRunRepo;
 
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT schema_version AS \"schema_version!: i64\" FROM backtest_run WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "schema_version!: i64",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "110189e883384b4383d03082f367e4d756b356238615975fedd6965873fccfd6"
+}

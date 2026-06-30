@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 id                  AS \"id!: String\",\n                 strategy_version_id AS \"strategy_version_id!: String\",\n                 schema_version      AS \"schema_version!: i64\",\n                 created_at          AS \"created_at!: String\",\n                 engine_fingerprint  AS \"engine_fingerprint!: String\",\n                 engine_target       AS \"engine_target!: String\",\n                 result_content_hash AS \"result_content_hash!: String\",\n                 net_pnl             AS \"net_pnl!: String\",\n                 expectancy          AS \"expectancy?: String\",\n                 trade_count         AS \"trade_count?: i64\"\n               FROM backtest_run\n               WHERE strategy_version_id = ?1\n               ORDER BY created_at, id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "strategy_version_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "schema_version!: i64",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine_fingerprint!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "engine_target!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "result_content_hash!: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "net_pnl!: String",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "expectancy?: String",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "trade_count?: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "7c3d45e00e8f1cb88e7e9e9c7cfc61fa5615d16d4e1ba9c0ae662c6bf92b639b"
+}
