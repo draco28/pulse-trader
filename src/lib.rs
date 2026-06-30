@@ -272,6 +272,17 @@ pub use adapters::broker::BinanceAdapter;
 pub use adapters::backtest::RegimeDetector;
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 
+// VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
+// (FR-6 / NFR-2, BACKLOG-4). `SummaryStats`/`EquityCurve`/`EquityPoint` are the
+// pure-`Decimal`/`usize` headline read of a finished backtest, computed in
+// `LoopState::into_result` and attached to `BacktestResult`; oracle-excluded
+// (README C3) so the frozen baseline stays frozen by construction. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` build error, not a warning. 4.02 adds Sharpe/Sortino onto
+// the same struct; 4.03/4.04 persist these columns; 4.05 renders + rebuilds the
+// curve on read via the SAME `EquityCurve::from_trades` constructor.
+pub use domain::{EquityCurve, EquityPoint, SummaryStats};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which

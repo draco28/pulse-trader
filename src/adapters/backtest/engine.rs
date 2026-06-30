@@ -6,10 +6,10 @@ use crate::adapters::backtest::regime::RegimeDetector;
 use crate::adapters::indicators::engine::IndicatorEngine;
 use crate::domain::{
     BacktestError, BacktestResult, Candle, CandleSeries, CompiledCondition, CompiledExit,
-    CompiledStrategy, Direction, EngineFingerprint, ExitReason, Fill, IntraBarExit, Regime,
-    RegimeBreakdown, Side, SizingOutcome, SkippedEntryCounts, SymbolFilters, Trade, TradeSource,
-    align, apply_slippage, compute_position_size, funding_payment, realized_pnl, realized_r,
-    resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
+    CompiledStrategy, Direction, EngineFingerprint, EquityCurve, ExitReason, Fill, IntraBarExit,
+    Regime, RegimeBreakdown, Side, SizingOutcome, SkippedEntryCounts, SummaryStats, SymbolFilters,
+    Trade, TradeSource, align, apply_slippage, compute_position_size, funding_payment,
+    realized_pnl, realized_r, resolve_intra_bar_exit, stop_price, take_profit_price, taker_fee,
 };
 
 /// Runtime knobs for the deterministic backtest loop.
@@ -155,7 +155,11 @@ pub fn run_backtest(
     }
 
     close_end_of_data(&mut state, primary, &funding_index, config)?;
-    Ok(state.into_result())
+    // The leading equity point's time is the run's first primary candle open
+    // (README C2 / D5). An empty primary series has no run-start bar; fall back to
+    // 0 (the run produced no trades either, so the curve is just the leading point).
+    let run_start_time_ms = primary.candles.first().map_or(0, |candle| candle.open_time);
+    Ok(state.into_result(config, run_start_time_ms))
 }
 
 #[derive(Debug, Clone)]
@@ -207,7 +211,15 @@ struct LoopState {
 }
 
 impl LoopState {
-    fn into_result(self) -> BacktestResult {
+    /// Fold the accumulated trade log into the final [`BacktestResult`].
+    ///
+    /// `config` supplies the constant `starting_equity` base for the equity curve
+    /// (D5); `run_start_time_ms` is the run's first primary candle open, the
+    /// leading equity point's time. The derived read-only `summary` + `equity_curve`
+    /// are computed as pure folds **after** the existing totals loop (D1) — they
+    /// read the already-final trade log + totals, never mutate them, and (the HARD
+    /// slice invariant, README C3/C8) are EXCLUDED from both content hashes.
+    fn into_result(self, config: &BacktestConfig, run_start_time_ms: i64) -> BacktestResult {
         let mut regime_breakdown = RegimeBreakdown::new();
         for trade in &self.trades {
             // Aggregate each closed trade into its entry-bar regime cell (FR-5).
@@ -225,6 +237,11 @@ impl LoopState {
             // identity. EXCLUDED from the content hash (D4) — it is the cross-run
             // comparison key, not part of the determinism oracle.
             engine_fingerprint: EngineFingerprint::current(),
+            // Derived read-only surfaces filled in below, AFTER the totals loop
+            // (D1). Default placeholders here so the struct is well-formed; the
+            // real values are computed once `net_pnl`/the cost totals are final.
+            summary: SummaryStats::default(),
+            equity_curve: EquityCurve::default(),
         };
         for trade in &result.trades {
             result.net_pnl += trade.realized_pnl;
@@ -232,6 +249,20 @@ impl LoopState {
             result.funding_total += trade.funding_total;
             result.slippage_total += trade.slippage_total;
         }
+        // Derived read-only folds over the now-final totals + trade log (D1 /
+        // README C1–C3). The equity curve is the single source of truth for
+        // `max_drawdown`, so it is built first and handed to the summary. NEITHER
+        // value is fed into `result_content_hash`/`money_math_hash` (D2/C8) — the
+        // frozen baseline stays frozen by construction (#69 untouched).
+        result.equity_curve =
+            EquityCurve::from_trades(run_start_time_ms, config.starting_equity, &result.trades);
+        result.summary = SummaryStats::from_trades(
+            &result.trades,
+            result.net_pnl,
+            result.fees_total,
+            result.funding_total,
+            &result.equity_curve,
+        );
         result
     }
 }
