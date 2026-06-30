@@ -88,10 +88,24 @@ impl EngineFingerprint {
     /// Used by sibling-module determinism tests (e.g. `result::tests`) that must
     /// build two results differing ONLY in their fingerprint to prove the content
     /// hash excludes it (D4). Not part of the public surface — `current()` is the
-    /// sole production constructor.
+    /// sole production constructor for *this build's* fingerprint.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_raw_for_test(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
+
+    /// Reconstruct a fingerprint value from a **persisted** hex string (VS-1.2.4
+    /// work-4.05, FR-7 read-back).
+    ///
+    /// `current()` mints *this build's* fingerprint; this constructor rehydrates a
+    /// fingerprint that was recorded by a possibly-different build — the
+    /// [`PersistedRun`](crate::PersistedRun)'s stored `engine_fingerprint` `TEXT`
+    /// column — so the FR-7 [`compare`](EngineFingerprint::compare) can run the
+    /// new run's fingerprint against the prior persisted one. The stored value is
+    /// already a validated hex digest on write (4.04); this is a pure wrap.
+    #[must_use]
+    pub fn from_stored(hex: impl Into<String>) -> Self {
         Self(hex.into())
     }
 
