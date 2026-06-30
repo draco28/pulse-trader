@@ -127,14 +127,19 @@ mechanisms enforce it:
    because they break that guarantee:
    - **`mul_add`** — contracts to a fused multiply-add, which rounds once
      instead of twice and so yields a different last bit.
-   - **Transcendentals** (`exp` / `ln` / `log` / `powf` / `powi` / `sin` /
-     `cos` / `tan`) — not standardized to the last ulp across libm
-     implementations, so their results can differ between architectures.
+   - **Transcendentals** (`exp` / `ln` / `log` / `log10` / `log2` / `ln_1p` /
+     `exp2` / `exp_m1` / `powf` / `powi` / `sin` / `cos` / `tan` / `sin_cos` /
+     `sinh` / `cosh` / `tanh` / `asin` / `acos` / `atan` / `atan2` / `cbrt` /
+     `hypot`) — not standardized to the last ulp across libm implementations, so
+     their results can differ between architectures. (This 23-name list plus
+     `mul_add` is the 24-token `BANNED_FP_CALLS` set the determinism guard
+     enforces — widened from the original 9 in VS-1.2.4 work-4.02, #70.)
 
-   `sqrt` is **allowed** (correctly-rounded; reserved for a future
-   `SummaryStats` stddev). The x87 80-bit excess-precision hazard is a
-   non-issue: `x86_64` uses SSE2 scalar f64 by default, matching aarch64's
-   IEEE-754 binary64.
+   `sqrt` is **allowed** (correctly-rounded; it is the single transcendental
+   permitted, and as of VS-1.2.4 work-4.02 the `SummaryStats` Sharpe/Sortino
+   stddev consumes it). The x87 80-bit excess-precision hazard is a non-issue:
+   `x86_64` uses SSE2 scalar f64 by default, matching aarch64's IEEE-754
+   binary64.
 
    **Stable-Rust reality (why this is enforced by absence, not a flag).**
    Stable Rust/LLVM does *not* contract `a*b + c` into an FMA unless

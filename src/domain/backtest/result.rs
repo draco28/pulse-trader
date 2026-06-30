@@ -24,7 +24,13 @@ use crate::domain::sizing::SkippedEntryCounts;
 /// the `*_total` fields are the run-wide cost roll-ups, surfaced separately so
 /// the demo's "fees/funding/slippage are deducted" readout (1.04) has them
 /// without re-summing the trade log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `PartialEq` but **not** `Eq`: as of VS-1.2.4 work-4.02 the nested
+/// `summary: SummaryStats` carries `sharpe`/`sortino` `f64` fields, so `Eq` is no
+/// longer derivable transitively. Determinism is unaffected — the two `f64`
+/// fields are oracle-excluded (never fed to either hash); `Eq` was only used for
+/// test equality, which `PartialEq` still provides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestResult {
     /// Every trade the run produced, in chronological order.
     pub trades: Vec<Trade>,
@@ -554,6 +560,8 @@ mod tests {
             max_loss_streak: 2,
             commission_total: Decimal::new(99, 0),
             funding_total: Decimal::new(-13, 0),
+            sharpe: Some(1.234),
+            sortino: Some(2.345),
         };
         assert_ne!(
             base.summary, summary_diff.summary,
@@ -589,6 +597,55 @@ mod tests {
                 base_money,
                 other.money_math_hash(),
                 "money_math_hash must EXCLUDE {label} (D2/README C3)"
+            );
+        }
+    }
+
+    /// AC-4 / D4 (`summary_excluded_from_content_hash`): the slice's HARD
+    /// oracle-exclusion invariant for the 4.02 f64 fields specifically — two
+    /// results differing ONLY in `summary.sharpe` / `summary.sortino` produce the
+    /// SAME `result_content_hash()` AND the same `money_math_hash()`. Folding an
+    /// f64 bit-pattern into the oracle would (a) make two architectures running
+    /// the same backtest hash differently and (b) move the frozen `49702fd5…`
+    /// baseline — so Sharpe/Sortino must never reach either hasher. This is
+    /// distinct from 4.01's `content_hash_excludes_summary_and_equity_curve` (the
+    /// whole-summary guard); this one is the sharpe/sortino-specific proof.
+    /// Mirrors `content_hash_excludes_fingerprint`. NFR-2.
+    #[test]
+    fn summary_excluded_from_content_hash() {
+        let base = nonempty_result();
+        let base_content = base.result_content_hash();
+        let base_money = base.money_math_hash();
+
+        // Perturb ONLY summary.sharpe / summary.sortino — every other byte of the
+        // result (trades, totals, regime, fingerprint, the rest of summary, the
+        // equity_curve) is untouched.
+        let mut sharpe_diff = base.clone();
+        sharpe_diff.summary.sharpe = Some(99.999);
+        sharpe_diff.summary.sortino = Some(-42.0);
+        assert_ne!(
+            base.summary, sharpe_diff.summary,
+            "the two results must genuinely differ in summary.sharpe/sortino"
+        );
+        // Also cover the None ⇄ Some flip so neither bit-pattern nor presence leaks.
+        let mut none_diff = base.clone();
+        none_diff.summary.sharpe = None;
+        none_diff.summary.sortino = None;
+
+        for (label, other) in [
+            ("sharpe/sortino values", &sharpe_diff),
+            ("None flip", &none_diff),
+        ] {
+            assert_eq!(
+                base_content,
+                other.result_content_hash(),
+                "result_content_hash must EXCLUDE summary.sharpe/sortino ({label}, D4) — \
+                 no f64 bit-pattern in the byte-identity oracle (NFR-2)"
+            );
+            assert_eq!(
+                base_money,
+                other.money_math_hash(),
+                "money_math_hash must EXCLUDE summary.sharpe/sortino ({label}, D4)"
             );
         }
     }

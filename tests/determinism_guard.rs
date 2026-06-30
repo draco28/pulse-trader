@@ -12,10 +12,12 @@
 //! Two scans, both over the f64 math paths only:
 //!   1. No fused-multiply-add / no transcendentals (FP portability contract D2).
 //!      IEEE-754 `+ - * /` and `sqrt` are correctly-rounded ⇒ bit-portable;
-//!      `mul_add` contracts to an FMA (different rounding) and the
-//!      transcendentals (`exp`/`ln`/`log`/`powf`/`powi`/`sin`/`cos`/`tan`) are
-//!      not standardized to the last ulp across libm implementations. `sqrt`
-//!      is therefore ALLOWED; everything in `BANNED_FP_CALLS` is not.
+//!      `mul_add` contracts to an FMA (different rounding) and the transcendentals
+//!      (the full `BANNED_FP_CALLS` set — `exp`/`ln`/`log`/`log10`/`log2`/`ln_1p`/
+//!      `exp2`/`exp_m1`/`powf`/`powi`/`sin`/`cos`/`tan`/`sin_cos`/`sinh`/`cosh`/
+//!      `tanh`/`asin`/`acos`/`atan`/`atan2`/`cbrt`/`hypot`) are not standardized
+//!      to the last ulp across libm implementations. `sqrt` is therefore ALLOWED;
+//!      everything in `BANNED_FP_CALLS` is not.
 //!   2. No shared mutable / interior-mutable state (audit C4 reentrancy scan):
 //!      `static mut`, `thread_rng`, `lazy_static`, `OnceCell`/`OnceLock`,
 //!      `Mutex`/`RwLock`, `RefCell`/`Cell<` — any of which could make
@@ -35,8 +37,19 @@ use std::path::PathBuf;
 
 /// Transcendentals + `mul_add` banned from the f64 math paths (FP contract D2).
 /// `sqrt` is intentionally absent — IEEE-754 correctly-rounded ⇒ bit-portable.
+///
+/// Widened for VS-1.2.4 work-4.02 (#70): the original 9-token v1 set
+/// (`mul_add`/`exp`/`ln`/`log`/`powf`/`powi`/`sin`/`cos`/`tan`) missed 15 other
+/// non-correctly-rounded f64 methods. The full 24-token ban now also covers
+/// `log10`/`log2`/`ln_1p`/`exp2`/`exp_m1`/`sin_cos`/`sinh`/`cosh`/`tanh`/`asin`/
+/// `acos`/`atan`/`atan2`/`cbrt`/`hypot`, so the next contributor reaching for any
+/// of them in a scanned math path trips the tripwire before CI. `sqrt` stays
+/// absent (the ONE allowed transcendental — Sharpe/Sortino's stddev in `stats.rs`
+/// consumes it).
 const BANNED_FP_CALLS: &[&str] = &[
-    "mul_add", "exp", "ln", "log", "powf", "powi", "sin", "cos", "tan",
+    "mul_add", "exp", "ln", "log", "powf", "powi", "sin", "cos", "tan", "log10", "log2", "ln_1p",
+    "exp2", "exp_m1", "sin_cos", "sinh", "cosh", "tanh", "asin", "acos", "atan", "atan2", "cbrt",
+    "hypot",
 ];
 
 /// Shared-mutable / interior-mutable markers that would break `run_backtest`
@@ -69,6 +82,11 @@ const SCAN_TARGETS: &[&str] = &[
     "src/domain/backtest/regime.rs",
     "src/adapters/backtest/regime.rs",
     "src/adapters/backtest/engine.rs",
+    // VS-1.2.4 work-4.02 (#70/D6): the NEW f64-bearing math surface — Sharpe/
+    // Sortino's `sqrt` + ratio. Scanned so a future banned call here is not a
+    // false-green hole; passes because the only transcendental present is the
+    // allowed `sqrt`.
+    "src/domain/backtest/stats.rs",
 ];
 
 fn manifest_relative(rel: &str) -> PathBuf {
