@@ -3,8 +3,9 @@
 //!
 //! Drives 1.04's protocol (`run_migrations_with_backup` / `undo_to`) + 1.01's
 //! `Db` open API through the `pulse::` surface — no new protocol code (§9). The
-//! embedded migration set ships `0001_init` (tables + immutability triggers) and
-//! `0002` (the `idx_strategy_name` index); the embedded max is therefore 2.
+//! embedded migration set ships `0001_init` (tables + immutability triggers),
+//! `0002` (the `idx_strategy_name` index), and `0003` (the `backtest_run` + `trade`
+//! system-of-record tables, VS-1.2.4 work-4.03); the embedded max is therefore 3.
 //!
 //! §4a-4: this uses the EXPORTED `undo_to(&pool, target)` wrapper, NOT
 //! `Migrator::undo` (a crate-root name collision resolving to the DSL document
@@ -87,8 +88,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        2,
-        "migrated to embedded max (2)"
+        3,
+        "migrated to embedded max (3)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -111,12 +112,12 @@ async fn migrate_up_then_undo_is_reversible() {
         "after undo, 0002 index gone"
     );
 
-    // (c) re-running brings it back (reversible round): 1 → 2.
+    // (c) re-running brings it back (reversible round): 1 → 3.
     MIGRATOR
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 2, "after re-run, max == 2");
+    assert_eq!(applied_max(db.pool()).await, 3, "after re-run, max == 3");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -148,7 +149,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 2, "to == the embedded max");
+            assert_eq!(to, 3, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -163,9 +164,78 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 2, "schema now at 0002");
+    assert_eq!(applied_max(db.pool()).await, 3, "schema now at 0003");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
+    );
+}
+
+// ---- AC-1 (VS-1.2.4 work-4.03): the 0003 backtest_run + trade roundtrip --------
+
+/// Whether all four `0003` objects (both tables + both indexes) are present.
+async fn schema_0003_present(pool: &SqlitePool) -> bool {
+    object_present(pool, "table", "backtest_run").await
+        && object_present(pool, "table", "trade").await
+        && object_present(pool, "index", "idx_br_strategy_version").await
+        && object_present(pool, "index", "idx_trade_run").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0003_backtest_run_and_trade_roundtrip() {
+    // (a) a fresh db migrated to the embedded max sits at 0003 with both new tables
+    //     and both new indexes present (C4 schema landed).
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("pulse.db");
+    let db = Db::with_path(&path).await.expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+
+    assert_eq!(
+        applied_max(db.pool()).await,
+        3,
+        "migrated to embedded max (3)"
+    );
+    assert!(
+        schema_0003_present(db.pool()).await,
+        "0003 backtest_run + trade tables and both indexes present after up"
+    );
+
+    // (b) undo_to(pool, 2) reverses ONLY 0003 — both new tables + indexes are gone,
+    //     max drops to 2, while the 0002 index (an earlier step) survives.
+    undo_to(db.pool(), 2).await.expect("undo to 2");
+    assert_eq!(applied_max(db.pool()).await, 2, "after undo, max == 2");
+    assert!(
+        !object_present(db.pool(), "table", "backtest_run").await,
+        "after undo to 2, backtest_run table gone"
+    );
+    assert!(
+        !object_present(db.pool(), "table", "trade").await,
+        "after undo to 2, trade table gone"
+    );
+    assert!(
+        !object_present(db.pool(), "index", "idx_br_strategy_version").await,
+        "after undo to 2, idx_br_strategy_version gone"
+    );
+    assert!(
+        !object_present(db.pool(), "index", "idx_trade_run").await,
+        "after undo to 2, idx_trade_run gone"
+    );
+    assert!(
+        index_present(db.pool()).await,
+        "after undo to 2, the earlier 0002 index survives"
+    );
+
+    // (c) re-running brings 0003 back (reversible round): 2 → 3.
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("re-run to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 3, "after re-run, max == 3");
+    assert!(
+        schema_0003_present(db.pool()).await,
+        "after re-run, 0003 backtest_run + trade tables and both indexes back"
     );
 }

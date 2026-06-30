@@ -55,10 +55,21 @@ pub enum MigrationOutcome {
 /// mismatch restores the original db from the backup and returns an error — the
 /// caller MUST treat that as fatal (REFUSE TO START, MASTER-SPEC §7.4).
 ///
+/// # Single-process v1 assumption (#38)
+/// This protocol assumes a **single process** brings the schema forward — v1 opens
+/// the db from exactly one CLI/app instance. There is intentionally NO cross-process
+/// advisory lock: two concurrent migrators racing the same `pulse.db` is out of
+/// scope (track-forward). The single-writer `SQLite` WAL + the ahead-state refusal
+/// below cover the v1 surface; a multi-process deployment would need the advisory
+/// lock added before this assumption is relaxed.
+///
 /// # Errors
 /// Returns [`DataError::Migration`] if the backup, migrate, or post-verify step
 /// fails (the original db is restored from the backup first; the backup is
-/// retained for forensics). Returns [`DataError::Db`] if the pool cannot be opened.
+/// retained for forensics), OR if the db is **ahead** of the embedded set
+/// (`applied_max > embedded_max` — a db newer than the binary must NOT be migrated
+/// *or* opened; refuse to start, MASTER-SPEC §7.4). Returns [`DataError::Db`] if the
+/// pool cannot be opened.
 pub async fn run_migrations_with_backup(db_path: &Path) -> Result<MigrationOutcome, DataError> {
     run_migrations_with_backup_using(db_path, &MIGRATOR).await
 }
@@ -82,9 +93,30 @@ async fn run_migrations_with_backup_using(
         });
     }
 
-    // Behind: snapshot the live db (consistent, WAL-safe) BEFORE migrating.
+    // AHEAD-state refusal (#38): the db's successfully-applied schema is NEWER than
+    // this binary's embedded set. A db newer than the binary must NOT be migrated
+    // (there is no down path for migrations we don't ship) NOR opened — refuse to
+    // start (MASTER-SPEC §7.4). This is a REAL `Err` (#65), never a `debug_assert!`:
+    // the determinism gate + CI run `--release`, where a `debug_assert!` is compiled
+    // out exactly when this guard matters. It fires BEFORE the behind-branch so no
+    // backup is taken and `Migrated{from,to}` can never be reported inverted.
+    if applied_max > embedded_max {
+        return Err(DataError::Migration(format!(
+            "db schema version {applied_max} is ahead of this binary's embedded max \
+             {embedded_max}: refusing to migrate or open a db newer than the binary"
+        )));
+    }
+
+    // Behind: snapshot the live db (consistent, WAL-safe) BEFORE migrating, then
+    // make the snapshot crash-durable (fsync the backup file + its parent dir)
+    // BEFORE the migrate runs — so a crash mid-migrate cannot lose the only recovery
+    // copy (#38 durability).
     let backup = backup_path(db_path, applied_max);
     vacuum_into(pool, &backup).await?;
+    fsync_file(&backup)?;
+    if let Some(parent) = backup.parent() {
+        fsync_dir(parent)?;
+    }
 
     // Migrate, then verify; on ANY failure restore from the backup and refuse.
     match migrate_and_verify(pool, migrator, embedded_max).await {
@@ -157,9 +189,19 @@ async fn migrate_and_verify(
     Ok(())
 }
 
-/// The max applied migration version from `_sqlx_migrations`, or `0` when no
-/// migration has ever applied (the table absent or empty). Raw `sqlx::query_scalar`
-/// (no `query!` macro — this item ships no `.sqlx` cache).
+/// The max **successfully-applied** migration version from `_sqlx_migrations`, or
+/// `0` when no migration has ever committed (the table absent or empty). Raw
+/// `sqlx::query_scalar` (no `query!` macro — this item ships no `.sqlx` cache).
+///
+/// **Committed-state filter (#38 / audit C6).** sqlx records a row in
+/// `_sqlx_migrations` for *every* attempt, with a `success` column that is `0`
+/// until the migration commits. This function MUST read `MAX(version) WHERE
+/// success = TRUE` so the value reflects the **applied schema**, not arbitrary
+/// migration history: a failed or partially-applied future-version row
+/// (`success = 0`) must NOT count, otherwise a single botched future-migration
+/// attempt would spuriously trip the ahead-state refusal and brick the binary.
+/// The ahead-state guard in [`run_migrations_with_backup_using`] depends on this
+/// filter being in place.
 async fn applied_max_version(pool: &SqlitePool) -> Result<i64, DataError> {
     // `MAX(version)` over an empty/absent set is NULL → coalesce to 0. The table
     // is created lazily by the migrator; guard against its absence on a fresh db.
@@ -172,10 +214,12 @@ async fn applied_max_version(pool: &SqlitePool) -> Result<i64, DataError> {
     if exists == 0 {
         return Ok(0);
     }
-    let max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
+    let max: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = TRUE",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
     Ok(max)
 }
 
@@ -298,6 +342,18 @@ fn fsync_dir(dir: &Path) -> Result<(), DataError> {
     })
 }
 
+/// fsync a just-written file so its bytes are durable on disk before the migrate
+/// runs (#38 backup durability — pairs with [`fsync_dir`] on the parent so both the
+/// file contents AND the directory entry survive a crash).
+fn fsync_file(path: &Path) -> Result<(), DataError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        DataError::Migration(format!("backup: open {} failed: {e}", path.display()))
+    })?;
+    file.sync_all().map_err(|e| {
+        DataError::Migration(format!("backup: fsync file {} failed: {e}", path.display()))
+    })
+}
+
 /// A hidden temp path co-located with `db_path` (same dir ⇒ rename is atomic on
 /// the same filesystem; mirrors `store/mod.rs::temp_path`).
 fn hidden_temp_path(db_path: &Path) -> Result<PathBuf, DataError> {
@@ -325,7 +381,8 @@ fn sidecar_path(db_path: &Path, ext: &str) -> PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        MigrationOutcome, run_migrations_with_backup, run_migrations_with_backup_using, undo_to,
+        MigrationOutcome, applied_max_version, embedded_max_version, run_migrations_with_backup,
+        run_migrations_with_backup_using, undo_to,
     };
     use crate::adapters::db::{Db, MIGRATOR};
     use crate::domain::DataError;
@@ -411,7 +468,7 @@ mod tests {
         match outcome {
             MigrationOutcome::Migrated { from, to, backup } => {
                 assert_eq!(from, 1, "from must be the pre-migration version");
-                assert_eq!(to, 2, "to must be the embedded max");
+                assert_eq!(to, 3, "to must be the embedded max");
                 assert!(
                     backup.exists(),
                     "backup file must exist: {}",
@@ -429,7 +486,7 @@ mod tests {
         }
 
         let db = Db::with_path(&path).await.expect("reopen db");
-        assert_eq!(applied_max(&db).await, 2, "schema must now be at 0002");
+        assert_eq!(applied_max(&db).await, 3, "schema must now be at 0003");
         assert!(
             index_present(&db).await,
             "idx_strategy_name must exist after migrate"
@@ -455,7 +512,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::AlreadyCurrent { version } => {
-                assert_eq!(version, 2, "version must be the embedded max");
+                assert_eq!(version, 3, "version must be the embedded max");
             }
             other @ MigrationOutcome::Migrated { .. } => {
                 panic!("expected AlreadyCurrent, got {other:?}")
@@ -546,27 +603,120 @@ mod tests {
 
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // AC-14: run → undo_to(1) → re-run. Index gone then back; max 2→1→2.
+        // run → undo_to(1) → re-run. Index gone then back; max 3→1→3.
         let (_tmp, path) = db_at_0001().await;
 
-        // Up: 1 → 2.
-        run_migrations_with_backup(&path).await.expect("up to 0002");
+        // Up: 1 → 3 (the embedded max, now that 0003 ships).
+        run_migrations_with_backup(&path).await.expect("up to 0003");
         let db = Db::with_path(&path).await.expect("reopen after up");
-        assert_eq!(applied_max(&db).await, 2, "after run, max == 2");
+        assert_eq!(applied_max(&db).await, 3, "after run, max == 3");
         assert!(index_present(&db).await, "after run, index present");
 
-        // Down: 2 → 1.
+        // Down: 3 → 1.
         undo_to(db.pool(), 1).await.expect("undo to 1");
         assert_eq!(applied_max(&db).await, 1, "after undo, max == 1");
         assert!(!index_present(&db).await, "after undo, index gone");
         drop(db);
 
-        // Re-run: 1 → 2.
+        // Re-run: 1 → 3.
         run_migrations_with_backup(&path)
             .await
-            .expect("re-run to 0002");
+            .expect("re-run to 0003");
         let db = Db::with_path(&path).await.expect("reopen after re-run");
-        assert_eq!(applied_max(&db).await, 2, "after re-run, max == 2");
+        assert_eq!(applied_max(&db).await, 3, "after re-run, max == 3");
         assert!(index_present(&db).await, "after re-run, index back");
+    }
+
+    /// Insert a synthetic `_sqlx_migrations` row at `version` with the given
+    /// `success` flag (all NOT NULL columns supplied — `description`, `checksum`
+    /// BLOB, `execution_time`). Used to fabricate an ahead-of-embedded / failed
+    /// future-version state without shipping a real future migration.
+    async fn seed_migration_row(db: &Db, version: i64, success: bool) {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (?1, ?2, CURRENT_TIMESTAMP, ?3, ?4, 0)",
+        )
+        .bind(version)
+        .bind(format!("synthetic future migration {version}"))
+        .bind(success)
+        .bind(vec![0_u8; 32])
+        .execute(db.pool())
+        .await
+        .expect("seed _sqlx_migrations row");
+    }
+
+    #[tokio::test]
+    async fn migration_refuses_ahead_of_embedded() {
+        // AC-12 / #38 / #65: a db whose SUCCESSFULLY-applied schema is ahead of the
+        // binary's embedded max must be REFUSED with a real DataError::Migration Err
+        // (refuse to start, MASTER-SPEC §7.4) — and NO backup is taken (the guard
+        // fires before the behind-branch).
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pulse.db");
+        let db = Db::with_path(&path).await.expect("open db");
+        MIGRATOR
+            .run(db.pool())
+            .await
+            .expect("bring up to embedded max");
+
+        let embedded = embedded_max_version(&MIGRATOR);
+        // Seed a COMMITTED (success = TRUE) future-version row → applied_max > embedded.
+        seed_migration_row(&db, embedded + 1, true).await;
+        assert_eq!(
+            applied_max_version(db.pool()).await.unwrap(),
+            embedded + 1,
+            "a committed future row advances applied_max above embedded"
+        );
+        drop(db);
+
+        let err = run_migrations_with_backup(&path)
+            .await
+            .expect_err("an ahead-of-embedded db must be refused");
+        assert!(
+            matches!(err, DataError::Migration(_)),
+            "ahead-state refusal must surface DataError::Migration, got {err:?}"
+        );
+        assert_eq!(
+            count_backups(tmp.path()),
+            0,
+            "no backup is taken on the ahead-state refusal (it precedes the behind-branch)"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_max_ignores_failed_migration_rows() {
+        // AC-15 / audit C6: a FAILED/partial future-version row (success = 0) must
+        // NOT count toward applied_max — otherwise one botched future-migration
+        // attempt would spuriously trip the ahead-state refusal and brick the binary.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pulse.db");
+        let db = Db::with_path(&path).await.expect("open db");
+        MIGRATOR
+            .run(db.pool())
+            .await
+            .expect("bring up to embedded max");
+
+        let embedded = embedded_max_version(&MIGRATOR);
+        // Seed a FAILED (success = 0) future-version row.
+        seed_migration_row(&db, embedded + 5, false).await;
+
+        // applied_max_version filters on success = TRUE, so the failed row is ignored.
+        assert_eq!(
+            applied_max_version(db.pool()).await.unwrap(),
+            embedded,
+            "a failed (success = 0) future row must NOT raise applied_max"
+        );
+        drop(db);
+
+        // And because applied_max == embedded, the protocol proceeds normally
+        // (AlreadyCurrent) rather than spuriously refusing to start.
+        let outcome = run_migrations_with_backup(&path)
+            .await
+            .expect("a failed future row must not brick the migrator");
+        assert!(
+            matches!(outcome, MigrationOutcome::AlreadyCurrent { version } if version == embedded),
+            "expected AlreadyCurrent at the embedded max, got {outcome:?}"
+        );
     }
 }
