@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::regime::{RegimeBreakdown, RegimeCell};
+use super::stats::{EquityCurve, SummaryStats};
 use super::trade::Trade;
 use crate::domain::fingerprint::EngineFingerprint;
 use crate::domain::sizing::SkippedEntryCounts;
@@ -23,7 +24,13 @@ use crate::domain::sizing::SkippedEntryCounts;
 /// the `*_total` fields are the run-wide cost roll-ups, surfaced separately so
 /// the demo's "fees/funding/slippage are deducted" readout (1.04) has them
 /// without re-summing the trade log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `PartialEq` but **not** `Eq`: as of VS-1.2.4 work-4.02 the nested
+/// `summary: SummaryStats` carries `sharpe`/`sortino` `f64` fields, so `Eq` is no
+/// longer derivable transitively. Determinism is unaffected — the two `f64`
+/// fields are oracle-excluded (never fed to either hash); `Eq` was only used for
+/// test equality, which `PartialEq` still provides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestResult {
     /// Every trade the run produced, in chronological order.
     pub trades: Vec<Trade>,
@@ -43,10 +50,18 @@ pub struct BacktestResult {
     /// NOT a frozen golden constant** — it is threshold-on-`f64`-EMA/ADX derived
     /// and inherits the deferred #29 cross-arch determinism caveat (deterministic
     /// on the v1 pinned toolchain, not byte-portable). 2.05 renders it.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): a result serialized before this
+    /// field existed deserializes via [`RegimeBreakdown::default`].
+    #[serde(default)]
     pub regime_breakdown: RegimeBreakdown,
     /// Per-reason tally of entries the exchange-constrained sizer suppressed over
     /// the run (audit C4): a bounded O(1) [`SkippedEntryCounts`] (sub-lot /
     /// sub-notional / leverage-capped), populated in `into_result`. 2.05 renders.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape result missing this
+    /// field deserializes via [`SkippedEntryCounts::default`].
+    #[serde(default)]
     pub skipped_entries: SkippedEntryCounts,
 
     /// The build-time identity of the engine that produced this run (FR-7 /
@@ -58,7 +73,40 @@ pub struct BacktestResult {
     /// encodes the per-target triple, so including it would make two architectures
     /// running the same backtest hash differently — it is the cross-run comparison
     /// *key*, not part of the byte-identity determinism oracle.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape result missing this
+    /// field deserializes via [`EngineFingerprint::default`].
+    #[serde(default)]
     pub engine_fingerprint: EngineFingerprint,
+
+    /// The derived read-only summary statistics for this run (VS-1.2.4 work-4.01,
+    /// FR-6 / README C1): trade counts, win rate, gross/net roll-ups, profit
+    /// factor, expectancy, max drawdown, win/loss streaks, and the commission +
+    /// funding totals. Computed as a pure `Decimal`/`usize` fold in
+    /// `LoopState::into_result` **after** the totals loop, over the already-final
+    /// trade log (D1). **Deliberately EXCLUDED from both
+    /// [`result_content_hash`](BacktestResult::result_content_hash) and
+    /// [`money_math_hash`](BacktestResult::money_math_hash)** (README C3/C8): it is
+    /// a derived read of the totals, not new money-math, so it never reaches either
+    /// hasher and the frozen baseline stays frozen by construction (#69 deferred).
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape result missing this
+    /// field deserializes via [`SummaryStats::default`].
+    #[serde(default)]
+    pub summary: SummaryStats,
+
+    /// The derived, non-compounding equity curve for this run (VS-1.2.4 work-4.01,
+    /// README C2): a leading `(run_start, starting_equity)` point then one point
+    /// per closed trade, the equity stepping by each trade's `realized_pnl` off a
+    /// constant base. Built in `LoopState::into_result` via
+    /// [`EquityCurve::from_trades`] (the SINGLE reusable constructor 4.05 reuses on
+    /// the read path). **Deliberately EXCLUDED from both content hashes** (README
+    /// C3/C8) — derived read-only, never persisted as its own table.
+    ///
+    /// `#[serde(default)]` (#68 / README C5): an old-shape result missing this
+    /// field deserializes via [`EquityCurve::default`] (an empty curve).
+    #[serde(default)]
+    pub equity_curve: EquityCurve,
 }
 
 impl BacktestResult {
@@ -245,8 +293,10 @@ fn regime_tag(regime: crate::domain::Regime) -> u8 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::BacktestResult;
+    use super::{BacktestResult, EquityCurve, SummaryStats};
+    use crate::domain::backtest::{EquityPoint, RegimeBreakdown};
     use crate::domain::fingerprint::EngineFingerprint;
+    use crate::domain::sizing::SkippedEntryCounts;
     use rust_decimal::Decimal;
 
     fn empty_result() -> BacktestResult {
@@ -259,6 +309,8 @@ mod tests {
             regime_breakdown: crate::domain::backtest::RegimeBreakdown::new(),
             skipped_entries: crate::domain::sizing::SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: SummaryStats::default(),
+            equity_curve: EquityCurve::default(),
         }
     }
 
@@ -301,8 +353,21 @@ mod tests {
         regime_breakdown.record(Regime::TrendingUp, trade.realized_pnl);
         let mut skipped_entries = SkippedEntryCounts::new();
         skipped_entries.record(SkipReason::SubLot);
+        let trades = vec![trade.clone()];
+        // Populate the derived read-only surfaces so the exclusion-guard +
+        // serde-round-trip tests are non-vacuous (a real, non-default
+        // summary/equity_curve). Built from the same trade log + totals the
+        // engine produces — NEVER fed into either hasher (README C3/C8).
+        let equity_curve = EquityCurve::from_trades(0, Decimal::new(10_000, 0), &trades);
+        let summary = SummaryStats::from_trades(
+            &trades,
+            trade.realized_pnl,
+            trade.fees_total,
+            trade.funding_total,
+            &equity_curve,
+        );
         BacktestResult {
-            trades: vec![trade.clone()],
+            trades,
             net_pnl: trade.realized_pnl,
             fees_total: trade.fees_total,
             funding_total: trade.funding_total,
@@ -310,6 +375,8 @@ mod tests {
             regime_breakdown,
             skipped_entries,
             engine_fingerprint: EngineFingerprint::current(),
+            summary,
+            equity_curve,
         }
     }
 
@@ -457,5 +524,162 @@ mod tests {
             other.money_math_hash(),
             "money_math_hash must EXCLUDE engine_fingerprint (D4)"
         );
+    }
+
+    /// AC-8 / D2 (`content_hash_excludes_summary_and_equity_curve`): two results
+    /// that differ ONLY in their derived `summary` / `equity_curve` produce the
+    /// SAME `result_content_hash()` AND the same `money_math_hash()` — the slice's
+    /// HARD oracle-exclusion invariant (README C3/C8). The new fields are a derived
+    /// read of the already-final totals, NOT new money-math, so they never reach
+    /// either hasher and the frozen baseline stays frozen *by construction* (#69
+    /// deferred; `result.rs`'s hash feed is untouched). Mirrors
+    /// `content_hash_excludes_fingerprint`. NFR-2.
+    #[test]
+    fn content_hash_excludes_summary_and_equity_curve() {
+        let base = nonempty_result();
+        let base_content = base.result_content_hash();
+        let base_money = base.money_math_hash();
+
+        // Perturb ONLY the summary: a clearly-different SummaryStats (non-default
+        // trade_count + a different max_drawdown / streaks) — nothing else changes.
+        let mut summary_diff = base.clone();
+        summary_diff.summary = SummaryStats {
+            trade_count: 999,
+            win_count: 7,
+            loss_count: 3,
+            win_rate: Decimal::new(7, 1),
+            gross_profit: Decimal::new(12_345, 0),
+            gross_loss: Decimal::new(678, 0),
+            net_pnl: Decimal::new(11_667, 0),
+            profit_factor: Some(Decimal::new(18, 1)),
+            avg_win: Decimal::new(1_763, 0),
+            avg_loss: Decimal::new(226, 0),
+            expectancy: Decimal::new(11, 0),
+            max_drawdown: Decimal::new(4_242, 0),
+            max_win_streak: 5,
+            max_loss_streak: 2,
+            commission_total: Decimal::new(99, 0),
+            funding_total: Decimal::new(-13, 0),
+            sharpe: Some(1.234),
+            sortino: Some(2.345),
+        };
+        assert_ne!(
+            base.summary, summary_diff.summary,
+            "the two results must genuinely differ in their summary"
+        );
+
+        // Perturb ONLY the equity_curve: a clearly-different series.
+        let mut curve_diff = base.clone();
+        curve_diff.equity_curve = EquityCurve(vec![
+            EquityPoint {
+                time_ms: 0,
+                equity: Decimal::new(10_000, 0),
+            },
+            EquityPoint {
+                time_ms: 123_456,
+                equity: Decimal::new(99_999, 0),
+            },
+        ]);
+        assert_ne!(
+            base.equity_curve, curve_diff.equity_curve,
+            "the two results must genuinely differ in their equity_curve"
+        );
+
+        // BOTH hashes must be byte-identical across all three results (D2).
+        for (label, other) in [("summary", &summary_diff), ("equity_curve", &curve_diff)] {
+            assert_eq!(
+                base_content,
+                other.result_content_hash(),
+                "result_content_hash must EXCLUDE {label} (D2/README C3) — the \
+                 frozen baseline stays frozen by construction"
+            );
+            assert_eq!(
+                base_money,
+                other.money_math_hash(),
+                "money_math_hash must EXCLUDE {label} (D2/README C3)"
+            );
+        }
+    }
+
+    /// AC-4 / D4 (`summary_excluded_from_content_hash`): the slice's HARD
+    /// oracle-exclusion invariant for the 4.02 f64 fields specifically — two
+    /// results differing ONLY in `summary.sharpe` / `summary.sortino` produce the
+    /// SAME `result_content_hash()` AND the same `money_math_hash()`. Folding an
+    /// f64 bit-pattern into the oracle would (a) make two architectures running
+    /// the same backtest hash differently and (b) move the frozen `49702fd5…`
+    /// baseline — so Sharpe/Sortino must never reach either hasher. This is
+    /// distinct from 4.01's `content_hash_excludes_summary_and_equity_curve` (the
+    /// whole-summary guard); this one is the sharpe/sortino-specific proof.
+    /// Mirrors `content_hash_excludes_fingerprint`. NFR-2.
+    #[test]
+    fn summary_excluded_from_content_hash() {
+        let base = nonempty_result();
+        let base_content = base.result_content_hash();
+        let base_money = base.money_math_hash();
+
+        // Perturb ONLY summary.sharpe / summary.sortino — every other byte of the
+        // result (trades, totals, regime, fingerprint, the rest of summary, the
+        // equity_curve) is untouched.
+        let mut sharpe_diff = base.clone();
+        sharpe_diff.summary.sharpe = Some(99.999);
+        sharpe_diff.summary.sortino = Some(-42.0);
+        assert_ne!(
+            base.summary, sharpe_diff.summary,
+            "the two results must genuinely differ in summary.sharpe/sortino"
+        );
+        // Also cover the None ⇄ Some flip so neither bit-pattern nor presence leaks.
+        let mut none_diff = base.clone();
+        none_diff.summary.sharpe = None;
+        none_diff.summary.sortino = None;
+
+        for (label, other) in [
+            ("sharpe/sortino values", &sharpe_diff),
+            ("None flip", &none_diff),
+        ] {
+            assert_eq!(
+                base_content,
+                other.result_content_hash(),
+                "result_content_hash must EXCLUDE summary.sharpe/sortino ({label}, D4) — \
+                 no f64 bit-pattern in the byte-identity oracle (NFR-2)"
+            );
+            assert_eq!(
+                base_money,
+                other.money_math_hash(),
+                "money_math_hash must EXCLUDE summary.sharpe/sortino ({label}, D4)"
+            );
+        }
+    }
+
+    /// AC-9 / D6 (`deserialize_old_result_shape_via_defaults`): a JSON object
+    /// written before the post-hoc fields existed — carrying ONLY the original
+    /// `trades` + the four totals, and missing `regime_breakdown`,
+    /// `skipped_entries`, `engine_fingerprint`, `summary`, and `equity_curve` —
+    /// still deserializes, the absent fields filling in via `#[serde(default)]`
+    /// (#68 / README C5). This is the serde-evolution discipline that keeps a
+    /// pre-VS-1.2.4 persisted result readable.
+    #[test]
+    fn deserialize_old_result_shape_via_defaults() {
+        // The minimal pre-evolution shape: trades + the four Decimal totals only.
+        // (Decimal serializes as a string under serde-with-str, matching `Candle`.)
+        let old_json = r#"{
+            "trades": [],
+            "net_pnl": "0",
+            "fees_total": "0",
+            "funding_total": "0",
+            "slippage_total": "0"
+        }"#;
+
+        let result: BacktestResult = serde_json::from_str(old_json)
+            .expect("old-shape result deserializes via serde defaults");
+
+        // The five post-hoc fields filled in from their defaults.
+        assert!(result.trades.is_empty());
+        assert_eq!(result.net_pnl, Decimal::ZERO);
+        assert_eq!(result.regime_breakdown, RegimeBreakdown::default());
+        assert_eq!(result.skipped_entries, SkippedEntryCounts::default());
+        // engine_fingerprint defaults to the current build's fingerprint.
+        assert_eq!(result.engine_fingerprint, EngineFingerprint::current());
+        assert_eq!(result.summary, SummaryStats::default());
+        assert_eq!(result.equity_curve, EquityCurve::default());
     }
 }

@@ -10,9 +10,18 @@
 //! trade log and confirm fees/funding/slippage are deducted."
 //!
 //! **Load path (G7):** `--dsl <path>` → read file → version-safe [`Migrator`]
-//! load → [`validate`] → [`compile`] → [`run_backtest`]. The DB-load path
-//! (`--version` from a `StrategyRepository`) is **deferred** (this slice is
-//! persistence-free).
+//! load → [`validate`] → [`compile`] → [`run_backtest`]. This `--dsl` path stays
+//! **persistence-free + comparison-free + silent** (today's behavior verbatim).
+//!
+//! **DB-load path (`--version`, VS-1.2.4 work-4.05, FR-7):** `--version
+//! <VersionId>` loads the compiled DSL from [`SqliteStrategyRepo`] by version id,
+//! runs the same engine, **FR-7-compares** the new run's `engine_fingerprint`
+//! against `latest_run_for_version`'s **before** inserting (any
+//! [`EngineFingerprint::compare`] warning goes to **stderr** so stdout stays
+//! byte-stable), **then always** persists the run (the
+//! [`BacktestRun`](crate::PersistedRun) header and its trades) via
+//! [`SqliteBacktestRunRepo`]. There is no `--save` flag — every versioned run is
+//! recorded provenance (README C7).
 //!
 //! **C5 flag defaults** match [`BacktestConfig::default`]: `--fee-bps 4`
 //! (0.04% Binance USDⓂ taker), `--slippage-bps 1`, `--equity 10000` (USDT).
@@ -31,23 +40,52 @@ use rust_decimal::Decimal;
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
 use crate::adapters::broker::BinanceAdapter;
+use crate::adapters::db::{Db, SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::adapters::store::CandleStore;
+use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestResult, CandleSeries, Direction, EngineFingerprint, ExchangeAdapter as _, ExitReason,
-    Migrator, Pair, Regime, StrategyDsl, Timeframe, Trade, compile, validate,
+    BacktestResult, BacktestRunRepository, CandleSeries, CompiledStrategy, Direction,
+    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, StrategyDsl,
+    StrategyRepository, SummaryStats, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
 
-/// `pulse backtest` arguments — the DSL path, the pair/timeframe(s), the candle
-/// store, and the C5 cost knobs (`--fee-bps` / `--slippage-bps` / `--equity`).
-/// The required flags are `--dsl`, `--pair`, and `--tf`; `--htf`, `--store`, and
-/// `--json` are optional. See each field for its meaning + default.
+/// `pulse backtest` arguments — the strategy source (`--dsl <file>` OR
+/// `--version <VersionId>`), the pair/timeframe(s), the candle store, and the C5
+/// cost knobs (`--fee-bps` / `--slippage-bps` / `--equity`).
+///
+/// **Strategy source (exactly one of, a clap `ArgGroup`):**
+/// - `--dsl <file>` — load a DSL JSON file; **persistence-free + comparison-free +
+///   silent** (today's behavior verbatim, README C7).
+/// - `--version <VersionId>` — load the compiled DSL from the strategy repo by
+///   version id; **always** FR-7-compares the prior run then persists this run +
+///   trades (VS-1.2.4 work-4.05, README C7). There is no `--save` flag.
+///
+/// `--pair` and `--tf` are required; `--htf`, `--store`, `--db`, and `--json` are
+/// optional. See each field for its meaning + default.
 #[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("strategy_source")
+        .required(true)
+        .args(["dsl", "version"]),
+))]
 pub struct BacktestArgs {
-    /// Path to the strategy DSL JSON document to backtest (G7 load path).
+    /// Path to the strategy DSL JSON document to backtest (G7 load path;
+    /// persistence-free). Mutually exclusive with `--version`.
     #[arg(long)]
-    pub dsl: PathBuf,
+    pub dsl: Option<PathBuf>,
+    /// Persisted strategy VERSION id to backtest (the `--version` load path,
+    /// VS-1.2.4 work-4.05). Loads the compiled DSL from the strategy repo, then
+    /// ALWAYS FR-7-compares the prior run + persists this run (README C7 — no
+    /// `--save` flag). Mutually exclusive with `--dsl`.
+    #[arg(long = "version")]
+    pub version: Option<String>,
+    /// `pulse.db` path override (defaults to the platform Application Support db).
+    /// Used only by the `--version` persist/compare path; `global = true` so it
+    /// parses in any position (mirror `StrategyArgs.db`).
+    #[arg(long, global = true)]
+    pub db: Option<PathBuf>,
     /// The trading pair symbol (e.g. `BTCUSDT`).
     #[arg(long)]
     pub pair: String,
@@ -78,19 +116,29 @@ pub struct BacktestArgs {
     pub json: bool,
 }
 
-/// Run a backtest over a DSL file + a local candle store and render the result.
+/// Run a backtest and render the result. Two strategy-load paths share the same
+/// engine pipeline + renderer; they differ only in where the compiled DSL comes
+/// from and whether the run is persisted + FR-7-compared:
 ///
-/// Pipeline (G7): read `--dsl` → version-safe [`Migrator`] load → [`validate`] →
-/// [`compile`] → load the primary (+ optional HTF) `CandleSeries` from the
-/// [`CandleStore`] → [`run_backtest`] → render.
+/// - **`--dsl <file>`** (G7, persistence-free): read the file → version-safe
+///   [`Migrator`] load → [`validate`] → [`compile`] → run → render. Silent,
+///   comparison-free, no DB touch (today's behavior verbatim, README C7).
+/// - **`--version <VersionId>`** (VS-1.2.4 work-4.05, FR-7): load the compiled DSL
+///   from [`SqliteStrategyRepo`] → run → render → FR-7-compare the prior run +
+///   persist (in [`persist_and_compare`]). `db` MUST be `Some` for this path
+///   (the dispatcher opens it via `open_migrated`).
+///
+/// `db` is `Some` only when the dispatcher opened a `pulse.db` for the `--version`
+/// path; the `--dsl` path never touches it (so it stays persistence-free).
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] on: an unreadable / malformed `--dsl` file, a DSL
-/// that fails semantic validation, a compile error, an invalid pair/timeframe,
-/// a missing candle snapshot, or an engine error (e.g. `NoStopLoss`). Every path
-/// surfaces a clear message + non-zero exit; nothing panics.
-pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
+/// Returns an [`anyhow::Error`] on: an unreadable / malformed `--dsl` file, an
+/// unresolvable `--version` id (#65 real error), a DSL that fails semantic
+/// validation, a compile error, an invalid pair/timeframe, a missing candle
+/// snapshot, an engine error (e.g. `NoStopLoss`), or a persistence failure. Every
+/// path surfaces a clear message + non-zero exit; nothing panics.
+pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::Result<()> {
     let pair = Pair::parse(args.pair.clone())
         .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
     let tf = parse_one_tf(&args.tf)?;
@@ -112,7 +160,9 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid cost configuration: {e}"))?;
 
-    let compiled = load_compiled_strategy(&args.dsl)?;
+    // Resolve the compiled strategy from whichever load path the args selected.
+    // The clap ArgGroup guarantees EXACTLY ONE of --dsl / --version is present.
+    let loaded = load_strategy(db, args).await?;
 
     let store = match &args.store {
         Some(dir) => CandleStore::with_base_dir(dir.clone()),
@@ -133,14 +183,148 @@ pub fn run_backtest_cli(args: &BacktestArgs) -> anyhow::Result<()> {
         .symbol_filters(&pair)
         .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
 
-    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
-        .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
+    let result = run_backtest(
+        &loaded.compiled,
+        &primary,
+        htf_series.as_ref(),
+        &config,
+        &filters,
+    )
+    .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
+
+    // FR-7 + persistence: the `--version` path FR-7-compares the prior run BEFORE
+    // inserting (warning to STDERR), then ALWAYS persists. The `--dsl` path does
+    // neither — it stays silent + persistence-free (README C7, D1). This happens
+    // BEFORE rendering so a persistence failure surfaces a non-zero exit without
+    // a misleading "success" footer on stdout.
+    if let Some(version_id) = loaded.persist {
+        let db =
+            db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
+        persist_and_compare(db, &version_id, &result, config.starting_equity).await?;
+    }
 
     if args.json {
         render_json(&result)?;
     } else {
         render_human(&result);
     }
+    Ok(())
+}
+
+/// A compiled strategy plus, for the `--version` path, the `VersionId` to persist
+/// the run against. `persist` is `None` for the `--dsl` path (persistence-free).
+struct LoadedStrategy {
+    compiled: CompiledStrategy,
+    /// `Some(version_id)` ⇒ persist + FR-7-compare (the `--version` path);
+    /// `None` ⇒ silent persistence-free (the `--dsl` path).
+    persist: Option<VersionId>,
+}
+
+/// Resolve the compiled strategy from whichever load path the args selected.
+///
+/// The clap `ArgGroup` (`required(true)`, mutually exclusive) guarantees exactly
+/// one of `--dsl` / `--version` is set; the unreachable both/neither arms still
+/// fail-closed with a clear `anyhow` error rather than panic (#65).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] on a bad `--dsl` file, an unresolvable `--version`
+/// id (no such version row — a real error, #65), a repo failure, or (defensively)
+/// a missing db for the `--version` path.
+async fn load_strategy(db: Option<&Db>, args: &BacktestArgs) -> anyhow::Result<LoadedStrategy> {
+    match (&args.dsl, &args.version) {
+        (Some(path), None) => Ok(LoadedStrategy {
+            compiled: load_compiled_strategy(path)?,
+            persist: None,
+        }),
+        (None, Some(version)) => {
+            let db =
+                db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
+            let version_id = VersionId::new(version.clone());
+            let compiled = load_compiled_from_version(db, &version_id).await?;
+            Ok(LoadedStrategy {
+                compiled,
+                persist: Some(version_id),
+            })
+        }
+        // The ArgGroup makes both these arms unreachable in practice; fail-closed
+        // (a real error, never a panic / debug_assert — #65) just in case.
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--dsl and --version are mutually exclusive (pick one)")
+        }
+        (None, None) => anyhow::bail!("exactly one of --dsl or --version is required"),
+    }
+}
+
+/// Load + compile the DSL of a persisted strategy VERSION (the `--version` path).
+///
+/// Fetches the [`StrategyVersion`](crate::StrategyVersion) by id via the
+/// [`StrategyRepository`] port, then [`validate`]s + [`compile`]s its migrated
+/// typed `.dsl` (the repo already ran `Migrator::load` on write, so the stored
+/// `.dsl` is current-schema). A missing version id is a real error (#65), never a
+/// panic.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] on a repo failure, no such version id, or a
+/// validate/compile failure of the stored DSL.
+async fn load_compiled_from_version(
+    db: &Db,
+    version_id: &VersionId,
+) -> anyhow::Result<CompiledStrategy> {
+    let repo = SqliteStrategyRepo::new(db.pool().clone());
+    let version = repo
+        .get_version(version_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("load strategy version {}: {e}", version_id.as_str()))?
+        .ok_or_else(|| anyhow::anyhow!("no such strategy version `{}`", version_id.as_str()))?;
+    let validated = validate(&version.dsl)
+        .map_err(|e| anyhow::anyhow!("stored strategy failed validation: {e}"))?;
+    compile(&validated).map_err(|e| anyhow::anyhow!("compile stored strategy: {e}"))
+}
+
+/// FR-7 compare-prior-BEFORE-insert, then ALWAYS persist (the `--version` path).
+///
+/// **Order matters (D3):** fetch `latest_run_for_version` FIRST — if `Some(prior)`,
+/// [`compare`](EngineFingerprint::compare) the new run's fingerprint against the
+/// prior's and `eprintln!` any warning to **STDERR** (never stdout — the footer/
+/// JSON byte string is test-pinned, D4) — and only THEN `save_run`, else the
+/// freshly-inserted row would become its own "prior" and the warning could never
+/// fire. Persistence is unconditional: every versioned run is recorded provenance
+/// (README C7 — no `--save` flag).
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] on a `latest_run_for_version` read failure or a
+/// `save_run` write failure (e.g. an absent `strategy_version_id`).
+async fn persist_and_compare(
+    db: &Db,
+    version_id: &VersionId,
+    result: &BacktestResult,
+    starting_equity: Decimal,
+) -> anyhow::Result<()> {
+    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
+
+    // FR-7: compare against the prior run BEFORE inserting (D3 order invariant).
+    let prior = repo
+        .latest_run_for_version(version_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("look up prior run for FR-7 compare: {e}"))?;
+    if let Some(prior) = prior {
+        let prior_fp = EngineFingerprint::from_stored(prior.engine_fingerprint.clone());
+        if let Some(warning) = result.engine_fingerprint.compare(&prior_fp) {
+            // STDERR only (D4): stdout carries the byte-pinned footer/JSON.
+            eprintln!("warning: {warning}");
+        }
+    }
+
+    // The headline summary is already computed on `result.summary` (4.01/4.02);
+    // the repo re-stores it as the typed projection (4.04). We pass it through —
+    // never recompute (D1 / spec §9).
+    let summary: &SummaryStats = &result.summary;
+    repo.save_run(version_id, result, summary, starting_equity)
+        .await
+        .map_err(|e| anyhow::anyhow!("persist backtest run: {e}"))?;
     Ok(())
 }
 
@@ -214,7 +398,9 @@ fn load_series(store: &CandleStore, pair: &Pair, tf: Timeframe) -> anyhow::Resul
 
 /// The tab-separated trade-log header (names every cost column the demo reads,
 /// plus the per-trade MFE/MAE excursion + entry regime — VS-1.2.2 work-2.05).
-const TRADE_HEADER: &str = "entry_time\texit_time\tdir\tentry_price\texit_price\tqty\tfees\tfunding\tslippage\tpnl\tR\texit_reason\tmfe_r\tmae_r\tregime";
+/// `pub(super)` so `runs show` (`src/cli/runs.rs`) prints the SAME header above
+/// the persisted trade log (D6).
+pub(super) const TRADE_HEADER: &str = "entry_time\texit_time\tdir\tentry_price\texit_price\tqty\tfees\tfunding\tslippage\tpnl\tR\texit_reason\tmfe_r\tmae_r\tregime";
 
 /// Render the human-readable trade log + the cost-breakdown footer + the
 /// regime-breakdown block + the skipped-entries line (VS-1.2.2 work-2.05).
@@ -232,7 +418,11 @@ fn render_human(result: &BacktestResult) {
 
 /// One tab-separated trade row. Decimals are normalized so trailing zeros do not
 /// clutter the readout (matching the `indicators` renderer convention).
-fn render_trade_row(trade: &Trade) -> String {
+///
+/// `pub(super)` so the `runs show` read verb (`src/cli/runs.rs`) renders the
+/// persisted trade log through the SAME row formatter (D6 — one trade renderer,
+/// no second formatter).
+pub(super) fn render_trade_row(trade: &Trade) -> String {
     [
         trade.entry_fill_time.to_string(),
         trade.exit_fill_time.to_string(),
@@ -261,6 +451,7 @@ fn render_trade_row(trade: &Trade) -> String {
 /// SUBTRACTED here — adding it would move gross the wrong way by `2 × |funding|`.
 fn render_footer(result: &BacktestResult) -> String {
     let gross = result.net_pnl + result.fees_total - result.funding_total + result.slippage_total;
+    let s = &result.summary;
     [
         "summary".to_owned(),
         format!("trades={}", result.trades.len()),
@@ -269,6 +460,18 @@ fn render_footer(result: &BacktestResult) -> String {
         format!("fees_total={}", dec(result.fees_total)),
         format!("funding_total={}", dec(result.funding_total)),
         format!("slippage_total={}", dec(result.slippage_total)),
+        // VS-1.2.4 work-4.05 (FR-6, D5): the headline `SummaryStats` cells appended
+        // ADDITIVELY — the existing cells above + the three fingerprint cells below
+        // stay byte-identical in spelling + order (the footer tests pin them). The
+        // two `Option` stats (`profit_factor`, `sharpe`) render the `—` sentinel
+        // when `None` (mirror `strategy.rs:281`); Decimal stats use `dec()`.
+        format!("expectancy={}", dec(s.expectancy)),
+        format!("win_rate={}", dec(s.win_rate)),
+        format!("profit_factor={}", dec_opt(s.profit_factor)),
+        format!("sharpe={}", f64_opt(s.sharpe)),
+        format!("max_drawdown={}", dec(s.max_drawdown)),
+        format!("max_win_streak={}", s.max_win_streak),
+        format!("max_loss_streak={}", s.max_loss_streak),
         // FR-7 / NFR-2 (3.03): surface the build-time engine identity — the hex
         // fingerprint plus the target triple (arch) — and the byte-stable content
         // hash, so two runs are comparable (matching fingerprint) and reproducible
@@ -335,9 +538,28 @@ fn render_json(result: &BacktestResult) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A compact, trailing-zero-normalized decimal rendering.
-fn dec(value: Decimal) -> String {
+/// A compact, trailing-zero-normalized decimal rendering. `pub(super)` so the
+/// `runs show` read verb renders the reconstructed equity-curve summary + the
+/// `SummaryStats` Decimal cells with the SAME normalization (D6).
+pub(super) fn dec(value: Decimal) -> String {
     value.normalize().to_string()
+}
+
+/// The render sentinel for an absent `Option` stat (mirror `strategy.rs:281`'s
+/// `—` convention) — used by the additive `SummaryStats` footer + the `runs show`
+/// read verb for `profit_factor` / `sharpe` when `None`.
+pub(super) const ABSENT_SENTINEL: &str = "—";
+
+/// Render an `Option<Decimal>` stat (`profit_factor`): the normalized decimal when
+/// `Some`, else the `—` sentinel (D5).
+pub(super) fn dec_opt(value: Option<Decimal>) -> String {
+    value.map_or_else(|| ABSENT_SENTINEL.to_owned(), dec)
+}
+
+/// Render an `Option<f64>` stat (`sharpe`/`sortino`): the `f64` (finite by the C1
+/// `None`-when-degenerate contract) when `Some`, else the `—` sentinel (D5).
+pub(super) fn f64_opt(value: Option<f64>) -> String {
+    value.map_or_else(|| ABSENT_SENTINEL.to_owned(), |x| x.to_string())
 }
 
 /// Human-readable trade-side label.
@@ -375,14 +597,14 @@ fn regime_label(regime: Regime) -> &'static str {
 mod tests {
     use super::{EngineFingerprint, render_json};
     use super::{
-        TRADE_HEADER, dec, parse_dsl, regime_label, reject_if_gapped, render_footer,
-        render_regime_breakdown, render_skipped_entries, render_trade_row,
+        TRADE_HEADER, dec, dec_opt, f64_opt, parse_dsl, regime_label, reject_if_gapped,
+        render_footer, render_regime_breakdown, render_skipped_entries, render_trade_row,
     };
     use crate::domain::{
         BacktestResult, Candle, CandleSeries, Comparator, Condition, DataVersion, Direction,
-        ExitReason, ExitRule, Fill, Pair, PriceField, Regime, RegimeBreakdown, RiskParams,
-        SchemaVersion, SkipReason, SkippedEntryCounts, StrategyDsl, SweepableValue, Timeframe,
-        Trade, TradeSource, ValueSource,
+        EquityCurve, ExitReason, ExitRule, Fill, Pair, PriceField, Regime, RegimeBreakdown,
+        RiskParams, SchemaVersion, SkipReason, SkippedEntryCounts, StrategyDsl, SummaryStats,
+        SweepableValue, Timeframe, Trade, TradeSource, ValueSource,
     };
     use rust_decimal::Decimal;
 
@@ -526,6 +748,8 @@ mod tests {
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let lines = render_regime_breakdown(&result);
         // Only the two regimes with trades appear (trending_down + unknown absent).
@@ -558,6 +782,8 @@ mod tests {
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let lines = render_regime_breakdown(&result);
         assert_eq!(lines.len(), 1);
@@ -577,6 +803,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let line = render_skipped_entries(&result);
         assert_eq!(line, "skipped_entries=0");
@@ -598,6 +826,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: counts,
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let line = render_skipped_entries(&result);
         assert!(line.contains("skipped_entries=4"), "line was: {line}");
@@ -617,6 +847,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let footer = render_footer(&result);
         assert!(footer.contains("trades=1"));
@@ -625,6 +857,165 @@ mod tests {
         // before costs = net + fees − funding + slippage = 1484 + 12 − 1 + 3 = 1498.
         assert!(footer.contains("gross_pnl=1498"), "footer was: {footer}");
         assert!(footer.contains("fees_total=12"));
+    }
+
+    /// A `SummaryStats` with every headline field populated (and the two `Option`
+    /// stats `Some`) so the additive-footer test can assert the new cells render
+    /// the real values, not the sentinel.
+    fn populated_summary() -> SummaryStats {
+        SummaryStats {
+            trade_count: 3,
+            win_count: 2,
+            loss_count: 1,
+            win_rate: Decimal::new(666, 3), // 0.666
+            gross_profit: Decimal::new(300, 0),
+            gross_loss: Decimal::new(100, 0),
+            net_pnl: Decimal::new(200, 0),
+            profit_factor: Some(Decimal::new(3, 0)),
+            avg_win: Decimal::new(150, 0),
+            avg_loss: Decimal::new(100, 0),
+            expectancy: Decimal::new(6666, 2), // 66.66
+            max_drawdown: Decimal::new(40, 0),
+            max_win_streak: 2,
+            max_loss_streak: 1,
+            commission_total: Decimal::new(12, 0),
+            funding_total: Decimal::new(1, 0),
+            sharpe: Some(1.25),
+            sortino: Some(2.5),
+        }
+    }
+
+    /// AC-9 (`footer_is_additive_keeps_existing_lines`): the footer renders the NEW
+    /// headline `SummaryStats` cells (expectancy / win rate / profit factor /
+    /// Sharpe / max drawdown / streaks) WITHOUT moving or re-spelling the existing
+    /// cells — the three pinned fingerprint/target/content-hash cells AND the cost
+    /// cells stay byte-identical (D5). The `Option` stats render their real value
+    /// when `Some`, the `—` sentinel when `None`.
+    #[test]
+    fn footer_is_additive_keeps_existing_lines() {
+        let result = BacktestResult {
+            trades: vec![sample_trade()],
+            net_pnl: Decimal::new(1_484, 0),
+            fees_total: Decimal::new(12, 0),
+            funding_total: Decimal::new(1, 0),
+            slippage_total: Decimal::new(3, 0),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
+            summary: populated_summary(),
+            equity_curve: EquityCurve::default(),
+        };
+        let footer = render_footer(&result);
+
+        // (a) the existing cost cells stay byte-identical in spelling.
+        assert!(footer.contains("trades=1"), "footer was: {footer}");
+        assert!(footer.contains("gross_pnl=1498"), "footer was: {footer}");
+        assert!(footer.contains("net_pnl=1484"), "footer was: {footer}");
+        assert!(footer.contains("fees_total=12"), "footer was: {footer}");
+        assert!(footer.contains("funding_total=1"), "footer was: {footer}");
+        assert!(footer.contains("slippage_total=3"), "footer was: {footer}");
+
+        // (b) the three pinned engine-identity cells survive byte-identical (D5).
+        let fp = EngineFingerprint::current();
+        assert!(
+            footer.contains(&format!("engine_fingerprint={}", fp.as_str())),
+            "the pinned engine_fingerprint cell must survive byte-identical; footer was: {footer}"
+        );
+        assert!(
+            footer.contains(&format!("target={}", EngineFingerprint::target())),
+            "the pinned target cell must survive byte-identical; footer was: {footer}"
+        );
+        assert!(
+            footer.contains(&format!("content_hash={}", result.result_content_hash())),
+            "the pinned content_hash cell must survive byte-identical; footer was: {footer}"
+        );
+
+        // (c) the NEW additive headline-SummaryStats cells appear with real values.
+        assert!(footer.contains("expectancy=66.66"), "footer was: {footer}");
+        assert!(footer.contains("win_rate=0.666"), "footer was: {footer}");
+        assert!(footer.contains("profit_factor=3"), "footer was: {footer}");
+        assert!(footer.contains("sharpe=1.25"), "footer was: {footer}");
+        assert!(footer.contains("max_drawdown=40"), "footer was: {footer}");
+        assert!(footer.contains("max_win_streak=2"), "footer was: {footer}");
+        assert!(footer.contains("max_loss_streak=1"), "footer was: {footer}");
+
+        // (d) the `None` Option stats render the `—` sentinel (mirror strategy.rs).
+        let mut none_stats = populated_summary();
+        none_stats.profit_factor = None;
+        none_stats.sharpe = None;
+        let none_result = BacktestResult {
+            summary: none_stats,
+            ..result
+        };
+        let none_footer = render_footer(&none_result);
+        assert!(
+            none_footer.contains("profit_factor=—"),
+            "absent profit_factor must render the sentinel; footer was: {none_footer}"
+        );
+        assert!(
+            none_footer.contains("sharpe=—"),
+            "absent sharpe must render the sentinel; footer was: {none_footer}"
+        );
+    }
+
+    /// AC-10 (`persist_wiring_excludes_content_hash`, mirror
+    /// `content_hash_excludes_fingerprint`): the persist/footer/stats wiring reads
+    /// `result.summary` / `result.equity_curve`, but those fields are
+    /// oracle-excluded (README C3/C8 / #69 frozen), so two results differing ONLY
+    /// in their `summary` + `equity_curve` produce the SAME `result_content_hash()`.
+    /// This guards the C8 freeze at the 4.05 seam: rendering the footer + persisting
+    /// the run cannot move the content hash (the freeze stays frozen by
+    /// construction). Local NON-PERTURBATION proof — NOT the literal cross-arch
+    /// baseline (#62: that is the CI matrix's job; no `49702fd5…` pinned here).
+    #[test]
+    fn persist_wiring_excludes_content_hash() {
+        // Base: default (empty) summary + curve — the pre-4.05 shape.
+        let base = BacktestResult {
+            trades: vec![sample_trade()],
+            net_pnl: Decimal::new(1_484, 0),
+            fees_total: Decimal::new(12, 0),
+            funding_total: Decimal::new(1, 0),
+            slippage_total: Decimal::new(3, 0),
+            regime_breakdown: RegimeBreakdown::new(),
+            skipped_entries: SkippedEntryCounts::new(),
+            engine_fingerprint: EngineFingerprint::current(),
+            summary: SummaryStats::default(),
+            equity_curve: EquityCurve::default(),
+        };
+        // Other: identical EXCEPT a fully-populated summary + a non-empty equity
+        // curve (exactly what the footer renders + `save_run` persists).
+        let mut other = base.clone();
+        other.summary = populated_summary();
+        other.equity_curve = EquityCurve::from_trades(
+            0,
+            Decimal::new(10_000, 0),
+            std::slice::from_ref(&sample_trade()),
+        );
+
+        assert_ne!(
+            base.summary, other.summary,
+            "the two results must genuinely differ in their summary"
+        );
+        assert_ne!(
+            base.equity_curve, other.equity_curve,
+            "the two results must genuinely differ in their equity curve"
+        );
+        assert_eq!(
+            base.result_content_hash(),
+            other.result_content_hash(),
+            "result_content_hash must EXCLUDE summary + equity_curve (the persist/footer/stats \
+             wiring cannot move the C8-frozen oracle)"
+        );
+    }
+
+    /// The `Option`-stat render helpers: a `Some` renders the value, a `None` the
+    /// `—` sentinel (mirror `strategy.rs:281`).
+    #[test]
+    fn option_stat_helpers_render_value_or_sentinel() {
+        assert_eq!(dec_opt(Some(Decimal::new(25, 1))), "2.5");
+        assert_eq!(dec_opt(None), "—");
+        assert_eq!(f64_opt(Some(1.5)), "1.5");
+        assert_eq!(f64_opt(None), "—");
     }
 
     /// AC-4 (`render_includes_fingerprint`): the engine fingerprint reaches BOTH
@@ -643,6 +1034,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
 
         // Human footer: the fingerprint, the target arch, and the content hash.

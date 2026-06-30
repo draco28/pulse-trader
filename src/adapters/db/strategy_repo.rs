@@ -231,7 +231,7 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                  created_at        AS "created_at!: String"
                FROM strategy
                WHERE (?1 = 1 OR archived = 0)
-               ORDER BY created_at"#,
+               ORDER BY created_at, id"#,
             archived_filter,
         )
         .fetch_all(&self.pool)
@@ -499,7 +499,7 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
                  created_by            AS "created_by!: String",
                  creating_llm_call_ids AS "creating_llm_call_ids!: String",
                  created_at            AS "created_at!: String"
-               FROM strategy_version WHERE strategy_id = ?1 ORDER BY created_at"#,
+               FROM strategy_version WHERE strategy_id = ?1 ORDER BY created_at, id"#,
             sid,
         )
         .fetch_all(&self.pool)

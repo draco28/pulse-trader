@@ -208,6 +208,14 @@ pub use adapters::db::{Db, MIGRATOR};
 // `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
 // it through the `StrategyRepository` port.
 pub use adapters::db::SqliteStrategyRepo;
+// VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
+// implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
+// committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter type unused outside its module is a `dead_code`
+// build error, not a warning (the `db/mod.rs` re-export alone is necessary but NOT
+// sufficient). 4.05's CLI consumes it through the `BacktestRunRepository` port.
+// Append-only (keep-both with 1.03's re-export at merge).
+pub use adapters::db::SqliteBacktestRunRepo;
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -271,6 +279,27 @@ pub use adapters::broker::BinanceAdapter;
 // the breakdown onto `BacktestResult`; 2.05 renders it.
 pub use adapters::backtest::RegimeDetector;
 pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
+
+// VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
+// (FR-6 / NFR-2, BACKLOG-4). `SummaryStats`/`EquityCurve`/`EquityPoint` are the
+// pure-`Decimal`/`usize` headline read of a finished backtest, computed in
+// `LoopState::into_result` and attached to `BacktestResult`; oracle-excluded
+// (README C3) so the frozen baseline stays frozen by construction. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` build error, not a warning. 4.02 adds Sharpe/Sortino onto
+// the same struct; 4.03/4.04 persist these columns; 4.05 renders + rebuilds the
+// curve on read via the SAME `EquityCurve::from_trades` constructor.
+pub use domain::{EquityCurve, EquityPoint, SummaryStats};
+
+// VS-1.2.4 work-4.04: the persisted backtest-run system-of-record (FR-6 / FR-7 /
+// NFR-2). `BacktestRunRepository` is the create+read-only persistence port (the
+// #39 ownership-on-write / re-validate-on-read / scoped corrupt-isolation seam);
+// `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back projections
+// (explicit columns per README C4, NOT a `BacktestResult` blob — #68 / D1).
+// REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported
+// public domain type is a `dead_code` build error, not a warning. 4.05's CLI
+// consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
+pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

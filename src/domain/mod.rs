@@ -51,6 +51,17 @@ pub use backtest::{
 // Re-exported here so `lib.rs` can curate the crate surface; an un-re-exported
 // public domain type is a `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
+// VS-1.2.4 work-4.01: the derived read-only summary stats + equity curve surface
+// (FR-6 / NFR-2). Re-exported so `lib.rs` can curate the crate surface; an
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
+// VS-1.2.4 work-4.04: the persisted backtest-run projection types (FR-6 / FR-7 /
+// NFR-2). `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back
+// projections the `BacktestRunRepository` port returns; re-exported so `lib.rs`
+// can curate the crate surface — an un-re-exported public domain type is a
+// `dead_code` BUILD error under `deny(warnings)`.
+pub use backtest::{BacktestRunId, PersistedRun, RunSummary};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
@@ -82,7 +93,7 @@ pub use pair::Pair;
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
-pub use port::{ExchangeAdapter, MarketDataSource, StrategyRepository};
+pub use port::{BacktestRunRepository, ExchangeAdapter, MarketDataSource, StrategyRepository};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the
 // `SymbolFilters` value type + its `unconstrained()` ctor, and the
