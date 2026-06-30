@@ -39,6 +39,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineFingerprint(String);
 
+/// `Default` is **this build's** fingerprint (VS-1.2.4 work-4.01 / #68).
+///
+/// Required so `BacktestResult::engine_fingerprint` can carry `#[serde(default)]`
+/// (README C5): an old-shape result serialized before the fingerprint field
+/// existed deserializes to the fingerprint of the build doing the read — the
+/// honest stand-in (the run was produced by *some* engine; absent a recorded one,
+/// the current build is the best available identity, and it matches the value
+/// `LoopState::into_result` stamps via [`EngineFingerprint::current`]). It is NOT
+/// an empty/placeholder string.
+impl Default for EngineFingerprint {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
 impl EngineFingerprint {
     /// The fingerprint of *this* build, baked in at compile time by `build.rs`.
     ///

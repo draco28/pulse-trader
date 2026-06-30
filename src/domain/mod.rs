@@ -51,6 +51,11 @@ pub use backtest::{
 // Re-exported here so `lib.rs` can curate the crate surface; an un-re-exported
 // public domain type is a `dead_code` BUILD error under `deny(warnings)`.
 pub use backtest::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
+// VS-1.2.4 work-4.01: the derived read-only summary stats + equity curve surface
+// (FR-6 / NFR-2). Re-exported so `lib.rs` can curate the crate surface; an
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every

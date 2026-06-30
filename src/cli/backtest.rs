@@ -526,6 +526,8 @@ mod tests {
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let lines = render_regime_breakdown(&result);
         // Only the two regimes with trades appear (trending_down + unknown absent).
@@ -558,6 +560,8 @@ mod tests {
             regime_breakdown: breakdown,
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let lines = render_regime_breakdown(&result);
         assert_eq!(lines.len(), 1);
@@ -577,6 +581,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let line = render_skipped_entries(&result);
         assert_eq!(line, "skipped_entries=0");
@@ -598,6 +604,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: counts,
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let line = render_skipped_entries(&result);
         assert!(line.contains("skipped_entries=4"), "line was: {line}");
@@ -617,6 +625,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
         let footer = render_footer(&result);
         assert!(footer.contains("trades=1"));
@@ -643,6 +653,8 @@ mod tests {
             regime_breakdown: RegimeBreakdown::new(),
             skipped_entries: SkippedEntryCounts::new(),
             engine_fingerprint: EngineFingerprint::current(),
+            summary: crate::domain::SummaryStats::default(),
+            equity_curve: crate::domain::EquityCurve::default(),
         };
 
         // Human footer: the fingerprint, the target arch, and the content hash.

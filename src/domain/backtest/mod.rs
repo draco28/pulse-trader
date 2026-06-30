@@ -22,6 +22,10 @@ mod feed;
 // ADX14). The stateful detector that holds the indicator adapters lives in
 // `adapters::backtest::regime`; this is the zero-I/O, `Decimal`-only half.
 mod regime;
+// VS-1.2.4 work-4.01: the derived read-only SummaryStats + equity curve (FR-6 /
+// NFR-2). Pure Decimal/usize folds over the already-final trade log + run totals;
+// oracle-excluded (README C3) so the frozen baseline stays frozen by construction.
+mod stats;
 
 // Re-exports kept at the `domain::backtest` surface so `domain/mod.rs` + `lib.rs`
 // can curate them onto the crate's public API (an un-re-exported public domain
@@ -32,4 +36,5 @@ pub use error::BacktestError;
 pub use feed::{AlignedBar, align};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
+pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};
