@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 id                AS \"id!: String\",\n                 name              AS \"name!: String\",\n                 tags              AS \"tags!: String\",\n                 owner             AS \"owner?: String\",\n                 pinned_version_id AS \"pinned_version_id?: String\",\n                 archived          AS \"archived!: i64\",\n                 created_at        AS \"created_at!: String\"\n               FROM strategy\n               WHERE (?1 = 1 OR archived = 0)\n               ORDER BY created_at",
+  "query": "SELECT\n                 id                AS \"id!: String\",\n                 name              AS \"name!: String\",\n                 tags              AS \"tags!: String\",\n                 owner             AS \"owner?: String\",\n                 pinned_version_id AS \"pinned_version_id?: String\",\n                 archived          AS \"archived!: i64\",\n                 created_at        AS \"created_at!: String\"\n               FROM strategy\n               WHERE (?1 = 1 OR archived = 0)\n               ORDER BY created_at, id",
   "describe": {
     "columns": [
       {
@@ -52,5 +52,5 @@
       false
     ]
   },
-  "hash": "dedab41c6d3d67d78d35210ef60dd48e04aa1836757d6471c149934a6a913437"
+  "hash": "8e1ceb4f931d9e6b3d2ee73c49a3f833686ddffee31cfe1e17d61309e3df1455"
 }

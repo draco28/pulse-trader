@@ -24,11 +24,29 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
+// NFR-2). `current()` is the sha2-256 hex baked in by `build.rs`; `target()` is the
+// compiled triple (the arch tag for the cross-arch story); `compare()` is the FR-7
+// cross-fingerprint warning mechanism (built-but-unwired this slice — VS-1.2.4
+// surfaces it). REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an
+// un-re-exported public domain type is a `dead_code` build error, not a warning.
+// 3.03 attaches it to `BacktestResult` and reaches it through this re-export.
+pub use domain::EngineFingerprint;
+
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5). REQUIRED under
 // `deny(warnings)` + `pub(crate) mod domain` — a new public domain type unused
 // outside its module is a `dead_code` build error, not a warning (VS-1.1.2
 // harvested gotcha). The EMA adapter + future indicators implement this seam.
 pub use domain::Indicator;
+
+// VS-1.2.1 work-1.02: the MTF-aligned, no-look-ahead candle feed (FR-5 /
+// BACKLOG-4). `align(primary, htf)` is the backtest iteration substrate; each
+// `AlignedBar` pairs a primary candle with the most-recent already-closed HTF
+// bar (or `None`). REQUIRED under `deny(warnings)` + `pub(crate) mod domain` —
+// an un-re-exported public domain type is a `dead_code` build error, not a
+// warning. (C6: nothing consumes `AlignedBar::htf` this slice; it is the
+// substrate validated by its own unit tests.)
+pub use domain::{AlignedBar, align};
 
 // VS-1.1.4 work-1.02: the strategy-tree entities + the `StrategyRepository` port
 // (FR-4 / FR-11). `Strategy`/`StrategyVersion` are the persisted records (the
@@ -167,6 +185,11 @@ pub use adapters::indicators::adx::Adx;
 // evaluator.
 pub use adapters::indicators::engine::{EngineError, IndicatorEngine};
 
+// VS-1.2.1 work-1.03: deterministic, sequential backtest engine. The adapter
+// owns the concrete indicator engine while composing the pure domain backtest
+// types and money-math primitives.
+pub use adapters::backtest::{BacktestConfig, run_backtest};
+
 // VS-1.1.4 work-1.01: the SQLite persistence foundation. `Db` is the WAL pool
 // wrapper (`with_path`/`open_default`/`pool`); `MIGRATOR` is the embedded
 // `0001_init` migration set. REQUIRED under `deny(warnings)` + `pub(crate) mod
@@ -185,6 +208,14 @@ pub use adapters::db::{Db, MIGRATOR};
 // `db/mod.rs` re-export alone is necessary but NOT sufficient). 1.05's CLI consumes
 // it through the `StrategyRepository` port.
 pub use adapters::db::SqliteStrategyRepo;
+// VS-1.2.4 work-4.04: the SQLite `BacktestRunRepository` adapter. `SqliteBacktestRunRepo`
+// implements the FR-6 persisted-run surface over `query!`/`query_as!` (the
+// committed `.sqlx/` cache). REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter type unused outside its module is a `dead_code`
+// build error, not a warning (the `db/mod.rs` re-export alone is necessary but NOT
+// sufficient). 4.05's CLI consumes it through the `BacktestRunRepository` port.
+// Append-only (keep-both with 1.03's re-export at merge).
+pub use adapters::db::SqliteBacktestRunRepo;
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -193,6 +224,82 @@ pub use adapters::db::SqliteStrategyRepo;
 // build error, not a warning (VS-1.1.2 harvested gotcha); re-export ALL of them,
 // not just the first. Append-only (keep-both with 1.03's re-exports at merge).
 pub use adapters::db::{MigrationOutcome, open_migrated, run_migrations_with_backup, undo_to};
+
+// VS-1.2.1 work-1.01: the pure backtester domain foundation (FR-5 / FR-6,
+// BACKLOG-4). The trade-record entities (`Trade`/`Fill`/`ExitReason`/
+// `TradeSource`), the run aggregate (`BacktestResult`), the error taxonomy
+// (`BacktestError`, incl. `NoStopLoss` (G5/#20) + `UnsupportedExit` (C4)), and
+// the pure `Decimal`-only money-math (`taker_fee`/`apply_slippage`+`Side`/
+// `funding_payment`/`realized_pnl`/`realized_r`/`position_size`) +
+// intra-bar collision (`resolve_intra_bar_exit`/`IntraBarExit`). The event loop
+// (1.03) composes these; 1.04's CLI renders the result. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` build error, not a warning. Kept additive (work-1.02's
+// MTF feed extends the same `backtest` tree at the R1→R2 merge).
+pub use domain::{
+    BacktestError, BacktestResult, ExitReason, Fill, IntraBarExit, Side, Trade, TradeSource,
+    apply_slippage, funding_payment, realized_pnl, realized_r, resolve_intra_bar_exit, taker_fee,
+};
+
+// VS-1.2.2 work-2.01: the shared, exchange-aware position sizer (FR-5 / NFR-3,
+// BACKLOG-5) — the `pulse-broker` money-math home. `compute_position_size` is the
+// **single** sizer sim + (future v3) live execution share (NFR-3 by
+// construction). `SymbolFilters` (+ `unconstrained()`) is the exchange-filter
+// value type; `SizingOutcome`/`SkipReason` are the skip-and-count substrate (2.04
+// wires, 2.05 renders). `ExchangeAdapter` is the exchange-metadata port;
+// `ExchangeError` its dedicated error (audit C5). REQUIRED under `deny(warnings)`
+// + `pub(crate) mod domain` — an un-re-exported public domain type is a
+// `dead_code` build error, not a warning.
+//
+// NFR-3 single-sizing-path hardening (VS-1.2.2 slice-close, close-audit finding):
+// the pre-quantization core `risk_capped_qty` is **intentionally NOT re-exported**
+// — it bypasses lot_step / min_qty / min_notional / exchange max-leverage, so
+// exposing it publicly would make the single-path invariant a convention rather
+// than construction. It stays crate-internal (the `pub(crate) mod domain` gate),
+// reachable only by `compute_position_size` (its sole production caller) + the
+// in-module proptests; the ONLY public sizing entry is `compute_position_size`.
+pub use domain::{
+    ExchangeAdapter, ExchangeError, SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters,
+    compute_position_size,
+};
+
+// VS-1.2.2 work-2.01: the `BinanceAdapter` exchange-metadata implementor
+// (`adapters/broker`), returning pinned BTCUSDT USD-M futures filters. REQUIRED
+// under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter type
+// unused outside its module is a `dead_code` build error. 2.04 wires it into
+// `run_backtest`'s sizing call through the `ExchangeAdapter` port.
+pub use adapters::broker::BinanceAdapter;
+
+// VS-1.2.2 work-2.03: the regime classifier surface (FR-5 / FR-6, BACKLOG-5).
+// `Regime`/`RegimeBreakdown`/`RegimeCell`/`classify`/`ADX_TREND_THRESHOLD` are
+// the pure domain half; `RegimeDetector` is the stateful adapter composing the
+// VS-1.1.3 `Ema`/`Adx` adapters. REQUIRED under `deny(warnings)` + `pub(crate)
+// mod domain`/`mod adapters` — an un-re-exported public item is a `dead_code`
+// build error, not a warning. 2.04 steps the detector over the run + aggregates
+// the breakdown onto `BacktestResult`; 2.05 renders it.
+pub use adapters::backtest::RegimeDetector;
+pub use domain::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
+
+// VS-1.2.4 work-4.01: the derived read-only `SummaryStats` + equity curve surface
+// (FR-6 / NFR-2, BACKLOG-4). `SummaryStats`/`EquityCurve`/`EquityPoint` are the
+// pure-`Decimal`/`usize` headline read of a finished backtest, computed in
+// `LoopState::into_result` and attached to `BacktestResult`; oracle-excluded
+// (README C3) so the frozen baseline stays frozen by construction. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` build error, not a warning. 4.02 adds Sharpe/Sortino onto
+// the same struct; 4.03/4.04 persist these columns; 4.05 renders + rebuilds the
+// curve on read via the SAME `EquityCurve::from_trades` constructor.
+pub use domain::{EquityCurve, EquityPoint, SummaryStats};
+
+// VS-1.2.4 work-4.04: the persisted backtest-run system-of-record (FR-6 / FR-7 /
+// NFR-2). `BacktestRunRepository` is the create+read-only persistence port (the
+// #39 ownership-on-write / re-validate-on-read / scoped corrupt-isolation seam);
+// `BacktestRunId`/`PersistedRun`/`RunSummary` are the typed read-back projections
+// (explicit columns per README C4, NOT a `BacktestResult` blob — #68 / D1).
+// REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported
+// public domain type is a `dead_code` build error, not a warning. 4.05's CLI
+// consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
+pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

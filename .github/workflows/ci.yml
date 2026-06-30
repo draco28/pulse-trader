@@ -88,3 +88,92 @@ jobs:
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe  # v2
+
+  # VS-1.2.3 work-3.04 (NFR-2, BACKLOG-12): the determinism gate. Runs the
+  # 100x-sequential + 100x-Rayon-parallel determinism test on Linux BOTH ARCHES —
+  # ubuntu-latest (x86_64) + ubuntu-24.04-arm (arm64) — because the property under
+  # test is about CPU ARCH, not OS (D4); x86_64 is retained as the FP-hygiene
+  # forcing function (the arch most likely to expose stray FMA/x87 contraction).
+  # apple-darwin determinism is deferred to a release/nightly workflow (#62), NOT
+  # every PR — do not add darwin arches here. Runs `--release` (gate-2 grill): the
+  # cross-arch CI compare is the AUTHORITATIVE gate, so it must prove the SHIPPED
+  # codegen profile (the `.app` ships `--release`); the local
+  # `cargo test --test determinism` AC stays debug (fast, in-process 100x-identity).
+  # The emitter WRITES the single canonical content hash to a FILE
+  # (target/determinism-hash.txt) — uploaded as the per-arch artifact; no stdout
+  # scraping. The dependent `determinism-crossarch` job downloads both and cmp's
+  # them: byte-equality across arches = the live AC#1 cross-arch proof (#29).
+  determinism:
+    name: determinism (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      # Ship-faithful (gate-2): the cross-arch gate runs the profile the .app
+      # ships (`--release`), so a release-only auto-vectorization divergence
+      # cannot ship unproven. 100x sequential + 100x Rayon, all 200 hashes equal.
+      - name: Determinism test (--release, 100x single + parallel)
+        run: cargo test --release --test determinism
+
+      # Tamper-proof transport: the emitter WRITES the one canonical
+      # result_content_hash() to target/determinism-hash.txt (no --nocapture
+      # scraping). D3 fallback if this ever diverges cross-arch on the f64 regime:
+      # swap result_content_hash() -> money_math_hash() in tests/determinism.rs and
+      # this run is unchanged.
+      - name: Emit canonical content hash to file (--release)
+        run: cargo test --release --test determinism emit_content_hash -- --ignored
+
+      - name: Upload per-arch determinism hash
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: determinism-hash-${{ matrix.arch }}
+          path: target/determinism-hash.txt
+          if-no-files-found: error
+
+  # VS-1.2.3 work-3.04: the live AC#1 cross-arch proof. Downloads BOTH arches'
+  # determinism-hash.txt and cmp's them byte-for-byte — EQUAL ⇒ the two arches
+  # produced the SAME content hash (closes #29's cross-arch half). RED here on the
+  # f64 regime component is the signal to apply the D3 fallback (regime-free
+  # money_math_hash()) and file a narrowed #29.
+  determinism-crossarch:
+    name: determinism cross-arch compare
+    needs: determinism
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download x86_64 hash
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: determinism-hash-x86_64
+          path: x86_64
+
+      - name: Download arm64 hash
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: determinism-hash-arm64
+          path: arm64
+
+      - name: Compare cross-arch content hashes (byte-equal = AC#1 proof)
+        run: |
+          echo "x86_64: $(cat x86_64/determinism-hash.txt)"
+          echo "arm64:  $(cat arm64/determinism-hash.txt)"
+          cmp x86_64/determinism-hash.txt arm64/determinism-hash.txt

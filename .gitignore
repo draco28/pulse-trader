@@ -1,6 +1,10 @@
 /target
 /.worktrees
 
+# proptest failure-seed cache — regenerated on demand; not checked in (matches
+# the repo's existing VS-1.1.2 proptest convention, which tracks no seeds).
+proptest-regressions/
+
 # VS-1.1.4 work-1.01 — ephemeral SQLite scratch DBs (WAL/SHM sidecars + the
 # `just prepare` / CI `prepare-check` throwaway DBs). The `.sqlx/` offline query
 # cache (1.03-populated) is COMMITTED, never ignored — only these scratch files are.

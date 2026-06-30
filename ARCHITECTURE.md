@@ -119,9 +119,54 @@ the SQLite DB is the system-of-record for all entities.
 Byte-reproducible backtests are a load-bearing requirement (NFR-2). Three
 mechanisms enforce it:
 
-1. **FMA / fast-math disabled.** The backtester opts out of fused
-   multiply-add and other re-associating compiler optimisations so floating-
-   point results are identical on aarch64 and x86\_64.
+1. **FMA / fast-math disabled (floating-point portability contract, D2).**
+   The f64 math paths (indicator / regime / backtest) are restricted to the
+   IEEE-754 operations the standard guarantees are *correctly-rounded* —
+   `+  -  *  /` and `sqrt` — which are therefore bit-identical on any compliant
+   target (aarch64 and x86\_64 alike). Two operation classes are **banned**
+   because they break that guarantee:
+   - **`mul_add`** — contracts to a fused multiply-add, which rounds once
+     instead of twice and so yields a different last bit.
+   - **Transcendentals** (`exp` / `ln` / `log` / `log10` / `log2` / `ln_1p` /
+     `exp2` / `exp_m1` / `powf` / `powi` / `sin` / `cos` / `tan` / `sin_cos` /
+     `sinh` / `cosh` / `tanh` / `asin` / `acos` / `atan` / `atan2` / `cbrt` /
+     `hypot`) — not standardized to the last ulp across libm implementations, so
+     their results can differ between architectures. (This 23-name list plus
+     `mul_add` is the 24-token `BANNED_FP_CALLS` set the determinism guard
+     enforces — widened from the original 9 in VS-1.2.4 work-4.02, #70.)
+
+   `sqrt` is **allowed** (correctly-rounded; it is the single transcendental
+   permitted, and as of VS-1.2.4 work-4.02 the `SummaryStats` Sharpe/Sortino
+   stddev consumes it). The x87 80-bit excess-precision hazard is a non-issue:
+   `x86_64` uses SSE2 scalar f64 by default, matching aarch64's IEEE-754
+   binary64.
+
+   **Stable-Rust reality (why this is enforced by absence, not a flag).**
+   Stable Rust/LLVM does *not* contract `a*b + c` into an FMA unless
+   `f64::mul_add` is called explicitly, and stable Rust exposes *no*
+   `-ffast-math`-equivalent / fp-contraction flag. So the real levers are:
+   (i) never call `mul_add` in the math paths, (ii) never add a
+   `target-feature` / `rustflag` that enables fp-contraction or fast-math, and
+   (iii) document + guard the above. `.cargo/config.toml` carries the contract
+   as a *documented guard surface*, not a magic flag — it deliberately adds no
+   `[build] rustflags`.
+
+   **Guard test (advisory tripwire) vs. authoritative gate.**
+   `tests/determinism_guard.rs` scans those f64 math source files for the
+   banned call-forms (matched word-boundaried and call-form anchored — method,
+   path/free-function, and bare forms — so `f64::exp(x)` and `libm::exp(x)`
+   are caught while `explain` / `println` are not) **and** for shared-mutable /
+   interior-mutable state (`static mut`, `thread_rng`, `lazy_static`,
+   `OnceCell` / `OnceLock`, `Mutex` / `RwLock`, `RefCell` / `Cell<`) that would
+   make `run_backtest` non-reentrant and flake the parallel arm. This guard is
+   an **advisory** pre-filter only: a source scan proves a token is *absent*,
+   never that an f64 result is bit-identical. The **authoritative** determinism
+   gate is the 100×-both-arches cross-arch CI compare (mechanism #3 below).
+
+   *Resolves issue #29* ("VS-1.1.3 determinism is single-process only —
+   establish FMA-off + cross-arch determinism gate"): this FMA-off contract +
+   the tracked guard test close the FMA-off / guard half of #29; the cross-arch
+   CI matrix half is delivered alongside mechanism #3.
 
 2. **Pinned toolchain.** `rust-toolchain.toml` pins an exact Rust version
    (`1.92.0`), not a floating `stable` channel. The toolchain version feeds

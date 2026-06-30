@@ -10,20 +10,24 @@
 //! schema; human mode prints a concise per-tf line. ANSI styling is suppressed
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
+pub(crate) mod backtest;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
+pub(crate) mod runs;
 pub(crate) mod strategy;
 
 use clap::{Parser, Subcommand};
 
 use crate::adapters::binance::BinanceDataSource;
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{default_db_path, open_migrated};
+use crate::adapters::db::{Db, default_db_path, open_migrated};
 use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
+use backtest::{BacktestArgs, run_backtest_cli};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
+use runs::{RunsArgs, run_runs};
 use strategy::{StrategyArgs, run_strategy};
 
 /// `pulse` — AI-orchestrated crypto-futures strategy development (v1 CLI `PoC`).
@@ -49,6 +53,10 @@ pub enum Command {
     Indicators(IndicatorsArgs),
     /// Browse / create / clone / tag / pin / archive / compare strategies (FR-11).
     Strategy(StrategyArgs),
+    /// Backtest a DSL strategy over a local candle snapshot + render the trade log (FR-5/FR-6).
+    Backtest(BacktestArgs),
+    /// List / show persisted backtest runs (FR-6 read verb, VS-1.2.4 work-4.05).
+    Runs(RunsArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -96,22 +104,52 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Indicators(args) => run_indicators(&args),
         Command::Strategy(args) => {
-            // Gate-7 C3 startup wiring (§4a-3): resolve the db path FIRST, then
-            // run the backup-before-migrate protocol + open the pool via 1.04's
-            // `open_migrated` (migrate-then-open). On a migration failure this
-            // REFUSES TO START (DataError::Migration → anyhow → non-zero exit,
-            // MASTER-SPEC §7.4). `Db::with_path`/`open_default` are pure openers
-            // that do NOT migrate, so they are deliberately NOT used here.
-            let path = match &args.db {
-                Some(p) => p.clone(),
-                None => default_db_path().map_err(|e| anyhow::anyhow!("resolve db path: {e}"))?,
-            };
-            let db = open_migrated(&path)
-                .await
-                .map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+            let db = open_db(args.db.as_deref()).await?;
             run_strategy(&db, &args).await
         }
+        // VS-1.2.4 work-4.05 (D2): `run_backtest_cli` is now async. The `--version`
+        // persist/compare path needs a migrated `pulse.db` (opened via
+        // `open_migrated`, migrate-then-open — mirroring the `Strategy` arm); the
+        // `--dsl` path is persistence-free, so the db is opened ONLY when
+        // `--version` is set (a `--dsl` run must NOT create/migrate a real
+        // Application Support `pulse.db` — it stays verbatim, README C7).
+        Command::Backtest(args) => {
+            let db = if args.version.is_some() {
+                Some(open_db(args.db.as_deref()).await?)
+            } else {
+                None
+            };
+            run_backtest_cli(db.as_ref(), &args).await
+        }
+        // VS-1.2.4 work-4.05 (D6): the `runs list/show` read verb always opens the
+        // db via `open_migrated` (same migrate-then-open as the Strategy arm).
+        Command::Runs(args) => {
+            let db = open_db(args.db.as_deref()).await?;
+            run_runs(&db, &args).await
+        }
     }
+}
+
+/// Resolve the `pulse.db` path (the `--db` override or `default_db_path()`) then
+/// open the pool via 1.04's `open_migrated` (migrate-then-open).
+///
+/// Gate-7 C3 startup wiring (§4a-3): on a migration failure this REFUSES TO START
+/// (`DataError::Migration` → `anyhow` → non-zero exit, MASTER-SPEC §7.4). The pure
+/// openers (`Db::with_path`/`open_default`) do NOT migrate and are deliberately
+/// NOT used here. Shared by the `Strategy`, `Backtest --version`, and `Runs` arms.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] if the default db path cannot be resolved or the
+/// migrate-then-open fails.
+async fn open_db(db_override: Option<&std::path::Path>) -> anyhow::Result<Db> {
+    let path = match db_override {
+        Some(p) => p.to_path_buf(),
+        None => default_db_path().map_err(|e| anyhow::anyhow!("resolve db path: {e}"))?,
+    };
+    open_migrated(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("open db: {e}"))
 }
 
 /// Orchestrate `fetch-data` over the injected port + store (NFR-9 / AC-6 — this
