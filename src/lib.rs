@@ -301,6 +301,21 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
 pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
 
+// VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The
+// PulseTrader-OWNED `LlmProvider` port + the message/response/usage/config value
+// types + the dedicated `LlmError` + the pure cost model
+// (`ModelPrice`/`PriceTable`) + the `LlmCall` ledger entity + its `LlmCallId`
+// newtype — all free of any `PulseHive` dep (ADR-0012 insulation; AC-8). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` BUILD error, not a warning (the `domain/mod.rs` re-export
+// alone is necessary but NOT sufficient — the harvested dead-code gotcha). 1.02
+// (persistence) + 1.03 (GLM adapter) + 1.04 (redacting-logging decorator) consume
+// these through the `LlmProvider` port + the value/cost types.
+pub use domain::{
+    LlmBackend, LlmCall, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message,
+    ModelPrice, PriceTable, TokenUsage, ToolCall,
+};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
