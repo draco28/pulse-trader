@@ -344,6 +344,17 @@ pub use domain::LlmCallRepository;
 pub use adapters::llm::glm::GlmProvider;
 pub use adapters::secrets::glm_api_key;
 
+// VS-1.3.1 work-1.04: the redacting + cost-logging `LlmProvider` decorator
+// (README C7, FR-24 / NFR-6). `RedactingLoggingProvider` wraps any inner provider
+// (1.05 wraps `GlmProvider`), redacts the PERSISTED copy of the prompt/completion
+// (grill OQ-A — the model still gets the real bytes), computes the `Decimal` cost
+// from `usage` times the `PriceTable`, and writes an `LlmCall` through the
+// `LlmCallRepository`; `Redactor` is the scoped, config-driven secret scrubber.
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public
+// adapter type unused outside its module is a `dead_code` BUILD error, not a
+// warning (the `llm/mod.rs` re-export alone is necessary but NOT sufficient).
+pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
