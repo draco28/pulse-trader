@@ -32,11 +32,11 @@ Three facts push toward option 2:
   domain refactor, and the hexagonal architecture requires ports to live in the zero-dep
   `domain` ring.
 - **The thin path is cheap and sufficient.** PulseHive's `pulsehive-openai`
-  `OpenAICompatibleProvider` reaches GLM 5.1 with a thin config
-  (`OpenAIConfig::new(key, "glm-5.1").with_base_url(GLM_URL)`; the key is a ctor arg, not an
-  env read). VS-1.3.1's demo bar is only "a GLM 5.1 call round-trips through PulseHive and
-  logs an LLMCall with redaction" — transport + persistence + redaction, **not** agent
-  orchestration.
+  `OpenAICompatibleProvider` reaches GLM 5.2 with a thin config
+  (`OpenAIConfig::new(key, "glm-5.2").with_base_url("https://api.z.ai/api/coding/paas/v4")`;
+  the key is a ctor arg, not an env read — Z.AI coding-plan endpoint, owner-confirmed). VS-1.3.1's
+  demo bar is only "a GLM 5.2 call round-trips through PulseHive and logs an LLMCall with
+  redaction" — transport + persistence + redaction, **not** agent orchestration.
 - **The full runtime carries weight VS-1.3.1 does not need.** Adopting `HiveMind` pulls
   `pulsehive-db` (an embedding/ONNX vector substrate) — a second memory store overlapping
   PulseTrader's SQLite — and couples PulseTrader to PulseHive's 2.x runtime API. PulseHive
