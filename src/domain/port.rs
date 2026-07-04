@@ -30,6 +30,7 @@ use crate::domain::candle::Candle;
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message};
+use crate::domain::llm_call::{LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
 use crate::domain::series::CandleSeries;
 use crate::domain::sizing::SymbolFilters;
@@ -367,6 +368,54 @@ pub trait LlmProvider {
         messages: Vec<Message>,
         config: &LlmConfig,
     ) -> impl Future<Output = Result<LlmResponse, LlmError>> + Send;
+}
+
+/// `PulseTrader`'s append-only [`LlmCall`] ledger persistence port (VS-1.3.1
+/// work-1.02, FR-24, README C6).
+///
+/// The **established** repository style — `impl Future<Output = ...> + Send`,
+/// consumed generically (`<R: LlmCallRepository>`), **never `dyn`** — mirrors
+/// [`BacktestRunRepository`] / [`StrategyRepository`] (audit C3), so a repository
+/// call can be `spawn`ed on tokio's multi-thread runtime. The `SqliteLlmCallRepo`
+/// (`adapters::db`) implements it over `pulse.db`; the 1.04 decorator writes
+/// through it and the 1.05 demo reads a row back.
+///
+/// **Calls are create + read only.** A persisted [`LlmCall`] is an append-only
+/// verbatim ledger record (FR-24) — there is deliberately NO `update_call` /
+/// `delete_call` method; immutability is structural in this API and enforced by the
+/// migration-`0004` `BEFORE UPDATE` / `BEFORE DELETE` triggers.
+///
+/// **Errors are [`DataError::Db`]**, the shared persistence error (like the other
+/// repos) — NOT [`LlmError`], which is the *provider*-port error only.
+pub trait LlmCallRepository {
+    /// Persist one [`LlmCall`] ledger row (append-only, FR-24).
+    ///
+    /// The stored `created_at` is sourced from the adapter's injected `Clock`
+    /// (deterministic under test); every other field is persisted verbatim.
+    /// Returns the persisted [`LlmCallId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the store fails.
+    fn save_call(
+        &self,
+        call: &LlmCall,
+    ) -> impl Future<Output = Result<LlmCallId, DataError>> + Send;
+
+    /// Fetch one persisted call by id (`Ok(None)` if no such row).
+    ///
+    /// **Fail-closed** (mirror [`BacktestRunRepository::get_run`]): an unsupported
+    /// stored `schema_version` or a corrupt/un-parseable column is an `Err`, never a
+    /// silent partial.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on an unsupported stored `schema_version`, a
+    /// malformed column, or a store failure.
+    fn get_call(
+        &self,
+        id: &LlmCallId,
+    ) -> impl Future<Output = Result<Option<LlmCall>, DataError>> + Send;
 }
 
 #[cfg(test)]
@@ -939,5 +988,94 @@ mod llm_provider_tests {
             .expect("chat succeeds");
         assert_eq!(response.content.as_deref(), Some("ping"));
         assert_eq!(response.usage.input_tokens, 7);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod llm_call_repository_tests {
+    use super::LlmCallRepository;
+    use crate::domain::error::DataError;
+    use crate::domain::llm::{LlmBackend, Message};
+    use crate::domain::llm_call::{LlmCall, LlmCallId};
+    use crate::domain::strategy::CreatedBy;
+    use chrono::{TimeZone, Utc};
+    use rust_decimal::Decimal;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// An in-memory, zero-I/O fake implementing [`LlmCallRepository`]. It locks the
+    /// trait shape (create + read only — no `update_call`/`delete_call` to
+    /// implement, so FR-24 immutability is structural in the API) and proves the
+    /// futures are `Send`-spawnable. The `Mutex`-guarded map keeps the fake
+    /// `Send + Sync` so its futures are `Send` while borrowing `&self` (mirror
+    /// `FakeRunRepo`).
+    #[derive(Default)]
+    struct FakeLlmCallRepo {
+        calls: Mutex<HashMap<String, LlmCall>>,
+    }
+
+    impl LlmCallRepository for FakeLlmCallRepo {
+        async fn save_call(&self, call: &LlmCall) -> Result<LlmCallId, DataError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .insert(call.id.as_str().to_owned(), call.clone());
+            Ok(call.id.clone())
+        }
+
+        async fn get_call(&self, id: &LlmCallId) -> Result<Option<LlmCall>, DataError> {
+            Ok(self
+                .calls
+                .lock()
+                .expect("calls lock")
+                .get(id.as_str())
+                .cloned())
+        }
+    }
+
+    fn sample_call() -> LlmCall {
+        LlmCall {
+            id: LlmCallId::new("call-1"),
+            backend: LlmBackend::Glm,
+            model: "glm-5.1".to_owned(),
+            prompt_messages: vec![Message::system("be terse"), Message::user("hi")],
+            completion: Some("hello".to_owned()),
+            input_tokens: 7,
+            output_tokens: 2,
+            cost: Decimal::new(1234, 4),
+            cost_currency: "CNY".to_owned(),
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            created_by: CreatedBy::ComposerLlm,
+        }
+    }
+
+    /// Generic consumption (`<R: LlmCallRepository>`) proves the port is used by
+    /// bound, not as `dyn`, and that the save→read futures are `Send` (required by
+    /// `spawn`). Round-trips a saved call.
+    async fn roundtrip_via<R: LlmCallRepository>(repo: R) -> Result<Option<LlmCall>, DataError> {
+        let call = sample_call();
+        let id = repo.save_call(&call).await?;
+        repo.get_call(&id).await
+    }
+
+    /// The call-repo port double is `Send`-spawnable and consumed generically
+    /// (`<R: LlmCallRepository>`, never `dyn`). The ABSENCE of any
+    /// `update_call`/`delete_call` method is demonstrated by `FakeLlmCallRepo`
+    /// having none to implement (FR-24 immutability is structural in the API).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llm_call_repo_port_double_is_send_spawnable() {
+        // If the port's futures were not `Send`, this `spawn` would not compile.
+        let handle = tokio::spawn(async { roundtrip_via(FakeLlmCallRepo::default()).await });
+        let fetched = handle
+            .await
+            .expect("spawned task joins")
+            .expect("round-trip succeeds")
+            .expect("saved call is fetchable");
+
+        assert_eq!(fetched.id, LlmCallId::new("call-1"));
+        assert_eq!(fetched.backend, LlmBackend::Glm);
+        assert_eq!(fetched.cost_currency, "CNY");
+        assert_eq!(fetched.cost, Decimal::new(1234, 4));
     }
 }

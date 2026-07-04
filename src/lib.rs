@@ -216,6 +216,15 @@ pub use adapters::db::SqliteStrategyRepo;
 // sufficient). 4.05's CLI consumes it through the `BacktestRunRepository` port.
 // Append-only (keep-both with 1.03's re-export at merge).
 pub use adapters::db::SqliteBacktestRunRepo;
+// VS-1.3.1 work-1.02: the SQLite `LlmCallRepository` adapter. `SqliteLlmCallRepo`
+// implements the FR-24 append-only ledger surface over `query!` (the committed
+// `.sqlx/` cache), `created_at` from an injected `Clock`, Decimal-as-TEXT cost, and
+// a `schema_version` read-reject. REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter type unused outside its module is a `dead_code`
+// build error (the `db/mod.rs` re-export alone is necessary but NOT sufficient).
+// 1.04's decorator constructs it; 1.05's demo reads a row back. Append-only
+// (keep-both with 1.03's re-export at merge).
+pub use adapters::db::SqliteLlmCallRepo;
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -315,6 +324,13 @@ pub use domain::{
     LlmBackend, LlmCall, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message,
     ModelPrice, PriceTable, TokenUsage, ToolCall,
 };
+// VS-1.3.1 work-1.02: the append-only `LlmCall` persistence port (FR-24, README C6)
+// — create + read only, `DataError::Db`-erroring, immutability structural in the API
+// (enforced by the migration-`0004` triggers). REQUIRED under `deny(warnings)` +
+// `pub(crate) mod domain` — an un-re-exported public domain type is a `dead_code`
+// BUILD error, not a warning (the `domain/mod.rs` re-export alone is necessary but
+// NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
+pub use domain::LlmCallRepository;
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

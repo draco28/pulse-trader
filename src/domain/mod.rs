@@ -100,7 +100,8 @@ pub use pair::Pair;
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, ExchangeAdapter, LlmProvider, MarketDataSource, StrategyRepository,
+    BacktestRunRepository, ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource,
+    StrategyRepository,
 };
 // VS-1.3.1 work-1.01: the LLM domain ring surface (FR-23 / FR-24, README C2–C5).
 // The message/response/usage/config value types + the dedicated `LlmError` + the
