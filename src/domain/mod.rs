@@ -22,6 +22,12 @@ mod fingerprint;
 // VS-1.2.2 work-2.01: the dedicated exchange-port error taxonomy (audit C5).
 mod exchange;
 mod indicator;
+// VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24). `llm` holds the value
+// types + dedicated error + pure cost model; `llm_call` the append-only ledger
+// entity. Both pure + zero-I/O + free of any `PulseHive` dep (ADR-0012); the
+// `LlmProvider` port lives in `port` beside the other ports.
+mod llm;
+mod llm_call;
 mod pair;
 mod port;
 mod series;
@@ -93,7 +99,20 @@ pub use pair::Pair;
 // `MarketDataSource`. The strategy entity value types are surfaced to `lib.rs`
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
-pub use port::{BacktestRunRepository, ExchangeAdapter, MarketDataSource, StrategyRepository};
+pub use port::{
+    BacktestRunRepository, ExchangeAdapter, LlmProvider, MarketDataSource, StrategyRepository,
+};
+// VS-1.3.1 work-1.01: the LLM domain ring surface (FR-23 / FR-24, README C2–C5).
+// The message/response/usage/config value types + the dedicated `LlmError` + the
+// pure cost model (`ModelPrice`/`PriceTable`), and the `LlmCall` ledger entity +
+// its `LlmCallId` newtype. Re-exported here so `lib.rs` can curate the crate
+// surface — an un-re-exported public domain type is a `dead_code` BUILD error
+// under `deny(warnings)`. 1.02–1.04 consume these through the `LlmProvider` port.
+pub use llm::{
+    LlmBackend, LlmConfig, LlmError, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage,
+    ToolCall,
+};
+pub use llm_call::{LlmCall, LlmCallId};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the
 // `SymbolFilters` value type + its `unconstrained()` ctor, and the

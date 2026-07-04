@@ -29,6 +29,7 @@ use crate::domain::backtest::{BacktestResult, BacktestRunId, PersistedRun, RunSu
 use crate::domain::candle::Candle;
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
+use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message};
 use crate::domain::pair::Pair;
 use crate::domain::series::CandleSeries;
 use crate::domain::sizing::SymbolFilters;
@@ -333,6 +334,39 @@ pub trait BacktestRunRepository {
         &self,
         id: &BacktestRunId,
     ) -> impl Future<Output = Result<Vec<Trade>, DataError>> + Send;
+}
+
+/// `PulseTrader`'s own LLM chat port (VS-1.3.1 work-1.01, FR-23 / FR-24, README
+/// C1).
+///
+/// The **established** port style — `impl Future<Output = ...> + Send`, consumed
+/// generically (`<P: LlmProvider>`), **never `dyn`** — mirrors
+/// [`MarketDataSource`] / [`StrategyRepository`] / [`BacktestRunRepository`]. This
+/// is deliberately NOT `PulseHive`'s `#[async_trait]` + `dyn`-safe trait: the
+/// shapes are `PulseTrader`-OWNED so `PulseHive`'s evolving 2.x API cannot ripple
+/// inward (ADR-0012). The
+/// [`LlmBackend`](crate::domain::llm::LlmBackend) on
+/// [`LlmConfig`](crate::domain::llm::LlmConfig) IS FR-23's "config flag" — the
+/// composition root (1.05) `match`es on it and constructs the concrete provider;
+/// adding a backend is a new adapter + match arm, no domain refactor.
+///
+/// **Non-streaming ONLY (v1):** the cost-logged path needs `usage`, and only
+/// `chat()` carries it (ADR-0012); streaming is a v1.5 GUI concern. The v1 port
+/// takes **no `tools`** (composer tools are VS-1.3.2 — additive later); a response
+/// still carries `tool_calls` for forward-compat.
+pub trait LlmProvider {
+    /// Run one non-streaming chat completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError`] if the provider / transport fails
+    /// ([`LlmError::Provider`]) or the request / config is invalid
+    /// ([`LlmError::Config`]).
+    fn chat(
+        &self,
+        messages: Vec<Message>,
+        config: &LlmConfig,
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> + Send;
 }
 
 #[cfg(test)]
@@ -844,5 +878,66 @@ mod backtest_run_repository_tests {
         assert_eq!(run.strategy_version_id, VersionId::new("ver-1"));
         assert_eq!(run.schema_version, 1);
         assert!(trades.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod llm_provider_tests {
+    use super::LlmProvider;
+    use crate::domain::llm::{LlmBackend, LlmConfig, LlmError, LlmResponse, Message, TokenUsage};
+
+    /// An in-memory, zero-I/O fake implementing [`LlmProvider`]. It echoes the
+    /// last user message back as the completion and reports fixed token usage,
+    /// proving the port's future is `Send` (spawnable) and consumed generically
+    /// (`<P: LlmProvider>`, never `dyn`) — mirrors `FakeSource` / `FakeRepo` /
+    /// `FakeRunRepo`.
+    struct FakeProvider;
+
+    impl LlmProvider for FakeProvider {
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            _config: &LlmConfig,
+        ) -> Result<LlmResponse, LlmError> {
+            let content = messages.iter().rev().find_map(|m| match m {
+                Message::User { content } => Some(content.clone()),
+                _ => None,
+            });
+            Ok(LlmResponse {
+                content,
+                tool_calls: Vec::new(),
+                usage: TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                },
+            })
+        }
+    }
+
+    /// Generic consumption (`<P: LlmProvider>`) proves the port is used by bound,
+    /// not as `dyn`, and that the returned future is `Send` (required by `spawn`).
+    async fn chat_via<P: LlmProvider>(provider: P) -> Result<LlmResponse, LlmError> {
+        let config = LlmConfig {
+            backend: LlmBackend::Glm,
+            model: "glm-5.1".to_owned(),
+            temperature: 0.5,
+            max_tokens: 128,
+        };
+        provider.chat(vec![Message::user("ping")], &config).await
+    }
+
+    /// AC-9: the [`LlmProvider`] future is `Send`-spawnable on the multi-thread
+    /// runtime (mirror `fetch_future_is_send_spawnable_on_multi_thread_runtime`).
+    /// If the port's future were not `Send`, this `spawn` would not compile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llm_provider_future_is_send() {
+        let handle = tokio::spawn(async { chat_via(FakeProvider).await });
+        let response = handle
+            .await
+            .expect("spawned task joins")
+            .expect("chat succeeds");
+        assert_eq!(response.content.as_deref(), Some("ping"));
+        assert_eq!(response.usage.input_tokens, 7);
     }
 }
