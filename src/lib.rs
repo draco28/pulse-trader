@@ -154,6 +154,14 @@ pub use adapters::store::{CandleStore, SnapshotProvenance};
 pub use cli::fetch_data::{Action, TfOutcome, TfSummary, ensure_one_tf, years_window_start_ms};
 pub use cli::{FetchArgs, run_fetch_data};
 
+// VS-1.3.1 work-1.05: the composition-root demo surface. The OFFLINE e2e test
+// (`tests/llm_roundtrip_cli.rs`, the auto-demo per audit C2) drives the injectable
+// core `run_llm_check_with` over a FAKE provider + a tempfile-`Db` repo (never a
+// live `GlmProvider`, never network/Keychain — MASTER-SPEC §9.4); `LlmCheckOutcome`
+// is the persisted-`LlmCall` + response it returns. `LlmArgs`/`run_llm_check` are
+// the live-arm surface, re-exported like the other `cli::` entrypoints.
+pub use cli::llm::{LlmArgs, LlmCheckOutcome, run_llm_check, run_llm_check_with};
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
