@@ -332,6 +332,18 @@ pub use domain::{
 // NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
 pub use domain::LlmCallRepository;
 
+// VS-1.3.1 work-1.03: the GLM transport adapter + the macOS Keychain READ
+// accessor (README C8, FR-23 / FR-1 / NFR-5). `GlmProvider` is the anti-corruption
+// layer implementing the `LlmProvider` port over the `PulseHive` OpenAI-compatible
+// transport (the ONLY `PulseHive`-importing module — AC-6); `glm_api_key` sources
+// the GLM key from the login Keychain (READ path only). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter item unused
+// outside its module is a `dead_code` BUILD error, not a warning. 1.04's decorator
+// composes over `GlmProvider`; 1.05's composition root injects `glm_api_key` into
+// its ctor. Append-only (keep-both with 1.02's re-exports at the R2 merge).
+pub use adapters::llm::glm::GlmProvider;
+pub use adapters::secrets::glm_api_key;
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
