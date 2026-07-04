@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 id               AS \"id!: String\",\n                 backend          AS \"backend!: String\",\n                 model            AS \"model!: String\",\n                 prompt_messages  AS \"prompt_messages!: String\",\n                 completion       AS \"completion?: String\",\n                 input_tokens     AS \"input_tokens!: i64\",\n                 output_tokens    AS \"output_tokens!: i64\",\n                 cost             AS \"cost!: String\",\n                 cost_currency    AS \"cost_currency!: String\",\n                 created_at       AS \"created_at!: String\",\n                 created_by       AS \"created_by!: String\",\n                 schema_version   AS \"schema_version!: i64\"\n               FROM llm_call WHERE id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "backend!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "model!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "prompt_messages!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "completion?: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "input_tokens!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "output_tokens!: i64",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "cost!: String",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "cost_currency!: String",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: String",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_by!: String",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "schema_version!: i64",
+        "ordinal": 11,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4d9370f1ccfb4650e8e13754cf1720de14decb6490347028fde6fcf761093f7a"
+}
