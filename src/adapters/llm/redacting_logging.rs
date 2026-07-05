@@ -63,9 +63,25 @@ const GENERIC_MIN_LEN: usize = 32;
 /// share no lexical shape, so a numeric regex would erase the very context the
 /// coach (1.3.3) needs. Structural balance/account-ID redaction is deferred to
 /// 1.3.2/1.3.3, done at prompt-composition time where the field is known.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Redactor {
     tagged_secrets: Vec<String>,
+}
+
+// Hand-written `Debug` that NEVER prints the tagged secret VALUES (they are raw
+// secrets — e.g. the live GLM API key is tagged in via `from_config` at the CLI
+// composition root). A derived `Debug` would dump them in the clear through any
+// `dbg!`/`tracing::debug!(?redactor)`/Debug-deriving wrapper — defeating the whole
+// leak-at-rest purpose (slice-close close-audit finding R1-2).
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redactor")
+            .field(
+                "tagged_secrets",
+                &format_args!("<{} redacted>", self.tagged_secrets.len()),
+            )
+            .finish()
+    }
 }
 
 impl Redactor {

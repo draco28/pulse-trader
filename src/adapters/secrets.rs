@@ -1,7 +1,8 @@
 //! macOS Keychain secret accessor (VS-1.3.1 work-1.03, FR-1 / NFR-5, decision 5).
 //!
 //! The READ half of secret handling: [`glm_api_key`] fetches the GLM API key from
-//! the login Keychain so the composition root (1.05) can inject it into
+//! the macOS Keychain (the data-protection keychain `keyring` binds to — see the
+//! seeding-reality note below) so the composition root (1.05) can inject it into
 //! [`GlmProvider`](crate::adapters::llm::glm::GlmProvider) as a ctor arg — the key
 //! never lives in a committed config file, an env var baked into the binary, or
 //! plaintext on disk (NFR-5). A **missing** entry returns a clear
@@ -35,7 +36,7 @@ const KEYCHAIN_SERVICE: &str = "PulseTrader";
 /// The Keychain account (item name) for the GLM API key.
 const GLM_API_KEY_ACCOUNT: &str = "glm_api_key";
 
-/// Read the GLM API key from the macOS login Keychain (FR-1 / NFR-5).
+/// Read the GLM API key from the macOS Keychain (FR-1 / NFR-5).
 ///
 /// # Errors
 ///
