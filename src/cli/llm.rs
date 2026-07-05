@@ -58,8 +58,11 @@ const DEMO_MODEL: &str = "glm-5.2";
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const DEMO_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap for the demo round-trip.
-const DEMO_MAX_TOKENS: u32 = 512;
+/// The response token cap for the demo round-trip. GLM 5.2 is a **reasoning**
+/// model whose thinking tokens count against this cap BEFORE the final answer, so
+/// a tight cap yields empty `content` (the live VS-1.3.1 close demo saw an empty
+/// reply at 256 and a real one at ~343). Keep generous headroom past the reasoning.
+const DEMO_MAX_TOKENS: u32 = 4096;
 
 /// The fixed demo prompt used when the operator gives no prompt argument.
 const DEMO_PROMPT: &str = "In one concise sentence, what is a liquidation in crypto futures?";
