@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
     Clock, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    Message, PriceTable,
+    Message, PriceTable, TokenUsage,
 };
 
 /// The placeholder substituted for every redacted span in the persisted copy.
@@ -91,7 +91,14 @@ impl Redactor {
     /// config; a test passes a small explicit list. [`Default`] is the minimal
     /// safe redactor (API-key stripping only, no tagged secrets).
     #[must_use]
-    pub fn from_config(tagged_secrets: Vec<String>) -> Self {
+    pub fn from_config(mut tagged_secrets: Vec<String>) -> Self {
+        // Longest-first: the sequential exact-substring replacement in `redact` is
+        // order-sensitive, so a shorter tagged secret that is a substring of a
+        // longer one must be scrubbed AFTER the longer one — otherwise the short
+        // match eats part of the long secret and leaves its tail exposed in the
+        // persisted copy (close-review Codex C4). Descending length guarantees the
+        // longest match wins.
+        tagged_secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         Self { tagged_secrets }
     }
 
@@ -243,12 +250,19 @@ where
         messages: Vec<Message>,
         config: &LlmConfig,
     ) -> Result<LlmResponse, LlmError> {
+        // Preflight the price table BEFORE the billed inner call: an unknown-model
+        // config error is knowable up front (zero usage → Ok(0) if priceable, else
+        // Err::Config), so surface it here rather than let a real, BILLED provider
+        // call succeed and then escape the FR-24 ledger when the post-call cost
+        // lookup fails (close-review Codex C2).
+        self.prices.cost(&config.model, &TokenUsage::default())?;
+
         // OQ-A: the inner provider gets the REAL, un-redacted prompt; we keep a
         // copy only to scrub the persisted record.
         let prompt_copy = messages.clone();
         let response = self.inner.chat(messages, config).await?;
 
-        // Cost from usage times the price table — fail-closed on an unknown model.
+        // Cost from usage times the price table — model already validated above.
         let cost = self.prices.cost(&config.model, &response.usage)?;
         let cost_currency = self.prices.currency().to_owned();
 
@@ -568,5 +582,74 @@ mod tests {
         assert_eq!(call.cost, prices().cost("glm-5.2", &usage).expect("cost"));
         assert_eq!(call.cost.normalize(), Decimal::new(7, 3).normalize());
         assert_eq!(call.cost_currency, "CNY");
+    }
+
+    #[tokio::test]
+    async fn redacts_overlapping_tagged_secrets_longest_first() {
+        // Two tagged secrets where the shorter is a substring of the longer. With
+        // naive in-list-order replacement the short one scrubs part of the long one
+        // and leaves its tail exposed; longest-first ordering must strip both fully
+        // (close-review Codex C4).
+        let short = "9F3K";
+        let long = "ACCT-9F3K-TOKEN-XYZ";
+        // Pass the SHORT one FIRST — `from_config` must reorder to longest-first.
+        let redactor = Redactor::from_config(vec![short.to_owned(), long.to_owned()]);
+        let prompt = vec![Message::user(format!("audit {long} please"))];
+        let driven = drive(prompt, redactor, response("ok", 3, 1), 1_700_000_000_000).await;
+
+        let stored = user_text(&driven.saved[0].prompt_messages[0]);
+        assert!(stored.contains(REDACTED), "not redacted: {stored}");
+        for leak in [long, short, "ACCT-", "TOKEN-XYZ"] {
+            assert!(
+                !stored.contains(leak),
+                "persisted prompt still leaks `{leak}`: {stored}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_errors_before_billing_and_ledger() {
+        // A model absent from the price table must fail BEFORE the billed inner
+        // call, so no provider request is spent and no ledger row is written — the
+        // config error is knowable up front (close-review Codex C2).
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let provider = FakeProvider {
+            received: Arc::clone(&received),
+            response: response("unreached", 1, 1),
+        };
+        let repo = RecordingRepo {
+            saved: Arc::clone(&saved),
+        };
+        let decorator = RedactingLoggingProvider::new(
+            provider,
+            repo,
+            FakeClock::at(1_700_000_000_000),
+            Redactor::default(),
+            prices(), // keyed on "glm-5.2" only
+        );
+        let cfg = LlmConfig {
+            backend: LlmBackend::Glm,
+            model: "unpriced-model".to_owned(),
+            temperature: 0.2,
+            max_tokens: 64,
+        };
+
+        let err = decorator
+            .chat(vec![Message::user("hi")], &cfg)
+            .await
+            .expect_err("an unpriced model must error");
+        assert!(
+            matches!(err, LlmError::Config(_)),
+            "expected Config, got {err:?}"
+        );
+        assert!(
+            received.lock().expect("received lock").is_empty(),
+            "inner provider must NOT be billed for an unpriced model"
+        );
+        assert!(
+            saved.lock().expect("saved lock").is_empty(),
+            "no ledger row may be written when the model is unpriced"
+        );
     }
 }
