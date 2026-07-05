@@ -70,6 +70,19 @@ feature-depth = 1
 # Fail on active vulnerabilities (default is deny for unmaintained=warn by default)
 # yanked crates are denied
 yanked = "deny"
+# VS-1.3.1 work-1.03 (ADR-0011/0012): scope UNMAINTAINED advisories to workspace-level
+# only — mirrors the identical policy in PulseDB's own deny.toml. Rationale: the
+# `pulsehive =2.0.2 features=["openai"]` graph links `pulsehive-core`/`-runtime`, which
+# use `pulsehive-db` (the agent-memory substrate) UNCONDITIONALLY. `pulsehive-db` in turn
+# pulls two crates flagged UNMAINTAINED (the lowest RUSTSEC class — informational, NOT
+# vulnerabilities, no safe upgrade): `bincode 1.3.3` (via the third-party `hnsw_rs` vector
+# index; RUSTSEC-2025-0141) and `paste 1.0.15` (via `tokenizers`; RUSTSEC-2024-0436).
+# PulseDB already migrated its OWN storage bincode->postcard (ADR-006) and accepts these
+# residual THIRD-PARTY transitives via `unmaintained = "workspace"`; PulseTrader adopts the
+# same supply-chain policy rather than being stricter than its own upstream. This still
+# FAILS the gate on: any actual vulnerability (RUSTSEC advisory-class), any yanked crate,
+# and any unmaintained crate that is a first-party/workspace dependency.
+unmaintained = "workspace"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
