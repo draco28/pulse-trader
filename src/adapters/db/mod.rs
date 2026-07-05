@@ -18,6 +18,11 @@ pub mod strategy_repo;
 // `query!` macros for `backtest_run`/`trade` are confined here (the `.sqlx` cache
 // is keyed to this file). Append-only beside `strategy_repo` (keep-both at merge).
 pub mod backtest_run_repo;
+// VS-1.3.1 work-1.02: the SQLite `LlmCallRepository` adapter (FR-24, README C6).
+// `query!` macros for `llm_call` are confined here (the `.sqlx` cache is keyed to
+// this file). Append-only beside `backtest_run_repo` (trivial keep-both with 1.03's
+// `strategy_repo`-adjacent additions at R2 integration).
+pub mod llm_call_repo;
 
 // VS-1.1.4 work-1.05 (§4a-3): the CLI dispatch resolves the default `pulse.db`
 // path BEFORE calling `open_migrated` (migrate-then-open), so it must reach
@@ -33,6 +38,11 @@ pub use strategy_repo::SqliteStrategyRepo;
 // `db/mod.rs` re-export is necessary but not sufficient; lib.rs mirrors it).
 // Append-only (keep-both with strategy_repo's re-export at merge).
 pub use backtest_run_repo::SqliteBacktestRunRepo;
+// VS-1.3.1 work-1.02: the SQLite `LlmCallRepository` adapter type. REQUIRED under
+// `deny(warnings)` — a `pub` type unused outside its module is a `dead_code` BUILD
+// error (the `db/mod.rs` re-export is necessary but not sufficient; lib.rs mirrors
+// it). Append-only (trivial keep-both with 1.03's re-exports at merge).
+pub use llm_call_repo::SqliteLlmCallRepo;
 
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a

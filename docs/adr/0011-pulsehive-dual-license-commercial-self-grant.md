@@ -14,10 +14,12 @@ license posture.)
 ## Context
 
 VS-1.3.1 introduces PulseTrader's first third-party AI dependency: **PulseHive** — the
-author-owned Rust multi-agent SDK — consumed for GLM-5.1 LLM transport via its
+author-owned Rust multi-agent SDK — consumed for GLM-5.2 LLM transport via its
 OpenAI-compatible provider. The dependency graph pulls `pulsehive` (meta) and transitively
-`pulsehive-core`, `pulsehive-runtime`, `pulsehive-openai`, and `pulsehive-db`. All are
-published on crates.io (pulsehive* at `2.0.1`, `pulsehive-db` at `0.5.1`) under
+`pulsehive-core`, `pulsehive-runtime`, `pulsehive-openai`, and `pulsehive-db`. The pin is
+`pulsehive* =2.0.2`; `pulsehive-core 2.0.2` transitively resolves **`pulsehive-db 0.4.0`**
+(the version PulseTrader actually links — matching the `deny.toml` exception note; newer
+`pulsehive-db` releases exist on crates.io but are not what `2.0.2` locks). All are licensed
 **AGPL-3.0-only**.
 
 The canonical `pulse-trader` repository is **public** and licensed **PolyForm Noncommercial

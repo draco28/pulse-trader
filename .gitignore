@@ -22,3 +22,10 @@ CLAUDE.md
 AGENTS.md
 .codex/
 .mcp.json
+
+# Local dev/testing secrets + config — NEVER committed (this is a PUBLIC repo).
+# Real GLM/Z.AI credentials live here (gitignored) + in the macOS Keychain
+# (the production read path, NFR-5). Only `.env.example` (secret-free) is tracked.
+.env
+.env.*
+!.env.example

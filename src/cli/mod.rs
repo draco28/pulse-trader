@@ -13,6 +13,7 @@
 pub(crate) mod backtest;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
+pub(crate) mod llm;
 pub(crate) mod runs;
 pub(crate) mod strategy;
 
@@ -27,6 +28,7 @@ use crate::domain::{Pair, Timeframe};
 use backtest::{BacktestArgs, run_backtest_cli};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
+use llm::{LlmArgs, run_llm_check};
 use runs::{RunsArgs, run_runs};
 use strategy::{StrategyArgs, run_strategy};
 
@@ -57,6 +59,9 @@ pub enum Command {
     Backtest(BacktestArgs),
     /// List / show persisted backtest runs (FR-6 read verb, VS-1.2.4 work-4.05).
     Runs(RunsArgs),
+    /// Round-trip a GLM 5.2 chat through `PulseHive` + log a redacted `LlmCall`
+    /// (the VS-1.3.1 composition-root demo, FR-23/FR-24/NFR-6).
+    LlmCheck(LlmArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -126,6 +131,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Runs(args) => {
             let db = open_db(args.db.as_deref()).await?;
             run_runs(&db, &args).await
+        }
+        // VS-1.3.1 work-1.05: the composition-root demo verb. The ledger write needs
+        // a migrated `pulse.db` (opened via `open_migrated`, migrate-then-open —
+        // mirroring the `Runs`/`Strategy` arms) so the redacted `LlmCall` persists.
+        Command::LlmCheck(args) => {
+            let db = open_db(args.db.as_deref()).await?;
+            run_llm_check(Some(&db), &args).await
         }
     }
 }

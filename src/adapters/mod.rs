@@ -31,3 +31,16 @@ pub(crate) mod broker;
 // platform-default db-path resolver. The ONLY module tree where `sqlx` is allowed
 // (the domain stays I/O-free).
 pub(crate) mod db;
+
+// VS-1.3.1 work-1.03: the GLM transport adapter home (README C8). `llm::glm` holds
+// `GlmProvider` — the anti-corruption layer over the `PulseHive` OpenAI-compatible
+// transport, and the ONLY module tree importing the `PulseHive` SDK crate (AC-6).
+// `pub(crate)` matching the sibling adapter precedent so `lib.rs` curates the
+// public `GlmProvider` re-export (dead-code gotcha).
+pub(crate) mod llm;
+
+// VS-1.3.1 work-1.03: the macOS Keychain READ accessor (`glm_api_key`) — FR-1 /
+// NFR-5. The ONLY module tree touching `keyring` (the domain stays keyring-free,
+// AC-7). `pub(crate)` matching the sibling adapter precedent; `lib.rs` curates the
+// public re-export.
+pub(crate) mod secrets;
