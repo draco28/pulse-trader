@@ -8,15 +8,22 @@
 //! [`LlmError::Config`] pointing at `pulse setup-keys`, NEVER a panic.
 //!
 //! READ path ONLY — the `set_password` / verify half (`pulse setup-keys`) is
-//! VS-1.3.4. On darwin, `keyring` 4.x default features bundle the apple-native
-//! keychain store, so no extra feature flags are needed.
+//! VS-1.3.4. Pinned to `keyring` 3.x, whose `Entry::new` + `get_password` bind
+//! DIRECTLY to the platform keychain (no store registration). `keyring` 4.x split
+//! into `keyring-core` + store crates whose lazy default-store init returned
+//! `NoDefaultStore` at runtime for our unsigned dev binary (found by the live
+//! user-demo at VS-1.3.1 slice close).
 //!
-//! **Dev-binary re-prompt caveat:** an unsigned dev binary presents a *different*
-//! code identity to the Keychain ACL on each rebuild, so macOS re-prompts to
-//! authorize the read every rebuild until code-signing lands (v1.5). For headless
-//! / CI runs, seed the item once with
-//! `security add-generic-password -s PulseTrader -a glm_api_key -w <key> -U` (or
-//! add the rebuilt binary to the item's ACL) to avoid the interactive prompt.
+//! **Seeding reality (macOS data-protection keychain — found at slice close):**
+//! `keyring` reads/writes the modern *data-protection* keychain, which is
+//! access-group-scoped by code identity. Two consequences: (a) a key written by
+//! the `security add-generic-password` CLI lands in the *file-based* login
+//! keychain and is INVISIBLE to `keyring` — the CLI stopgap does NOT work; (b) an
+//! unsigned dev binary gets a distinct ad-hoc identity, so only the `pulse` binary
+//! ITSELF (via VS-1.3.4 `pulse setup-keys`, which calls `set_password`) can seed a
+//! key it can later read back. Until `setup-keys` + code-signing (v1.5) land, the
+//! read path is exercised end-to-end only from a same-identity binary; the live
+//! GLM transport is validated by injecting the key directly (VS-1.3.1 close demo).
 
 use keyring::Entry;
 

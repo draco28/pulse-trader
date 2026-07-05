@@ -68,11 +68,15 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # rust_decimal/ta/polars (OQ-C lockfile guard).
 pulsehive = { version = "=2.0.2", features = ["openai"] }
 # VS-1.3.1 work-1.03: macOS Keychain READ accessor for the GLM API key (FR-1 /
-# NFR-5, decision 5). keyring 4.x default features bundle the apple-native
-# keychain store on darwin (no extra flags). I/O not math — NOT in any
-# determinism fingerprint, so a caret `4.1` is fine (unlike ta/sqlx). READ path
-# only; the `set_password`/verify half is VS-1.3.4's `pulse setup-keys`.
-keyring = "4.1"
+# NFR-5, decision 5). Pinned to keyring 3.x: its `Entry::new` + `get_password`
+# bind DIRECTLY to the macOS keychain (default features), so no store-registration
+# is needed. keyring 4.x split into keyring-core + store crates whose lazy default-
+# store init returned `NoDefaultStore` at runtime for our unsigned dev binary
+# (caught by the live user-demo at slice close — the offline test masked it by
+# mapping any error to LlmError::Config). I/O not math — NOT in any determinism
+# fingerprint, so a caret is fine (unlike ta/sqlx). READ path only; the
+# `set_password`/verify half is VS-1.3.4's `pulse setup-keys`.
+keyring = "3"
 
 # VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
 # the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock
