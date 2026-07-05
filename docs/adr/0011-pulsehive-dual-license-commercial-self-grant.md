@@ -4,7 +4,7 @@ Date: 2026-07-04T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
 (Companions VS-1.3.1 — PulseHive + GLM provider wiring. Proposed-then-flip: flips to
 Accepted via `/flip-adr` once the slice merges with PulseHive dual-licensed and the
@@ -87,3 +87,8 @@ self-documenting *why* an otherwise-nonpermissive license is admitted.
   VS-1.3.1; flip this ADR to Accepted (with an `## Empirical validation` note) once CI is
   green with the dependency + exceptions in place. Relates to ADR-0012 (the integration
   shape that introduces the dependency).
+
+## Empirical validation
+
+- Validated: 2026-07-05
+- Signal: VS-1.3.1 merged via PR #80 (`slice/VS-1.3.1` → `sprint-1.3`, merge commit `2d225fe`): the AGPL-3.0-only `pulsehive*`/`pulsehive-db` crates link into the PolyForm-Noncommercial public binary under the owner's commercial self-grant, with the per-crate `deny.toml` AGPL exceptions passing `cargo deny` green in CI; a live GLM 5.2 completion ran through the dual-licensed PulseHive at slice close.

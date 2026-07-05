@@ -4,7 +4,7 @@ Date: 2026-07-04T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
 (Companions VS-1.3.1 — PulseHive + GLM provider wiring. Proposed-then-flip: flips to
 Accepted via `/flip-adr` once the slice merges with the port + adapter + redacting-logging
@@ -86,3 +86,8 @@ cost-logged path uses the non-streaming `chat()` call (only it carries usage).
   locked in VS-1.3.1; whether the composer (1.3.2) and coach (1.3.3) extend the thin port or
   adopt `HiveMind` is a tracked open decision (`10-decisions-log.md`, VS-1.3.1 KICKOFF).
   Flip to Accepted once VS-1.3.1 merges with the port + adapter + decorator in place.
+
+## Empirical validation
+
+- Validated: 2026-07-05
+- Signal: VS-1.3.1 merged via PR #80 with the thin `LlmProvider` port + `GlmProvider` anti-corruption adapter + `RedactingLoggingProvider` decorator; `pulsehive =2.0.2` added 132 transitive packages but moved ZERO math deps and the golden `142.29083294950040454` + determinism hash stayed byte-unmoved, confirming the thin-port insulation held; a live GLM 5.2 round-trip validated the adapter end-to-end.
