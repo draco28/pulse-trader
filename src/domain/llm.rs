@@ -121,6 +121,27 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// A tool/function schema advertised to the model on a [`chat`](crate::domain::LlmProvider::chat)
+/// request (VS-1.3.2 work-2.01, FR-23 / FR-3, README C1).
+///
+/// `PulseTrader`-OWNED and re-declared here (it mirrors `PulseHive`'s identical
+/// tool-schema shape but is NOT the same type — ADR-0012 insulation, so
+/// `PulseHive`'s evolving 2.x API cannot ripple into the domain). The 2.01
+/// OpenAI-compat adapter translates this to the `PulseHive` type field-by-field
+/// (the anti-corruption per-field pattern, not a serde round-trip).
+/// `parameters` is an opaque JSON-Schema `serde_json::Value` — the composer (2.02+)
+/// owns the actual schemas; this slice ships only the transport type. `PartialEq`
+/// but not `Eq` (`parameters` is a `serde_json::Value`, whose floats are not `Eq`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// The tool/function name the model calls (echoed back on a [`ToolCall`]).
+    pub name: String,
+    /// A description the model uses to decide when to invoke this tool.
+    pub description: String,
+    /// The tool's parameters as an opaque JSON Schema (the tool layer owns it).
+    pub parameters: serde_json::Value,
+}
+
 /// Token accounting for one completion — the cost-model input (README C5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -168,13 +189,13 @@ pub struct LlmConfig {
 /// v1 ships a single backend; v2 adds DeepSeek/Gemini/`ClaudeCode`/Codex (roadmap
 /// Sprint 2.3) as new arms + adapters — no domain refactor. A typed enum (NOT a
 /// `provider: String`) so a typo cannot select a nonexistent backend at runtime.
-/// Serializes as its `snake_case` tag, e.g. `"glm"`.
+/// Serializes as its `snake_case` tag, e.g. `"ollama"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmBackend {
-    /// GLM 5.1 (Zhipu), reached via `PulseHive`'s OpenAI-compatible transport in
-    /// the 1.03 adapter.
-    Glm,
+    /// Ollama Cloud (`gpt-oss:120b`), reached via `PulseHive`'s OpenAI-compatible
+    /// transport in the 2.01 adapter (the VS-1.3.2 provider pivot from GLM).
+    Ollama,
 }
 
 /// The dedicated `LlmProvider` port error (README C3).
@@ -318,13 +339,16 @@ mod tests {
     #[test]
     fn llm_config_roundtrips_and_carries_f32_temperature() {
         let cfg = LlmConfig {
-            backend: LlmBackend::Glm,
-            model: "glm-5.1".to_owned(),
+            backend: LlmBackend::Ollama,
+            model: "gpt-oss:120b".to_owned(),
             temperature: 0.5,
             max_tokens: 512,
         };
         let json = serde_json::to_string(&cfg).expect("serialize LlmConfig");
-        assert!(json.contains("\"backend\":\"glm\""), "backend tag: {json}");
+        assert!(
+            json.contains("\"backend\":\"ollama\""),
+            "backend tag: {json}"
+        );
         let back: LlmConfig = serde_json::from_str(&json).expect("deserialize LlmConfig");
         assert_eq!(cfg, back);
     }

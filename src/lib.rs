@@ -332,6 +332,12 @@ pub use domain::{
     LlmBackend, LlmCall, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message,
     ModelPrice, PriceTable, TokenUsage, ToolCall,
 };
+// VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
+// Mirror of the `domain/mod.rs` re-export (REQUIRED — the dead-code gotcha: the
+// module-level re-export alone is necessary but NOT sufficient under
+// `deny(warnings)`). Appended as its own line so the parallel 2.03 additions merge
+// cleanly.
+pub use domain::ToolDefinition;
 // VS-1.3.1 work-1.02: the append-only `LlmCall` persistence port (FR-24, README C6)
 // — create + read only, `DataError::Db`-erroring, immutability structural in the API
 // (enforced by the migration-`0004` triggers). REQUIRED under `deny(warnings)` +
@@ -340,16 +346,16 @@ pub use domain::{
 // NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
 pub use domain::LlmCallRepository;
 
-// VS-1.3.1 work-1.03: the GLM transport adapter + the macOS Keychain READ
-// accessor (README C8, FR-23 / FR-1 / NFR-5). `GlmProvider` is the anti-corruption
-// layer implementing the `LlmProvider` port over the `PulseHive` OpenAI-compatible
-// transport (the ONLY `PulseHive`-importing module — AC-6); `glm_api_key` sources
-// the GLM key from the login Keychain (READ path only). REQUIRED under
-// `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter item unused
-// outside its module is a `dead_code` BUILD error, not a warning. 1.04's decorator
-// composes over `GlmProvider`; 1.05's composition root injects `glm_api_key` into
-// its ctor. Append-only (keep-both with 1.02's re-exports at the R2 merge).
-pub use adapters::llm::glm::GlmProvider;
+// VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
+// the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).
+// `OpenAiCompatProvider` (generalized from 1.03's `GlmProvider`, pointed at Ollama
+// Cloud) is the anti-corruption layer implementing the `LlmProvider` port over the
+// `PulseHive` OpenAI-compatible transport (the ONLY `PulseHive`-importing module —
+// AC-9); `glm_api_key` sources the API key from the login Keychain (READ path only).
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter
+// item unused outside its module is a `dead_code` BUILD error, not a warning. 1.04's
+// decorator composes over the provider; 1.05's composition root injects the key.
+pub use adapters::llm::openai_compat::OpenAiCompatProvider;
 pub use adapters::secrets::glm_api_key;
 
 // VS-1.3.1 work-1.04: the redacting + cost-logging `LlmProvider` decorator

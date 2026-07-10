@@ -29,7 +29,7 @@ use crate::domain::backtest::{BacktestResult, BacktestRunId, PersistedRun, RunSu
 use crate::domain::candle::Candle;
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
-use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message};
+use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
 use crate::domain::llm_call::{LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
 use crate::domain::series::CandleSeries;
@@ -352,11 +352,16 @@ pub trait BacktestRunRepository {
 /// adding a backend is a new adapter + match arm, no domain refactor.
 ///
 /// **Non-streaming ONLY (v1):** the cost-logged path needs `usage`, and only
-/// `chat()` carries it (ADR-0012); streaming is a v1.5 GUI concern. The v1 port
-/// takes **no `tools`** (composer tools are VS-1.3.2 — additive later); a response
-/// still carries `tool_calls` for forward-compat.
+/// `chat()` carries it (ADR-0012); streaming is a v1.5 GUI concern. The port takes
+/// `tools` **additively** (VS-1.3.2 work-2.01, FR-3): a borrowed
+/// `&[ToolDefinition]` slice the composer advertises so the model may return
+/// `tool_calls`. An **empty slice** reproduces the VS-1.3.1 no-tools behavior
+/// exactly (a response still carries `tool_calls` for forward-compat).
 pub trait LlmProvider {
-    /// Run one non-streaming chat completion.
+    /// Run one non-streaming chat completion, advertising `tools` to the model.
+    ///
+    /// `tools` is a borrowed slice of [`ToolDefinition`]s the model may call; pass
+    /// `&[]` for the no-tools flow (identical to the VS-1.3.1 behavior).
     ///
     /// # Errors
     ///
@@ -366,6 +371,7 @@ pub trait LlmProvider {
     fn chat(
         &self,
         messages: Vec<Message>,
+        tools: &[ToolDefinition],
         config: &LlmConfig,
     ) -> impl Future<Output = Result<LlmResponse, LlmError>> + Send;
 }
@@ -934,7 +940,9 @@ mod backtest_run_repository_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod llm_provider_tests {
     use super::LlmProvider;
-    use crate::domain::llm::{LlmBackend, LlmConfig, LlmError, LlmResponse, Message, TokenUsage};
+    use crate::domain::llm::{
+        LlmBackend, LlmConfig, LlmError, LlmResponse, Message, TokenUsage, ToolDefinition,
+    };
 
     /// An in-memory, zero-I/O fake implementing [`LlmProvider`]. It echoes the
     /// last user message back as the completion and reports fixed token usage,
@@ -947,6 +955,7 @@ mod llm_provider_tests {
         async fn chat(
             &self,
             messages: Vec<Message>,
+            _tools: &[ToolDefinition],
             _config: &LlmConfig,
         ) -> Result<LlmResponse, LlmError> {
             let content = messages.iter().rev().find_map(|m| match m {
@@ -968,12 +977,14 @@ mod llm_provider_tests {
     /// not as `dyn`, and that the returned future is `Send` (required by `spawn`).
     async fn chat_via<P: LlmProvider>(provider: P) -> Result<LlmResponse, LlmError> {
         let config = LlmConfig {
-            backend: LlmBackend::Glm,
-            model: "glm-5.1".to_owned(),
+            backend: LlmBackend::Ollama,
+            model: "gpt-oss:120b".to_owned(),
             temperature: 0.5,
             max_tokens: 128,
         };
-        provider.chat(vec![Message::user("ping")], &config).await
+        provider
+            .chat(vec![Message::user("ping")], &[], &config)
+            .await
     }
 
     /// AC-9: the [`LlmProvider`] future is `Send`-spawnable on the multi-thread
@@ -1037,8 +1048,8 @@ mod llm_call_repository_tests {
     fn sample_call() -> LlmCall {
         LlmCall {
             id: LlmCallId::new("call-1"),
-            backend: LlmBackend::Glm,
-            model: "glm-5.1".to_owned(),
+            backend: LlmBackend::Ollama,
+            model: "gpt-oss:120b".to_owned(),
             prompt_messages: vec![Message::system("be terse"), Message::user("hi")],
             completion: Some("hello".to_owned()),
             input_tokens: 7,
@@ -1074,7 +1085,7 @@ mod llm_call_repository_tests {
             .expect("saved call is fetchable");
 
         assert_eq!(fetched.id, LlmCallId::new("call-1"));
-        assert_eq!(fetched.backend, LlmBackend::Glm);
+        assert_eq!(fetched.backend, LlmBackend::Ollama);
         assert_eq!(fetched.cost_currency, "CNY");
         assert_eq!(fetched.cost, Decimal::new(1234, 4));
     }
