@@ -113,6 +113,11 @@ pub use llm::{
     LlmBackend, LlmConfig, LlmError, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage,
     ToolCall,
 };
+// VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
+// Appended as its own line (NOT folded into the block above) so the parallel 2.03
+// re-export additions merge cleanly. Re-exported here so `lib.rs` can curate the
+// crate surface — an un-re-exported public domain type is a `dead_code` BUILD error.
+pub use llm::ToolDefinition;
 pub use llm_call::{LlmCall, LlmCallId};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the

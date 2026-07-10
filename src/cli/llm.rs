@@ -6,7 +6,7 @@
 //! ([`run_llm_check`]) wires:
 //!
 //! ```text
-//! glm_api_key()  →  GlmProvider::new(key)
+//! glm_api_key()  →  OpenAiCompatProvider::new(key)
 //!                →  RedactingLoggingProvider::new(inner, repo, clock, redactor, prices)
 //!                   where repo = SqliteLlmCallRepo over the opened Db
 //!                →  .chat()  →  a redacted, cost-logged LlmCall row
@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo};
-use crate::adapters::llm::glm::GlmProvider;
+use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
 use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
 use crate::adapters::secrets::glm_api_key;
 use crate::domain::{
@@ -50,9 +50,10 @@ use crate::domain::{
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
-/// The demo model id — GLM 5.2 via the Z.AI coding plan (mirrors the `glm.rs`
-/// `GLM_MODEL_ID` const + the price-table key so `cost` resolves).
-const DEMO_MODEL: &str = "glm-5.2";
+/// The demo model id — `gpt-oss:120b` via Ollama Cloud (mirrors the
+/// `openai_compat.rs` `OLLAMA_MODEL_ID` const + the price-table key so `cost`
+/// resolves).
+const DEMO_MODEL: &str = "gpt-oss:120b";
 
 /// A conservative sampling temperature for the demo round-trip (wire-level `f32`,
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
@@ -117,10 +118,10 @@ fn nominal_price_table() -> PriceTable {
     PriceTable::from_config(NOMINAL_CURRENCY, models)
 }
 
-/// The demo chat config (backend = GLM, model = [`DEMO_MODEL`], nominal knobs).
+/// The demo chat config (backend = Ollama, model = [`DEMO_MODEL`], nominal knobs).
 fn demo_config() -> LlmConfig {
     LlmConfig {
-        backend: LlmBackend::Glm,
+        backend: LlmBackend::Ollama,
         model: DEMO_MODEL.to_owned(),
         temperature: DEMO_TEMPERATURE,
         max_tokens: DEMO_MAX_TOKENS,
@@ -210,8 +211,10 @@ where
     let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices);
     let config = demo_config();
 
+    // No-tool back-compat: the `llm-check` demo advertises no tools (composer tools
+    // are 2.04); an empty slice reproduces the VS-1.3.1 behavior exactly.
     let response = decorator
-        .chat(prompt, &config)
+        .chat(prompt, &[], &config)
         .await
         .map_err(|e| anyhow::anyhow!("llm chat round-trip failed: {e}"))?;
 
@@ -251,7 +254,7 @@ pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()
     // is scrubbed from the STORED copy too (structural sk-shaped stripping is always
     // on). Clone before moving the key into the provider ctor.
     let redactor = Redactor::from_config(vec![key.clone()]);
-    let provider = GlmProvider::new(key);
+    let provider = OpenAiCompatProvider::new(key);
 
     // SINGLE SHARED CLOCK (1.04 deferral): ONE SystemClock injected into BOTH the
     // repo AND the decorator (via the core), so `created_at` is single-sourced.
@@ -290,10 +293,10 @@ fn print_outcome(outcome: &LlmCheckOutcome) {
     }
 }
 
-/// The bare backend tag for display (e.g. `glm`).
+/// The bare backend tag for display (e.g. `ollama`).
 fn backend_label(backend: LlmBackend) -> &'static str {
     match backend {
-        LlmBackend::Glm => "glm",
+        LlmBackend::Ollama => "ollama",
     }
 }
 
@@ -365,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn demo_config_targets_glm_5_2_matching_the_price_table() {
+    fn demo_config_targets_ollama_model_matching_the_price_table() {
         let config = demo_config();
-        assert_eq!(config.backend, LlmBackend::Glm);
+        assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, DEMO_MODEL);
         // The nominal table has a price for the demo model, so cost resolves + is
         // non-zero for a non-trivial usage (fail-closed otherwise).

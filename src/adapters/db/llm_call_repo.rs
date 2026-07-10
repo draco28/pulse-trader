@@ -270,7 +270,7 @@ mod tests {
     fn sample_call_at(now_ms: i64, id: &str) -> LlmCall {
         LlmCall {
             id: LlmCallId::new(id),
-            backend: LlmBackend::Glm,
+            backend: LlmBackend::Ollama,
             model: "glm-5.1".to_owned(),
             prompt_messages: vec![
                 Message::system("be terse"),
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(got, call, "the ledger record round-trips verbatim");
         assert_eq!(got.cost, Decimal::new(1234, 4));
         assert_eq!(got.cost_currency, "CNY", "native billing currency, no FX");
-        assert_eq!(got.backend, LlmBackend::Glm);
+        assert_eq!(got.backend, LlmBackend::Ollama);
         assert_eq!(got.prompt_messages.len(), 2);
 
         // NFR-2 / the `user:` demo criterion: `cost` is canonical decimal TEXT, not a

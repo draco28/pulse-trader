@@ -3,7 +3,8 @@
 //! The READ half of secret handling: [`glm_api_key`] fetches the GLM API key from
 //! the macOS Keychain (the data-protection keychain `keyring` binds to — see the
 //! seeding-reality note below) so the composition root (1.05) can inject it into
-//! [`GlmProvider`](crate::adapters::llm::glm::GlmProvider) as a ctor arg — the key
+//! [`OpenAiCompatProvider`](crate::adapters::llm::openai_compat::OpenAiCompatProvider)
+//! as a ctor arg — the key
 //! never lives in a committed config file, an env var baked into the binary, or
 //! plaintext on disk (NFR-5). A **missing** entry returns a clear
 //! [`LlmError::Config`] pointing at `pulse setup-keys`, NEVER a panic.
