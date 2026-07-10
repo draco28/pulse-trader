@@ -1,0 +1,30 @@
+# PulseTrader — LLM price table (VS-1.3.2 work-2.03, the "moat in DATA" seam).
+#
+# NOMINAL ledger estimate — NOT a real per-token tariff. Ollama Cloud
+# (https://ollama.com/v1) is a flat-rate / subscription API, so `gpt-oss:120b`
+# has no true per-token price. The figures below are a documented nominal
+# per-Mtok estimate whose ONLY purpose is to populate each persisted `LlmCall`
+# row's cost with a data-tunable (not frozen-in-Rust) number. Real per-token
+# backends (v2) override this file via `$PULSE_CONFIG_DIR/prices.toml`.
+#
+# Moat discipline (VS-1.3.1 decision 4): price VALUES live HERE, as data —
+# never as a public Rust literal. The loader (`src/agent/config.rs`) carries
+# no price numbers.
+#
+# Decimal values are quoted STRINGS so `rust_decimal` parses them exactly
+# (NFR-2 — no float ever touches a billed figure).
+
+# Native billing currency for the figures below (stored verbatim on `LlmCall`).
+currency = "USD"
+
+# Transport pinning (data, not a Rust literal). Consumed by the composition
+# root (2.05) when it constructs the provider; carried here so the base URL and
+# model id are config, not code.
+[llm]
+base_url = "https://ollama.com/v1"
+model = "gpt-oss:120b"
+
+# Per-model nominal prices, per 1,000,000 tokens, in `currency`.
+[models."gpt-oss:120b"]
+input_per_mtok = "0.50"
+output_per_mtok = "1.50"
