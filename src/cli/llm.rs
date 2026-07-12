@@ -28,11 +28,11 @@
 //! `save_call` overrides `created_at` with its own clock, so a single shared
 //! clock keeps the persisted timestamp single-sourced.
 //!
-//! **Nominal price (Z.AI coding plan).** The GLM coding plan is a FLAT-RATE
-//! subscription, so the per-token figures the ledger records are a NOMINAL
-//! estimate (config-tunable later), not a real per-Mtok rate. The values are DATA
-//! fed through [`PriceTable::from_config`] (the moat seam), never a hardcoded
-//! public-Rust price literal in the domain.
+//! **Prices from config (2.03 moat seam).** The per-token figures the ledger
+//! records are a NOMINAL estimate (Ollama Cloud is flat-rate), loaded from
+//! `config/prices.toml` via `agent::config::load_price_table` — DATA, never a
+//! hardcoded public-Rust price literal in `src/cli/` (AC-11 retires the old
+//! `nominal_price_table` seam).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -42,13 +42,11 @@ use crate::adapters::db::{Db, SqliteLlmCallRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
 use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
 use crate::adapters::secrets::glm_api_key;
+use crate::agent::LlmCallCapture;
 use crate::domain::{
     Clock, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmProvider,
-    LlmResponse, Message, ModelPrice, PriceTable,
+    LlmResponse, Message, PriceTable,
 };
-
-use rust_decimal::Decimal;
-use std::collections::HashMap;
 
 /// The demo model id — `gpt-oss:120b` via Ollama Cloud (mirrors the
 /// `openai_compat.rs` `OLLAMA_MODEL_ID` const + the price-table key so `cost`
@@ -67,10 +65,6 @@ const DEMO_MAX_TOKENS: u32 = 4096;
 
 /// The fixed demo prompt used when the operator gives no prompt argument.
 const DEMO_PROMPT: &str = "In one concise sentence, what is a liquidation in crypto futures?";
-
-/// The native billing currency of the nominal GLM price table (Zhipu/Z.AI bills
-/// RMB/CNY — audit ch3; no silent FX baked in).
-const NOMINAL_CURRENCY: &str = "CNY";
 
 /// `pulse llm-check [PROMPT] [--db <path>]` — run a GLM 5.2 chat round-trip through
 /// the redacting + cost-logging composition and print the persisted `LlmCall`.
@@ -99,25 +93,6 @@ pub struct LlmCheckOutcome {
     pub response: LlmResponse,
 }
 
-/// The nominal GLM 5.2 price table (README C5, the moat-in-data seam).
-///
-/// The Z.AI coding plan is a FLAT-RATE subscription, so these per-Mtok figures are
-/// a NOMINAL estimate the ledger records for observability, NOT a real per-token
-/// bill — they are config-tunable and deliberately not authoritative. Fed as DATA
-/// through [`PriceTable::from_config`], never a hardcoded domain literal.
-fn nominal_price_table() -> PriceTable {
-    let mut models = HashMap::new();
-    models.insert(
-        DEMO_MODEL.to_owned(),
-        ModelPrice {
-            // Nominal CNY/Mtok estimates for the flat-rate coding plan.
-            input_per_mtok: Decimal::new(2, 0),
-            output_per_mtok: Decimal::new(8, 0),
-        },
-    );
-    PriceTable::from_config(NOMINAL_CURRENCY, models)
-}
-
 /// The demo chat config (backend = Ollama, model = [`DEMO_MODEL`], nominal knobs).
 fn demo_config() -> LlmConfig {
     LlmConfig {
@@ -144,16 +119,41 @@ fn build_prompt(args: &LlmArgs) -> Vec<Message> {
 }
 
 /// A capture side-channel over an inner [`LlmCallRepository`]: it forwards
-/// `save_call` to the real repo (the actual persistence) and records a COPY of the
-/// saved row, so the composition root can surface the persisted `LlmCall` (its id,
-/// redacted prompt, tokens, cost) after the write.
+/// `save_call` to the real repo (the actual persistence) and — WITHOUT changing the
+/// [`LlmCallRepository`] port — exposes each write through two channels:
+///
+/// - `captured` records a COPY of the most-recent saved row, so the `llm-check`
+///   composition root can surface the persisted `LlmCall` (its id, redacted prompt,
+///   tokens, cost) after the write; and
+/// - `ids` PUSHES each minted [`LlmCallId`] into a shared [`LlmCallCapture`] buffer
+///   (VS-1.3.2 work-2.05) that the `compose` composition root also wires into
+///   [`Composer::new`](crate::agent::Composer::new), so the composer reads its run's
+///   provenance ids back after the loop.
 ///
 /// The port has no "last saved" read and the [`RedactingLoggingProvider`] mints the
 /// row id internally, so this thin wrapper is how the id is recovered generically —
-/// for BOTH the live arm and the auto-test — without modifying 1.04's decorator.
-struct CapturingRepo<R> {
+/// for BOTH the live arm and the auto-tests — without modifying 1.04's decorator.
+pub(crate) struct CapturingRepo<R> {
     inner: R,
     captured: Arc<Mutex<Option<LlmCall>>>,
+    ids: LlmCallCapture,
+}
+
+impl<R> CapturingRepo<R> {
+    /// Wrap `inner`, sharing the single-row `captured` slot (`llm-check`) and the
+    /// append-only `ids` buffer (`compose`). `llm-check` passes a throwaway `ids`
+    /// buffer; `compose` passes the SAME buffer it wires into `Composer::new`.
+    pub(crate) fn new(
+        inner: R,
+        captured: Arc<Mutex<Option<LlmCall>>>,
+        ids: LlmCallCapture,
+    ) -> Self {
+        Self {
+            inner,
+            captured,
+            ids,
+        }
+    }
 }
 
 impl<R: LlmCallRepository + Send + Sync> LlmCallRepository for CapturingRepo<R> {
@@ -163,6 +163,10 @@ impl<R: LlmCallRepository + Send + Sync> LlmCallRepository for CapturingRepo<R> 
         let id = self.inner.save_call(call).await?;
         if let Ok(mut slot) = self.captured.lock() {
             *slot = Some(call.clone());
+        }
+        // Share the minted id with the composer's provenance buffer (2.05).
+        if let Ok(mut ids) = self.ids.lock() {
+            ids.push(id.clone());
         }
         Ok(id)
     }
@@ -201,10 +205,13 @@ where
     C: Clock + Send + Sync,
 {
     let captured: Arc<Mutex<Option<LlmCall>>> = Arc::new(Mutex::new(None));
-    let capturing = CapturingRepo {
-        inner: repo,
-        captured: Arc::clone(&captured),
-    };
+    // `llm-check` uses only the single-row `captured` slot; the id buffer is a
+    // throwaway here (the composer's provenance buffer is a `compose`-only concern).
+    let capturing = CapturingRepo::new(
+        repo,
+        Arc::clone(&captured),
+        Arc::new(Mutex::new(Vec::new())),
+    );
 
     // The composition root: wrap the (already-selected) provider in the redacting +
     // cost-logging decorator over the capturing repo, sharing the single `clock`.
@@ -261,7 +268,10 @@ pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()
     let clock = SystemClock;
     let repo = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
 
-    let prices = nominal_price_table();
+    // Prices load from `config/prices.toml` via the 2.03 loader (AC-11 — no price
+    // literal in `src/cli/`); the shipped gpt-oss:120b entry backs this demo.
+    let prices = crate::agent::config::load_price_table()
+        .map_err(|e| anyhow::anyhow!("load price table: {e}"))?;
     let prompt = build_prompt(args);
 
     let outcome = run_llm_check_with(provider, repo, redactor, prices, clock, prompt).await?;
@@ -318,13 +328,10 @@ fn render_message(message: &Message) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        DEMO_MODEL, LlmArgs, build_prompt, demo_config, nominal_price_table, render_message,
-    };
+    use super::{DEMO_MODEL, LlmArgs, build_prompt, demo_config, render_message};
     use crate::cli::{Cli, Command};
-    use crate::domain::{LlmBackend, Message, TokenUsage};
+    use crate::domain::{LlmBackend, Message};
     use clap::Parser;
-    use rust_decimal::Decimal;
 
     #[test]
     fn parses_llm_check_with_positional_prompt() {
@@ -368,25 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn demo_config_targets_ollama_model_matching_the_price_table() {
+    fn demo_config_targets_ollama_model() {
+        // The demo config targets the pinned Ollama model; the cost table now loads
+        // from `config/prices.toml` (2.03), asserted in `agent::config`'s own tests
+        // — this seam no longer carries a price table (AC-11).
         let config = demo_config();
         assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, DEMO_MODEL);
-        // The nominal table has a price for the demo model, so cost resolves + is
-        // non-zero for a non-trivial usage (fail-closed otherwise).
-        let cost = nominal_price_table()
-            .cost(
-                DEMO_MODEL,
-                &TokenUsage {
-                    input_tokens: 1000,
-                    output_tokens: 1000,
-                },
-            )
-            .expect("nominal table prices the demo model");
-        assert!(
-            cost > Decimal::ZERO,
-            "nominal cost must be non-zero: {cost}"
-        );
     }
 
     #[test]
