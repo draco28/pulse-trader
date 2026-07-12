@@ -28,3 +28,12 @@ pub(crate) use tools::{
     ToolOutcome, add_entry_signal, add_filter, builder_tool_definitions, create_strategy,
     finalize_strategy, set_exit_rules, set_risk_params,
 };
+
+// VS-1.3.2 work-2.04: the composer agent loop — the orchestrator that drives the
+// model through the builder tools (2.02) over the tools-carrying `LlmProvider` port
+// (2.01) framed by the config prompt (2.03), and finalizes a `StrategyVersion` value
+// with composer provenance (DB-free — 2.05 persists it). Its surface is `pub` (2.05's
+// CLI + composition root consume it), mirrored at `src/lib.rs`. Append-only (keep-both
+// with 2.01–2.03's re-exports at the merge into `slice/VS-1.3.2`).
+mod composer;
+pub use composer::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
