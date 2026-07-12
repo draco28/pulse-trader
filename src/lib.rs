@@ -162,6 +162,19 @@ pub use cli::{FetchArgs, run_fetch_data};
 // the live-arm surface, re-exported like the other `cli::` entrypoints.
 pub use cli::llm::{LlmArgs, LlmCheckOutcome, run_llm_check, run_llm_check_with};
 
+// VS-1.3.2 work-2.05: the `pulse compose` composition-root + demo surface (FR-3 /
+// FR-4 / NFR-6, README C8). The OFFLINE e2e (`tests/compose_cli.rs`, demo criterion
+// 1) drives the injectable core `run_compose_with` over a FAKE provider + the REAL
+// composer + REAL builder tools + a tempfile SQLite repo (never a live LLM —
+// MASTER-SPEC §9.4); `ComposeWiring` bundles the LLM-side deps, `ComposeCliOutcome`
+// is the persisted `StrategyVersion` + provenance it returns. `ComposeArgs` /
+// `run_compose` are the live-arm surface, re-exported like the other `cli::`
+// entrypoints. REQUIRED under `deny(warnings)` — a `pub` item unused outside its
+// private `cli::compose` module is a `dead_code` build error, not a warning.
+pub use cli::compose::{
+    ComposeArgs, ComposeCliOutcome, ComposeWiring, run_compose, run_compose_with,
+};
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).

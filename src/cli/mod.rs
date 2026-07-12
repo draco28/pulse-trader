@@ -11,6 +11,7 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod backtest;
+pub(crate) mod compose;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
 pub(crate) mod llm;
@@ -26,6 +27,7 @@ use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
+use compose::{ComposeArgs, run_compose};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
 use llm::{LlmArgs, run_llm_check};
@@ -62,6 +64,9 @@ pub enum Command {
     /// Round-trip a GLM 5.2 chat through `PulseHive` + log a redacted `LlmCall`
     /// (the VS-1.3.1 composition-root demo, FR-23/FR-24/NFR-6).
     LlmCheck(LlmArgs),
+    /// Compose a natural-language target into a persisted, attributable
+    /// `StrategyVersion` via the composer (the VS-1.3.2 demo, FR-3/FR-4/NFR-6).
+    Compose(ComposeArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -138,6 +143,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::LlmCheck(args) => {
             let db = open_db(args.db.as_deref()).await?;
             run_llm_check(Some(&db), &args).await
+        }
+        // VS-1.3.2 work-2.05: the composer composition-root demo verb. The ledger +
+        // version writes need a migrated `pulse.db` (opened via `open_migrated`,
+        // migrate-then-open — mirroring the `LlmCheck`/`Runs`/`Strategy` arms).
+        Command::Compose(args) => {
+            let db = open_db(args.db.as_deref()).await?;
+            run_compose(Some(&db), &args).await
         }
     }
 }
