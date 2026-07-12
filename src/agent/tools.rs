@@ -1,0 +1,924 @@
+//! The six server-validated builder tools (VS-1.3.2 work-2.02, FR-3 heart) +
+//! the isolated flat-primitive → tagged-DSL mapping seam.
+//!
+//! Each tool parses a **flat-primitive** JSON argument (never a serde-tagged
+//! [`Condition`](crate::domain::Condition)/[`ExitRule`](crate::domain::ExitRule)
+//! and never a whole [`StrategyDsl`](crate::domain::StrategyDsl)), runs a local
+//! **correctable** structural/range check, mutates the
+//! [`StrategyBuilder`](super::builder::StrategyBuilder), and returns a
+//! [`ToolOutcome`]. `finalize_strategy` assembles the accumulated fields + runs
+//! the whole-document [`validate`](crate::domain::validate) (reused verbatim; no
+//! rule reimplemented here). A serde parse failure of any arg struct maps to a
+//! [`FieldError`] — **never a panic, never `.unwrap()`** (FR-3 correctable
+//! rejection).
+//!
+//! **Reversibility (README C4, load-bearing).** The flat-primitive → tagged
+//! conversion lives ONLY in the [`mapping`] submodule. A future switch to
+//! tagged-fragment args (option A) or schema-guided/constrained decoding is a
+//! localized swap of *only* that module — `StrategyBuilder`, `validate()`, and
+//! `schema_version` stay untouched.
+
+// The tools are built-but-unwired this slice: their first production caller is
+// the composer loop (2.04, R3), so the re-exported surface is otherwise
+// `dead_code` under `deny(warnings)` — the VS-1.3.1 harvested dead-code gotcha.
+#![allow(dead_code)]
+
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+use crate::domain::{
+    Direction, ExitRule, FieldError, RiskParams, SweepableValue, ToolDefinition, ValidationCode,
+};
+
+use super::builder::StrategyBuilder;
+
+/// The correctable result each builder tool returns; the composer (2.04)
+/// serializes it as the tool-result content the model reads back.
+///
+/// Reuses [`domain::dsl::FieldError`](crate::domain::FieldError) — the `Err` arm
+/// is the correctable path FR-3 mandates (a field-pathed, coded, human/LLM
+/// message the model can fix and re-call).
+#[derive(Debug)]
+pub(crate) enum ToolOutcome {
+    /// The fragment was accepted; `summary` is a human/LLM-readable confirmation.
+    Ok {
+        /// What the tool set, in one line.
+        summary: String,
+    },
+    /// The fragment was rejected; `errors` are correctable field-pathed errors.
+    Err {
+        /// The correctable field errors the model can fix and re-call.
+        errors: Vec<FieldError>,
+    },
+}
+
+/// Build a correctable [`FieldError`] (the single error-construction helper the
+/// tools + the [`mapping`] seam share).
+fn field_error(
+    path: impl Into<String>,
+    code: ValidationCode,
+    message: impl Into<String>,
+) -> FieldError {
+    FieldError {
+        path: path.into(),
+        code,
+        message: message.into(),
+    }
+}
+
+/// A single-error [`ToolOutcome::Err`].
+fn err(error: FieldError) -> ToolOutcome {
+    ToolOutcome::Err {
+        errors: vec![error],
+    }
+}
+
+/// Deserialize a tool's flat arg struct from the opaque `serde_json::Value`,
+/// mapping a **parse failure to a correctable [`FieldError`]** (never a panic).
+fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, FieldError> {
+    serde_json::from_value(args).map_err(|source| {
+        field_error(
+            "arguments",
+            ValidationCode::FieldRange,
+            format!("could not parse tool arguments: {source}"),
+        )
+    })
+}
+
+/// Map the flat `"long"`/`"short"` string to a tagged [`Direction`].
+fn direction_from_str(raw: &str) -> Result<Direction, FieldError> {
+    match raw {
+        "long" => Ok(Direction::Long),
+        "short" => Ok(Direction::Short),
+        other => Err(field_error(
+            "direction",
+            ValidationCode::FieldRange,
+            format!("unknown direction {other:?}; expected \"long\" or \"short\""),
+        )),
+    }
+}
+
+// -- the six tools (each `fn(&mut StrategyBuilder, Value) -> ToolOutcome`) --------
+
+/// `create_strategy { name, direction }` — init/replace the name + direction.
+pub(crate) fn create_strategy(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
+    let args: CreateStrategyArgs = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return err(error),
+    };
+    let mut errors = Vec::new();
+    if args.name.trim().is_empty() {
+        errors.push(field_error(
+            "name",
+            ValidationCode::EmptyName,
+            "strategy name must not be empty or whitespace-only",
+        ));
+    }
+    let direction = match direction_from_str(&args.direction) {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    match direction {
+        Some(direction) if errors.is_empty() => {
+            let summary = format!("created strategy {:?} ({})", args.name, args.direction);
+            builder.set_identity(args.name, direction);
+            ToolOutcome::Ok { summary }
+        }
+        _ => ToolOutcome::Err { errors },
+    }
+}
+
+/// `add_entry_signal { left, op, right }` — assemble a tagged [`Condition`] and
+/// set (replace) it as the entry trigger.
+pub(crate) fn add_entry_signal(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
+    let args: SignalArgs = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return err(error),
+    };
+    match mapping::build_condition(&args.left, &args.op, &args.right) {
+        Ok(condition) => {
+            builder.set_entry(condition);
+            ToolOutcome::Ok {
+                summary: "set entry signal".to_owned(),
+            }
+        }
+        Err(errors) => ToolOutcome::Err { errors },
+    }
+}
+
+/// `add_filter { left, op, right }` — assemble a tagged [`Condition`] and
+/// **append** it (AND-conjoined per the `StrategyDsl` convention).
+pub(crate) fn add_filter(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
+    let args: SignalArgs = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return err(error),
+    };
+    match mapping::build_condition(&args.left, &args.op, &args.right) {
+        Ok(condition) => {
+            builder.push_filter(condition);
+            ToolOutcome::Ok {
+                summary: "added filter".to_owned(),
+            }
+        }
+        Err(errors) => ToolOutcome::Err { errors },
+    }
+}
+
+/// `set_exit_rules { stop_loss_pct?, take_profit_r?, trailing_pct?, time_bars? }`
+/// — build a `Vec<ExitRule>` (replacing); `stop_loss_pct` is required (defines
+/// 1R). No duplicate exclusive kinds are possible (each field appears at most
+/// once).
+pub(crate) fn set_exit_rules(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
+    let args: ExitArgs = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return err(error),
+    };
+    let Some(stop_loss_pct) = args.stop_loss_pct else {
+        return err(field_error(
+            "stop_loss_pct",
+            ValidationCode::FieldRange,
+            "stop_loss_pct is required; it defines 1R (a decimal fraction string like \"0.05\")",
+        ));
+    };
+    let mut exits = vec![ExitRule::StopLoss {
+        distance_pct: SweepableValue::Fixed(stop_loss_pct),
+    }];
+    if let Some(target_r) = args.take_profit_r {
+        exits.push(ExitRule::TakeProfit {
+            target_r: SweepableValue::Fixed(target_r),
+        });
+    }
+    if let Some(trail_pct) = args.trailing_pct {
+        exits.push(ExitRule::TrailingStop {
+            trail_pct: SweepableValue::Fixed(trail_pct),
+        });
+    }
+    if let Some(max_bars) = args.time_bars {
+        exits.push(ExitRule::TimeStop {
+            max_bars: SweepableValue::Fixed(max_bars),
+        });
+    }
+    let summary = format!("set {} exit rule(s)", exits.len());
+    builder.set_exits(exits);
+    ToolOutcome::Ok { summary }
+}
+
+/// `set_risk_params { risk_per_trade_pct, max_leverage }` — set (replace) risk;
+/// `risk_per_trade_pct ∈ (0, 1]`, `max_leverage ≥ 1` (`FieldRange`).
+pub(crate) fn set_risk_params(builder: &mut StrategyBuilder, args: Value) -> ToolOutcome {
+    let args: RiskArgs = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => return err(error),
+    };
+    let mut errors = Vec::new();
+    let risk_pct = args.risk_per_trade_pct;
+    if risk_pct <= Decimal::ZERO || risk_pct > Decimal::ONE {
+        errors.push(field_error(
+            "risk_per_trade_pct",
+            ValidationCode::FieldRange,
+            "risk_per_trade_pct must be a decimal fraction in the range (0, 1]",
+        ));
+    }
+    let leverage = args.max_leverage;
+    if leverage < Decimal::ONE {
+        errors.push(field_error(
+            "max_leverage",
+            ValidationCode::FieldRange,
+            "max_leverage must be at least 1",
+        ));
+    }
+    if !errors.is_empty() {
+        return ToolOutcome::Err { errors };
+    }
+    let summary = format!("set risk {risk_pct} per trade, {leverage}x max leverage");
+    builder.set_risk(RiskParams {
+        risk_per_trade_pct: SweepableValue::Fixed(risk_pct),
+        max_leverage: SweepableValue::Fixed(leverage),
+    });
+    ToolOutcome::Ok { summary }
+}
+
+/// `finalize_strategy {}` — assemble + run the whole-document `validate()` (via
+/// [`StrategyBuilder::finalize`]); a missing required piece → correctable `Err`.
+///
+/// 2.04 reads the [`ValidatedDsl`](crate::domain::ValidatedDsl) directly from
+/// [`StrategyBuilder::finalize`] to build the `StrategyVersion`; this wrapper is
+/// the uniform-dispatch/streaming surface (it maps to a [`ToolOutcome`]).
+pub(crate) fn finalize_strategy(builder: &StrategyBuilder) -> ToolOutcome {
+    match builder.finalize() {
+        Ok(validated) => ToolOutcome::Ok {
+            summary: format!("finalized strategy {:?}", validated.dsl().name),
+        },
+        Err(errors) => ToolOutcome::Err { errors },
+    }
+}
+
+// -- per-tool flat arg structs (`#[derive(Deserialize)]`) ------------------------
+
+/// `create_strategy` args (flat primitives).
+#[derive(Debug, Deserialize)]
+struct CreateStrategyArgs {
+    name: String,
+    direction: String,
+}
+
+/// `add_entry_signal` / `add_filter` args (flat `{ left, op, right }`).
+#[derive(Debug, Deserialize)]
+struct SignalArgs {
+    left: mapping::Operand,
+    op: String,
+    right: mapping::Operand,
+}
+
+/// `set_exit_rules` args — flat scalar fields; `Decimal`s carried as JSON
+/// strings (`"0.05"`), matching the DSL's `serde(with = "…str")` convention.
+#[derive(Debug, Deserialize)]
+struct ExitArgs {
+    #[serde(default)]
+    stop_loss_pct: Option<Decimal>,
+    #[serde(default)]
+    take_profit_r: Option<Decimal>,
+    #[serde(default)]
+    trailing_pct: Option<Decimal>,
+    #[serde(default)]
+    time_bars: Option<u32>,
+}
+
+/// `set_risk_params` args — `Decimal`s carried as JSON strings.
+#[derive(Debug, Deserialize)]
+struct RiskArgs {
+    risk_per_trade_pct: Decimal,
+    max_leverage: Decimal,
+}
+
+// -- the isolated flat-primitive → tagged-DSL mapping seam (README C4) -----------
+
+mod mapping {
+    //! The **only** place flat-primitive tool args become tagged DSL fragments
+    //! (README C4 reversibility). A future move to tagged-fragment args or
+    //! schema-guided decoding swaps ONLY this module — the accumulator, the
+    //! whole-document `validate()`, and `schema_version` are untouched.
+
+    use rust_decimal::Decimal;
+    use serde::Deserialize;
+
+    use crate::domain::{
+        Comparator, Condition, FieldError, IndicatorSpec, PriceField, SweepableValue,
+        ValidationCode, ValueSource,
+    };
+
+    use super::field_error;
+
+    /// A flat, untagged operand — the LLM-facing scalar shape (README C5). It is
+    /// assembled **server-side** into a tagged [`ValueSource`]; the LLM never
+    /// emits the serde tag.
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Operand {
+        source: String,
+        #[serde(default)]
+        indicator: Option<String>,
+        #[serde(default)]
+        period: Option<u32>,
+        #[serde(default)]
+        fast: Option<u32>,
+        #[serde(default)]
+        slow: Option<u32>,
+        #[serde(default)]
+        signal: Option<u32>,
+        #[serde(default)]
+        price_field: Option<String>,
+        #[serde(default)]
+        value: Option<Decimal>,
+    }
+
+    /// The comparator/cross the flat `op` string selects.
+    enum Op {
+        Compare(Comparator),
+        CrossesAbove,
+        CrossesBelow,
+    }
+
+    /// Assemble `{ left, op, right }` flat primitives into a tagged
+    /// [`Condition`], collecting **every** correctable field error (fast
+    /// correctable feedback, FR-3). The non-degenerate-cross local check mirrors
+    /// [`validate`](crate::domain::validate) rule 2 for immediate feedback; the
+    /// whole-document validator re-checks it at finalize.
+    pub(super) fn build_condition(
+        left: &Operand,
+        op: &str,
+        right: &Operand,
+    ) -> Result<Condition, Vec<FieldError>> {
+        let mut errors = Vec::new();
+        let lhs = collect(operand_to_value_source(left, "left"), &mut errors);
+        let rhs = collect(operand_to_value_source(right, "right"), &mut errors);
+        let parsed_op = collect(parse_op(op), &mut errors);
+        let (Some(lhs), Some(rhs), Some(parsed_op)) = (lhs, rhs, parsed_op) else {
+            return Err(errors);
+        };
+        let condition = match parsed_op {
+            Op::Compare(operator) => Condition::Compare {
+                lhs,
+                op: operator,
+                rhs,
+            },
+            Op::CrossesAbove => Condition::CrossesAbove { lhs, rhs },
+            Op::CrossesBelow => Condition::CrossesBelow { lhs, rhs },
+        };
+        if is_degenerate_cross(&condition) {
+            errors.push(field_error(
+                "op",
+                ValidationCode::DegenerateCross,
+                "a cross needs at least one Price or Indicator operand; both are Constant",
+            ));
+        }
+        if errors.is_empty() {
+            Ok(condition)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Push `result`'s error (if any) into `errors`, yielding the `Ok` value.
+    fn collect<T>(result: Result<T, FieldError>, errors: &mut Vec<FieldError>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        }
+    }
+
+    /// Map the flat comparator string to an [`Op`].
+    fn parse_op(op: &str) -> Result<Op, FieldError> {
+        match op {
+            "gt" => Ok(Op::Compare(Comparator::Gt)),
+            "gte" => Ok(Op::Compare(Comparator::Gte)),
+            "lt" => Ok(Op::Compare(Comparator::Lt)),
+            "lte" => Ok(Op::Compare(Comparator::Lte)),
+            "eq" => Ok(Op::Compare(Comparator::Eq)),
+            "crosses_above" => Ok(Op::CrossesAbove),
+            "crosses_below" => Ok(Op::CrossesBelow),
+            other => Err(field_error(
+                "op",
+                ValidationCode::FieldRange,
+                format!(
+                    "unknown op {other:?}; expected gt|gte|lt|lte|eq|crosses_above|crosses_below"
+                ),
+            )),
+        }
+    }
+
+    /// Map a flat operand to a tagged [`ValueSource`].
+    fn operand_to_value_source(operand: &Operand, path: &str) -> Result<ValueSource, FieldError> {
+        match operand.source.as_str() {
+            "constant" => {
+                let value = operand.value.ok_or_else(|| {
+                    field_error(
+                        format!("{path}.value"),
+                        ValidationCode::FieldRange,
+                        "a constant operand requires a `value` (decimal string)",
+                    )
+                })?;
+                Ok(ValueSource::Constant { value })
+            }
+            "price" => Ok(ValueSource::Price {
+                field: price_field(operand.price_field.as_deref(), path)?,
+            }),
+            "indicator" => Ok(ValueSource::Indicator {
+                spec: indicator_spec(operand, path)?,
+            }),
+            other => Err(field_error(
+                format!("{path}.source"),
+                ValidationCode::FieldRange,
+                format!("unknown operand source {other:?}; expected indicator|price|constant"),
+            )),
+        }
+    }
+
+    /// Map the flat `price_field` string to a tagged [`PriceField`].
+    fn price_field(field: Option<&str>, path: &str) -> Result<PriceField, FieldError> {
+        match field {
+            Some("open") => Ok(PriceField::Open),
+            Some("high") => Ok(PriceField::High),
+            Some("low") => Ok(PriceField::Low),
+            Some("close") => Ok(PriceField::Close),
+            Some("volume") => Ok(PriceField::Volume),
+            Some(other) => Err(field_error(
+                format!("{path}.price_field"),
+                ValidationCode::FieldRange,
+                format!("unknown price_field {other:?}; expected open|high|low|close|volume"),
+            )),
+            None => Err(field_error(
+                format!("{path}.price_field"),
+                ValidationCode::FieldRange,
+                "a price operand requires a `price_field`",
+            )),
+        }
+    }
+
+    /// Map a flat indicator operand to a tagged [`IndicatorSpec`] (periods become
+    /// `SweepableValue::Fixed`; v1 constructs only `Fixed`). Period range (`> 0`)
+    /// and the MACD `fast < slow` rule are enforced by the whole-document
+    /// `validate()` at finalize — not reimplemented here.
+    fn indicator_spec(operand: &Operand, path: &str) -> Result<IndicatorSpec, FieldError> {
+        let indicator = operand.indicator.as_deref().ok_or_else(|| {
+            field_error(
+                format!("{path}.indicator"),
+                ValidationCode::FieldRange,
+                "an indicator operand requires an `indicator` name",
+            )
+        })?;
+        match indicator {
+            "rsi" => Ok(IndicatorSpec::Rsi {
+                period: fixed_period(operand, path)?,
+            }),
+            "ema" => Ok(IndicatorSpec::Ema {
+                period: fixed_period(operand, path)?,
+            }),
+            "adx" => Ok(IndicatorSpec::Adx {
+                period: fixed_period(operand, path)?,
+            }),
+            "macd" => Ok(IndicatorSpec::Macd {
+                fast: fixed_u32(operand.fast, &format!("{path}.fast"))?,
+                slow: fixed_u32(operand.slow, &format!("{path}.slow"))?,
+                signal: fixed_u32(operand.signal, &format!("{path}.signal"))?,
+            }),
+            other => Err(field_error(
+                format!("{path}.indicator"),
+                ValidationCode::FieldRange,
+                format!("unknown indicator {other:?}; expected rsi|ema|adx|macd"),
+            )),
+        }
+    }
+
+    /// A single-period indicator's `period` field as a `SweepableValue::Fixed`.
+    fn fixed_period(operand: &Operand, path: &str) -> Result<SweepableValue<u32>, FieldError> {
+        fixed_u32(operand.period, &format!("{path}.period"))
+    }
+
+    /// Wrap a required `u32` field into `SweepableValue::Fixed`, or a correctable
+    /// "field required" error.
+    fn fixed_u32(value: Option<u32>, path: &str) -> Result<SweepableValue<u32>, FieldError> {
+        value.map(SweepableValue::Fixed).ok_or_else(|| {
+            field_error(
+                path.to_owned(),
+                ValidationCode::FieldRange,
+                "this indicator requires a positive integer period",
+            )
+        })
+    }
+
+    /// Whether `condition` is a cross with both operands constant (rule 2 shape).
+    fn is_degenerate_cross(condition: &Condition) -> bool {
+        match condition {
+            Condition::CrossesAbove { lhs, rhs } | Condition::CrossesBelow { lhs, rhs } => {
+                is_constant(lhs) && is_constant(rhs)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a [`ValueSource`] is a literal constant (no series operand).
+    fn is_constant(value: &ValueSource) -> bool {
+        matches!(value, ValueSource::Constant { .. })
+    }
+}
+
+// -- the tool definitions advertised to the model (2.04 assembles the list) ------
+
+/// The six builder-tool [`ToolDefinition`]s (name + inline default description +
+/// flat-arg JSON Schema). The tool *names* + *flat arg shapes* are public
+/// contract; 2.03/2.04 overlay richer description prose from the config seam.
+pub(crate) fn builder_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        def_create_strategy(),
+        def_add_entry_signal(),
+        def_add_filter(),
+        def_set_exit_rules(),
+        def_set_risk_params(),
+        def_finalize_strategy(),
+    ]
+}
+
+/// The reusable flat `operand` JSON Schema (README C5) — a `ValueSource` without
+/// serde tags.
+fn operand_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "source": { "type": "string", "enum": ["indicator", "price", "constant"] },
+            "indicator": { "type": "string", "enum": ["rsi", "ema", "adx", "macd"] },
+            "period": { "type": "integer", "minimum": 1 },
+            "fast": { "type": "integer", "minimum": 1 },
+            "slow": { "type": "integer", "minimum": 1 },
+            "signal": { "type": "integer", "minimum": 1 },
+            "price_field": {
+                "type": "string",
+                "enum": ["open", "high", "low", "close", "volume"]
+            },
+            "value": { "type": "string", "description": "a decimal as a string, e.g. \"30\"" }
+        },
+        "required": ["source"]
+    })
+}
+
+/// The reusable `{ left, op, right }` JSON Schema for the two condition tools.
+fn signal_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "left": operand_schema(),
+            "op": {
+                "type": "string",
+                "enum": ["gt", "gte", "lt", "lte", "eq", "crosses_above", "crosses_below"]
+            },
+            "right": operand_schema()
+        },
+        "required": ["left", "op", "right"]
+    })
+}
+
+fn def_create_strategy() -> ToolDefinition {
+    ToolDefinition {
+        name: "create_strategy".to_owned(),
+        description: "Initialize a new strategy with a name and trade direction. Call this \
+                      first; re-calling replaces the name and direction."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "human-readable strategy name" },
+                "direction": { "type": "string", "enum": ["long", "short"] }
+            },
+            "required": ["name", "direction"]
+        }),
+    }
+}
+
+fn def_add_entry_signal() -> ToolDefinition {
+    ToolDefinition {
+        name: "add_entry_signal".to_owned(),
+        description: "Set the entry trigger as `left op right` over flat operands (indicator, \
+                      price field, or a decimal-string constant). Re-calling replaces the entry."
+            .to_owned(),
+        parameters: signal_schema(),
+    }
+}
+
+fn def_add_filter() -> ToolDefinition {
+    ToolDefinition {
+        name: "add_filter".to_owned(),
+        description: "Append an AND-conjoined filter condition (same `left op right` shape as \
+                      add_entry_signal). Call repeatedly to conjoin several filters."
+            .to_owned(),
+        parameters: signal_schema(),
+    }
+}
+
+fn def_set_exit_rules() -> ToolDefinition {
+    ToolDefinition {
+        name: "set_exit_rules".to_owned(),
+        description: "Set the exit rules (replacing). `stop_loss_pct` is required and defines \
+                      1R. Decimal fields are JSON strings (e.g. \"0.05\"); `take_profit_r` is a \
+                      plain R-multiple string; `time_bars` is an integer."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "stop_loss_pct": { "type": "string", "description": "stop distance fraction, e.g. \"0.05\"" },
+                "take_profit_r": { "type": "string", "description": "take-profit R-multiple, e.g. \"2\"" },
+                "trailing_pct": { "type": "string", "description": "trailing distance fraction" },
+                "time_bars": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["stop_loss_pct"]
+        }),
+    }
+}
+
+fn def_set_risk_params() -> ToolDefinition {
+    ToolDefinition {
+        name: "set_risk_params".to_owned(),
+        description: "Set risk sizing (replacing). `risk_per_trade_pct` is a decimal-string \
+                      fraction in (0, 1] (e.g. \"0.01\"); `max_leverage` is a decimal-string \
+                      multiplier >= 1 (e.g. \"3\")."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "risk_per_trade_pct": { "type": "string", "description": "fraction in (0,1], e.g. \"0.01\"" },
+                "max_leverage": { "type": "string", "description": "multiplier >= 1, e.g. \"3\"" }
+            },
+            "required": ["risk_per_trade_pct", "max_leverage"]
+        }),
+    }
+}
+
+fn def_finalize_strategy() -> ToolDefinition {
+    ToolDefinition {
+        name: "finalize_strategy".to_owned(),
+        description: "Assemble the accumulated fields into a schema-valid strategy and run \
+                      whole-document validation. Call last, after every other piece is set."
+            .to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{
+        StrategyBuilder, ToolOutcome, add_entry_signal, add_filter, builder_tool_definitions,
+        create_strategy, finalize_strategy, set_exit_rules, set_risk_params,
+    };
+    use crate::domain::{Direction, ValidationCode};
+    use serde_json::json;
+
+    fn assert_ok(outcome: ToolOutcome) {
+        match outcome {
+            ToolOutcome::Ok { .. } => {}
+            ToolOutcome::Err { errors } => panic!("expected Ok, got Err({errors:?})"),
+        }
+    }
+
+    /// Drive the demo strategy through all six mutating tools:
+    /// RSI(14) < 30 entry, Close > EMA(200) filter, [5% stop, 2R TP] exits,
+    /// 1% risk / 3x leverage.
+    fn assemble_demo_builder() -> StrategyBuilder {
+        let mut builder = StrategyBuilder::new();
+        assert_ok(create_strategy(
+            &mut builder,
+            json!({ "name": "RSI Oversold", "direction": "long" }),
+        ));
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                "op": "lt",
+                "right": { "source": "constant", "value": "30" }
+            }),
+        ));
+        assert_ok(add_filter(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "indicator", "indicator": "ema", "period": 200 }
+            }),
+        ));
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05", "take_profit_r": "2" }),
+        ));
+        assert_ok(set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ));
+        builder
+    }
+
+    /// AC-6: assemble the demo via the six tools then `finalize` → `Ok`; a
+    /// missing-`entry` case → `Err`.
+    #[test]
+    fn finalize_validates_assembled_strategy() {
+        let builder = assemble_demo_builder();
+        let validated = builder
+            .finalize()
+            .expect("the assembled demo strategy must validate");
+        assert_eq!(validated.dsl().name, "RSI Oversold");
+        assert_eq!(validated.dsl().filters.len(), 1);
+        assert_ok(finalize_strategy(&builder));
+
+        // Missing entry → correctable Err (via both the builder + the tool).
+        let mut incomplete = StrategyBuilder::new();
+        let _ = create_strategy(
+            &mut incomplete,
+            json!({ "name": "no entry", "direction": "long" }),
+        );
+        let _ = set_exit_rules(&mut incomplete, json!({ "stop_loss_pct": "0.05" }));
+        let _ = set_risk_params(
+            &mut incomplete,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        );
+        let errs = incomplete
+            .finalize()
+            .expect_err("a missing entry must not finalize");
+        assert!(errs.iter().any(|e| e.path == "entry"));
+        assert!(matches!(
+            finalize_strategy(&incomplete),
+            ToolOutcome::Err { .. }
+        ));
+    }
+
+    /// AC-7: an out-of-range `set_risk_params(risk_per_trade_pct = "2.0")` →
+    /// `ToolOutcome::Err` with a `FieldError` whose `code == FieldRange`.
+    #[test]
+    fn invalid_tool_input_returns_correctable_error() {
+        let mut builder = StrategyBuilder::new();
+        let outcome = set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "2.0", "max_leverage": "3" }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => assert!(
+                errors
+                    .iter()
+                    .any(|e| e.code == ValidationCode::FieldRange && e.path == "risk_per_trade_pct")
+            ),
+            ToolOutcome::Ok { .. } => panic!("out-of-range risk must be a correctable Err"),
+        }
+    }
+
+    /// AC-8: a `serde_json::Value` that fails the arg-struct `Deserialize` maps
+    /// to a `FieldError` — no panic, no `.unwrap()`.
+    #[test]
+    fn malformed_args_map_to_field_error_not_panic() {
+        let mut builder = StrategyBuilder::new();
+        // `name` is the wrong JSON type and `direction` is absent → Deserialize fails.
+        match create_strategy(&mut builder, json!({ "name": 123 })) {
+            ToolOutcome::Err { errors } => assert!(!errors.is_empty()),
+            ToolOutcome::Ok { .. } => panic!("malformed args must map to a FieldError, not Ok"),
+        }
+        // A structurally-malformed operand (unknown source) is also correctable.
+        assert!(matches!(
+            add_entry_signal(
+                &mut builder,
+                json!({
+                    "left": { "source": "bogus" },
+                    "op": "gt",
+                    "right": { "source": "constant", "value": "1" }
+                })
+            ),
+            ToolOutcome::Err { .. }
+        ));
+    }
+
+    /// AC-12: calling `set_risk_params` (and the other setters) BEFORE
+    /// `create_strategy` still finalizes correctly (order-independence, audit F3).
+    #[test]
+    fn tools_are_order_independent() {
+        let mut builder = StrategyBuilder::new();
+        assert_ok(set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        ));
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05", "take_profit_r": "2" }),
+        ));
+        assert_ok(add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                "op": "lt",
+                "right": { "source": "constant", "value": "30" }
+            }),
+        ));
+        assert_ok(create_strategy(
+            &mut builder,
+            json!({ "name": "Reordered", "direction": "long" }),
+        ));
+        let validated = builder
+            .finalize()
+            .expect("order-independent assembly still finalizes");
+        assert_eq!(validated.dsl().name, "Reordered");
+    }
+
+    /// Re-call semantics: the set-tools replace, `add_filter` appends.
+    #[test]
+    fn setters_replace_and_filters_append() {
+        let mut builder = StrategyBuilder::new();
+        let _ = create_strategy(
+            &mut builder,
+            json!({ "name": "first", "direction": "long" }),
+        );
+        let _ = create_strategy(
+            &mut builder,
+            json!({ "name": "second", "direction": "short" }),
+        );
+        let _ = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                "op": "lt",
+                "right": { "source": "constant", "value": "30" }
+            }),
+        );
+        let _ = add_filter(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "indicator", "indicator": "ema", "period": 50 }
+            }),
+        );
+        let _ = add_filter(
+            &mut builder,
+            json!({
+                "left": { "source": "price", "price_field": "close" },
+                "op": "gt",
+                "right": { "source": "indicator", "indicator": "ema", "period": 200 }
+            }),
+        );
+        let _ = set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05", "take_profit_r": "2" }),
+        );
+        let _ = set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3" }),
+        );
+        let validated = builder.finalize().expect("finalizes");
+        assert_eq!(validated.dsl().name, "second");
+        assert_eq!(validated.dsl().direction, Direction::Short);
+        assert_eq!(validated.dsl().filters.len(), 2);
+    }
+
+    /// An all-constant cross is a correctable degenerate-cross error (the local
+    /// check, mirroring `validate` rule 2).
+    #[test]
+    fn degenerate_cross_is_correctable() {
+        let mut builder = StrategyBuilder::new();
+        match add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "constant", "value": "1" },
+                "op": "crosses_above",
+                "right": { "source": "constant", "value": "2" }
+            }),
+        ) {
+            ToolOutcome::Err { errors } => assert!(
+                errors
+                    .iter()
+                    .any(|e| e.code == ValidationCode::DegenerateCross)
+            ),
+            ToolOutcome::Ok { .. } => panic!("an all-constant cross must be a correctable Err"),
+        }
+    }
+
+    /// The six tool definitions carry exactly the six public-contract tool names.
+    #[test]
+    fn tool_definitions_list_the_six_tools() {
+        let defs = builder_tool_definitions();
+        assert_eq!(defs.len(), 6);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        for expected in [
+            "create_strategy",
+            "add_entry_signal",
+            "add_filter",
+            "set_exit_rules",
+            "set_risk_params",
+            "finalize_strategy",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing tool definition {expected}"
+            );
+        }
+    }
+}
