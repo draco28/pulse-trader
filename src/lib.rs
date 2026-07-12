@@ -369,6 +369,15 @@ pub use adapters::secrets::glm_api_key;
 // warning (the `llm/mod.rs` re-export alone is necessary but NOT sufficient).
 pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
 
+// VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
+// `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +
+// the streamed `ComposerEvent` + the dedicated `ComposerError` + the `LlmCallCapture`
+// provenance handle. Mirror of the `agent/mod.rs` re-export (REQUIRED — the dead-code
+// gotcha: the module-level `pub use` alone is necessary but NOT sufficient under
+// `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
+// BUILD error). 2.05's `pulse compose` verb + composition root consume these.
+pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///
 /// A thin **sync** entry (audit C1/C3): it delegates to [`cli::run`], which
