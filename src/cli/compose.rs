@@ -6,7 +6,7 @@
 //! live arm ([`run_compose`]) wires:
 //!
 //! ```text
-//! .env OLLAMA_API_KEY  →  OpenAiCompatProvider::new(key)   (Ollama Cloud, gpt-oss:120b)
+//! .env OLLAMA_API_KEY  →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.2)
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
 //!                         where capturing = CapturingRepo<SqliteLlmCallRepo> sharing ONE
 //!                         LlmCallCapture buffer + ONE SystemClock (repo owns created_at, #82)
@@ -38,6 +38,12 @@
 //! **Prices from config (2.03).** The price table loads from `config/prices.toml`
 //! via `agent::config::load_price_table` — no price VALUE literal lives in
 //! `src/cli/` (AC-11).
+//!
+//! **Transport from config (FIX A, ADR-0013).** The model + base URL load from the
+//! SAME `config/prices.toml` `[llm]` table via `agent::config::load_llm_transport`:
+//! MODEL resolves config `[llm].model` → [`COMPOSE_MODEL`] const fallback, base URL
+//! resolves config `[llm].base_url` → the provider's `const` default. A one-line
+//! model swap is DATA (edit the toml), not a Rust edit — the ADR-0013 promise.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -46,7 +52,7 @@ use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo, SqliteStrategyRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
 use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
-use crate::agent::config::{load_composer_prompt, load_price_table};
+use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
 use crate::agent::{
     ComposeOutcome, Composer, ComposerEvent, LlmCallCapture, builder_tool_definitions,
 };
@@ -58,21 +64,23 @@ use crate::domain::{
 
 use super::llm::CapturingRepo;
 
-/// The Ollama Cloud model id the composer drives (README C2/C8). A model-id STRING
-/// (not a price literal) — AC-11 greps `src/cli/` only for price VALUE field names.
-/// `glm-5.2` is the tested main model (Ollama Cloud, OpenAI-compat, tool-capable);
-/// `gpt-oss:120b` was a pre-subscription placeholder that returned reproducible
-/// HTTP 500s under multi-turn tool-calling (VS-1.3.2 slice-close correction,
-/// 2026-07-12 — the model is config-tunable per ADR-0013 decision 9).
+/// The FALLBACK Ollama Cloud model id the composer drives when the config
+/// `[llm].model` is absent (README C2/C8). A model-id STRING (not a price literal)
+/// — AC-11 greps `src/cli/` only for price VALUE field names. `glm-5.2` is the
+/// tested main model (Ollama Cloud, OpenAI-compat, tool-capable); `gpt-oss:120b`
+/// was a pre-subscription placeholder that returned reproducible HTTP 500s under
+/// multi-turn tool-calling (VS-1.3.2 slice-close correction, 2026-07-12). The live
+/// model is config-driven per ADR-0013 (`config/prices.toml` `[llm].model`); this
+/// const is only the documented fallback (slice-close FIX A).
 const COMPOSE_MODEL: &str = "glm-5.2";
 
 /// A conservative sampling temperature for the compose run (wire-level `f32`, never
 /// a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const COMPOSE_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap. gpt-oss (like GLM 5.2) is a **reasoning** model whose
-/// thinking tokens count against this cap BEFORE its tool calls, so keep generous
-/// headroom past the reasoning ([VS-1.3.1 GLM]; the live demo uses 4096).
+/// The response token cap. glm-5.2 is a **reasoning** model whose thinking tokens
+/// count against this cap BEFORE its tool calls, so keep generous headroom past the
+/// reasoning ([VS-1.3.1 GLM]; the live demo uses 4096).
 const COMPOSE_MAX_TOKENS: u32 = 4096;
 
 /// The `.env` variable naming the Ollama Cloud API key (live-dev inject, deferral d).
@@ -228,11 +236,19 @@ where
 pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<()> {
     let db = db.ok_or_else(|| anyhow::anyhow!("internal: compose requires an open db"))?;
 
+    // Transport pinning from config (FIX A, ADR-0013): base URL + model load from
+    // `config/prices.toml` `[llm]`; a missing table/field falls back to the const.
+    let transport = load_llm_transport().map_err(|e| anyhow::anyhow!("load llm transport: {e}"))?;
+
     let key = ollama_api_key()?;
     // Tag the live key as a secret so an accidental echo is scrubbed at rest too
     // (structural api-key-shaped stripping is always on). Clone before the ctor move.
     let redactor = Redactor::from_config(vec![key.clone()]);
-    let provider = OpenAiCompatProvider::new(key);
+    // Base URL: config `[llm].base_url` → the provider's const default.
+    let provider = match transport.base_url {
+        Some(base_url) => OpenAiCompatProvider::with_base_url(key, base_url),
+        None => OpenAiCompatProvider::new(key),
+    };
 
     // SINGLE SHARED CLOCK (#82): ONE SystemClock into the ledger repo AND the
     // decorator, so the persisted LlmCall.created_at is single-sourced. SystemClock
@@ -252,7 +268,8 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
         prices,
         clock,
         prompt,
-        config: compose_config(),
+        // Model: config `[llm].model` → the COMPOSE_MODEL const fallback (FIX A).
+        config: compose_config(transport.model.as_deref()),
     };
 
     let mut on_event = |event: ComposerEvent| println!("{}", render_event(&event));
@@ -261,12 +278,13 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
     Ok(())
 }
 
-/// The compose chat config (backend = Ollama, model = [`COMPOSE_MODEL`], generous
-/// reasoning-headroom `max_tokens`).
-fn compose_config() -> LlmConfig {
+/// The compose chat config (backend = Ollama, generous reasoning-headroom
+/// `max_tokens`). MODEL resolves the config override → the [`COMPOSE_MODEL`] const
+/// fallback: `model_override` is the config `[llm].model` when present (FIX A).
+fn compose_config(model_override: Option<&str>) -> LlmConfig {
     LlmConfig {
         backend: LlmBackend::Ollama,
-        model: COMPOSE_MODEL.to_owned(),
+        model: model_override.unwrap_or(COMPOSE_MODEL).to_owned(),
         temperature: COMPOSE_TEMPERATURE,
         max_tokens: COMPOSE_MAX_TOKENS,
     }
@@ -399,14 +417,25 @@ mod tests {
 
     #[test]
     fn compose_config_targets_the_pinned_ollama_model() {
-        let config = compose_config();
+        // No config override → the COMPOSE_MODEL const fallback (FIX A).
+        let config = compose_config(None);
         assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, COMPOSE_MODEL);
-        // Reasoning headroom (gpt-oss/GLM thinking tokens count against the cap).
+        // Reasoning headroom (glm-5.2 thinking tokens count against the cap).
         assert!(
             config.max_tokens >= 4096,
             "generous cap for reasoning tokens"
         );
+    }
+
+    /// FIX A: a config `[llm].model` (e.g. `kimi-k2.6`) drives the composed config's
+    /// model; the const is only the fallback used when the config field is absent.
+    /// The config-dir read is proven race-free in `agent::config`'s own tests; here
+    /// we prove the compose seam PREFERS that value over the const.
+    #[test]
+    fn compose_config_prefers_config_model_over_const_fallback() {
+        assert_eq!(compose_config(Some("kimi-k2.6")).model, "kimi-k2.6");
+        assert_eq!(compose_config(None).model, COMPOSE_MODEL);
     }
 
     #[test]

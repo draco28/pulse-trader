@@ -543,15 +543,12 @@ fn flush_run(run: &mut String, out: &mut String) {
 /// Whether a `[A-Za-z0-9_-]` run looks like an API key (known prefixes or a long,
 /// mixed-alphanumeric opaque token). Deliberately conservative so strategy words and
 /// numbers survive.
+///
+/// Delegates to the shared [`looks_like_secret_token`](crate::domain) kernel so the
+/// compose-time scrub and the at-rest ledger scrubber recognize the SAME prefixes —
+/// the at-rest copy can never be weaker than compose-time (slice-close FIX C).
 fn looks_secret(run: &str) -> bool {
-    const PREFIXES: [&str; 7] = ["sk-", "sk_", "pk-", "ghp_", "gho_", "xox", "akia"];
-    let lower = run.to_ascii_lowercase();
-    if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
-        return true;
-    }
-    run.len() >= 32
-        && run.chars().any(|c| c.is_ascii_alphabetic())
-        && run.chars().any(|c| c.is_ascii_digit())
+    crate::domain::looks_like_secret_token(run)
 }
 
 /// Whether an object key names a secret-typed field.

@@ -12,8 +12,10 @@
 //! Thin transport ONLY: no `HiveMind`/agent/lens substrate, no streaming (the
 //! cost-logged path in the decorator needs `usage`, which only the non-streaming
 //! `chat()` carries), no key env-read (the key is a ctor arg the composition root
-//! sources from the Keychain via [`glm_api_key`](crate::adapters::secrets::glm_api_key)),
-//! and no redaction / cost / persistence (that is the redacting-logging decorator).
+//! supplies — `llm-check` reads the Keychain via
+//! [`glm_api_key`](crate::adapters::secrets::glm_api_key), `compose` reads
+//! `OLLAMA_API_KEY` from the environment / gitignored `.env`), and no redaction /
+//! cost / persistence (that is the redacting-logging decorator).
 //!
 //! **Tool-calling (VS-1.3.2 work-2.01, FR-3).** `chat` now forwards a borrowed
 //! `&[ToolDefinition]` slice — each `PulseTrader` [`ToolDefinition`] is translated to
@@ -33,16 +35,22 @@ use crate::domain::{
     LlmConfig, LlmError, LlmProvider, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
 };
 
-/// The Ollama Cloud OpenAI-compatible base URL (provider pivot 2026-07-10 —
-/// spike-verified `/v1` tool-calling).
+/// The DEFAULT Ollama Cloud OpenAI-compatible base URL (provider pivot 2026-07-10 —
+/// spike-verified `/v1` tool-calling). The `const` fallback when the config
+/// `[llm].base_url` is absent; [`OpenAiCompatProvider::with_base_url`] accepts a
+/// config override (slice-close FIX A).
 ///
 /// `PulseHive`'s `chat_completions_url()` trims a trailing `/` and appends
-/// `/chat/completions`, yielding `https://ollama.com/v1/chat/completions`. Kept a
-/// single named const (config, not alpha) so an endpoint swap is one edit.
+/// `/chat/completions`, yielding `https://ollama.com/v1/chat/completions`.
 const OLLAMA_BASE_URL: &str = "https://ollama.com/v1";
 
-/// The Ollama Cloud model id (VS-1.3.2 — the composer drives `gpt-oss:120b`).
-const OLLAMA_MODEL_ID: &str = "gpt-oss:120b";
+/// The default Ollama Cloud model id — the `OpenAIConfig` fallback carried by the
+/// provider. The per-request model actually flows from [`LlmConfig::model`] (the
+/// composition root resolves it: config `[llm].model` → const), so this is only the
+/// transport-level default. `glm-5.2` is the tested main model (Ollama Cloud,
+/// OpenAI-compat, tool-capable) — slice-close FIX B retired the pre-subscription
+/// `gpt-oss:120b` placeholder.
+const OLLAMA_MODEL_ID: &str = "glm-5.2";
 
 /// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
 /// future coach loop forever; an unset/infinite timeout is a v1 reliability gap).
@@ -65,17 +73,30 @@ pub struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
-    /// Build an `OpenAiCompatProvider` from an API key.
+    /// Build an `OpenAiCompatProvider` from an API key, pinned to the DEFAULT
+    /// [`OLLAMA_BASE_URL`].
     ///
     /// The key is a **ctor argument** (never env-read here) — the composition root
-    /// (1.05) sources it from the macOS Keychain via
-    /// [`glm_api_key`](crate::adapters::secrets::glm_api_key) and injects it. The
-    /// endpoint / model / timeout / retry posture is pinned to the Ollama Cloud
-    /// config (README C2/C8, audit ch4).
+    /// supplies it (`llm-check` from the macOS Keychain via
+    /// [`glm_api_key`](crate::adapters::secrets::glm_api_key); `compose` from
+    /// `OLLAMA_API_KEY`). Use [`with_base_url`](Self::with_base_url) to override the
+    /// endpoint from config (slice-close FIX A). The timeout / retry posture is
+    /// pinned to the Ollama Cloud config (README C2/C8, audit ch4).
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url(api_key, OLLAMA_BASE_URL)
+    }
+
+    /// Build an `OpenAiCompatProvider` from an API key + an explicit OpenAI-compatible
+    /// `base_url` (the config `[llm].base_url` override — slice-close FIX A). [`new`]
+    /// delegates here with the [`OLLAMA_BASE_URL`] default.
+    ///
+    /// The key provenance is identical to [`new`](Self::new). The model / timeout /
+    /// retry posture is unchanged; only the endpoint is caller-chosen.
+    #[must_use]
+    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         let config = OpenAIConfig::new(api_key, OLLAMA_MODEL_ID)
-            .with_base_url(OLLAMA_BASE_URL)
+            .with_base_url(base_url)
             .with_timeout(OLLAMA_TIMEOUT_SECS)
             .with_max_retries(OLLAMA_MAX_RETRIES);
         Self {
@@ -239,11 +260,13 @@ mod tests {
     #[test]
     fn provider_constructs_with_pinned_ollama_config() {
         // Smoke test: the adapter builds against the pinned Ollama Cloud config with
-        // NO network. The consts are the provider-pivot endpoint + model id (README
-        // C2/C8).
+        // NO network. The consts are the provider-pivot endpoint + default model id
+        // (README C2/C8); `glm-5.2` is the tested main model (slice-close FIX B).
         let _provider = OpenAiCompatProvider::new("test-key");
+        // FIX A: the config `[llm].base_url` override ctor also builds (NO network).
+        let _override = OpenAiCompatProvider::with_base_url("test-key", "https://example.test/v1");
         assert_eq!(OLLAMA_BASE_URL, "https://ollama.com/v1");
-        assert_eq!(OLLAMA_MODEL_ID, "gpt-oss:120b");
+        assert_eq!(OLLAMA_MODEL_ID, "glm-5.2");
     }
 
     #[test]

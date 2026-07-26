@@ -112,16 +112,14 @@ impl StrategyBuilder {
                 "call add_entry_signal to set the entry trigger",
             ));
         }
-        if self.exits.is_empty() {
-            errors.push(FieldError {
-                path: "exits".to_owned(),
-                code: ValidationCode::NoExit,
-                message: "call set_exit_rules to set at least one exit rule".to_owned(),
-            });
-        }
         if self.risk.is_none() {
             errors.push(missing("risk", "call set_risk_params to set risk sizing"));
         }
+        // Guard ONLY the fields structurally required to CONSTRUCT a `StrategyDsl`
+        // (name/direction/entry/risk). Empty exits are NOT short-circuited here: the
+        // whole-document `validate()` below reports `NoExit` alongside EVERY other
+        // semantic error in one pass, so a single finalize surfaces them all at once
+        // (slice-close FIX D — no local guard that hides a co-occurring error).
         let (Some(name), Some(direction), Some(entry), Some(risk)) = (
             self.name.clone(),
             self.direction,
@@ -130,11 +128,6 @@ impl StrategyBuilder {
         ) else {
             return Err(errors);
         };
-        if !errors.is_empty() {
-            // A required piece other than name/direction/entry/risk is missing
-            // (an empty exits list); do not assemble a partial document.
-            return Err(errors);
-        }
         let dsl = StrategyDsl {
             schema_version: SchemaVersion::CURRENT,
             name,
@@ -217,19 +210,64 @@ mod tests {
     }
 
     #[test]
-    fn new_builder_finalize_reports_all_missing_pieces() {
+    fn new_builder_finalize_reports_all_missing_construct_pieces() {
         let builder = StrategyBuilder::new();
         let errs = builder
             .finalize()
             .expect_err("an empty builder cannot finalize");
+        // The four fields structurally required to CONSTRUCT a `StrategyDsl` are
+        // reported locally; empty exits (and every other semantic rule) is a
+        // `validate()` concern surfaced only once the document is constructable
+        // (slice-close FIX D — no local empty-exits short-circuit before validate).
         assert!(errs.iter().any(|e| e.path == "name"));
         assert!(errs.iter().any(|e| e.path == "direction"));
         assert!(errs.iter().any(|e| e.path == "entry"));
+        assert!(errs.iter().any(|e| e.path == "risk"));
+    }
+
+    /// FIX D: with the constructable fields present but exits EMPTY and a
+    /// co-occurring semantic error (MACD fast >= slow in the entry), `finalize`
+    /// surfaces BOTH `NoExit` and the MACD error in one pass — proof the removed
+    /// empty-exits guard no longer hides other errors a round.
+    #[test]
+    fn finalize_surfaces_empty_exits_and_other_errors_together() {
+        let mut builder = StrategyBuilder::new();
+        builder.set_identity("both errors".to_owned(), Direction::Long);
+        // Entry uses a MACD with fast(26) >= slow(12) — a whole-document rule
+        // violation (`entry.indicator.macd.fast`, code FieldRange).
+        builder.set_entry(Condition::Compare {
+            lhs: ValueSource::Indicator {
+                spec: IndicatorSpec::Macd {
+                    fast: SweepableValue::Fixed(26),
+                    slow: SweepableValue::Fixed(12),
+                    signal: SweepableValue::Fixed(9),
+                },
+            },
+            op: Comparator::Gt,
+            rhs: ValueSource::Constant {
+                value: Decimal::ZERO,
+            },
+        });
+        // Exits deliberately left EMPTY; risk present so the doc is constructable.
+        builder.set_risk(valid_risk());
+
+        let errs = builder
+            .finalize()
+            .expect_err("empty exits + a bad MACD must not finalize");
+        assert!(
+            errs.iter().any(|e| e.code == ValidationCode::NoExit),
+            "expected a NoExit error, got {errs:?}"
+        );
+        // The OTHER semantic error must ALSO be present (both surfaced at once).
         assert!(
             errs.iter()
-                .any(|e| e.path == "exits" && e.code == ValidationCode::NoExit)
+                .any(|e| e.code != ValidationCode::NoExit && e.path.contains("macd.fast")),
+            "expected the co-occurring MACD fast>=slow error too, got {errs:?}"
         );
-        assert!(errs.iter().any(|e| e.path == "risk"));
+        assert!(
+            errs.len() >= 2,
+            "finalize must surface BOTH errors in one pass, got {errs:?}"
+        );
     }
 
     #[test]

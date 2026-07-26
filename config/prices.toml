@@ -17,9 +17,11 @@
 # Native billing currency for the figures below (stored verbatim on `LlmCall`).
 currency = "USD"
 
-# Transport pinning (data, not a Rust literal). Consumed by the composition
-# root (2.05) when it constructs the provider; carried here so the base URL and
-# model id are config, not code.
+# Transport pinning (data, not a Rust literal). LIVE as of slice-close FIX A:
+# `pulse compose` reads this `[llm]` table via `agent::config::load_llm_transport`
+# and drives the provider's base URL + model from it (config → const fallback,
+# ADR-0013's one-line model swap). A missing field falls back to the compiled-in
+# `openai_compat.rs` / `compose.rs` const. Change the model or endpoint HERE.
 [llm]
 base_url = "https://ollama.com/v1"
 model = "glm-5.2"

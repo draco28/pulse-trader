@@ -40,21 +40,16 @@ use crate::domain::{
 /// The placeholder substituted for every redacted span in the persisted copy.
 const REDACTED: &str = "«REDACTED»";
 
-/// Minimum length of the high-entropy tail after an `sk-` prefix for a token to
-/// count as an API key (conservative — a short `sk-`-word is left alone).
-const SK_MIN_TAIL_LEN: usize = 16;
-
-/// Minimum length of a prefix-less token for the generic high-entropy branch
-/// (a long mixed-alphanumeric run — session/API tokens).
-const GENERIC_MIN_LEN: usize = 32;
-
 /// A scoped, data-driven secret scrubber for the PERSISTED copy of a prompt +
 /// completion (NFR-6, README C7, audit ch1).
 ///
 /// v1 strips exactly two things and nothing else:
-/// - **API-key-shaped tokens** — a conservative structural pattern (an `sk-`
-///   prefixed high-entropy tail, or a long mixed-alphanumeric run). This is
-///   detection LOGIC, not secret DATA, so it lives in code.
+/// - **API-key-shaped tokens** — a conservative structural pattern (a known key
+///   prefix — `sk-`/`sk_`/`pk-`/`ghp_`/`gho_`/`xox`/`akia` — or a long
+///   mixed-alphanumeric run), shared with the compose-time scrub via the
+///   [`looks_like_secret_token`](crate::domain) kernel so the at-rest copy is
+///   never weaker than compose-time (slice-close FIX C). This is detection LOGIC,
+///   not secret DATA, so it lives in code.
 /// - **Caller-declared tagged secrets** — the exact secret VALUES the caller
 ///   marks as sensitive (e.g. a live key value), supplied as DATA via
 ///   [`from_config`](Self::from_config) so no production secret is a public-Rust
@@ -168,7 +163,7 @@ impl Redactor {
         if word.is_empty() {
             return;
         }
-        if Self::looks_like_api_key(word) {
+        if crate::domain::looks_like_secret_token(word) {
             out.push_str(REDACTED);
         } else {
             out.push_str(word);
@@ -181,21 +176,6 @@ impl Redactor {
     /// pure-digit words (never key-shaped) and survives.
     fn is_word_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
-    }
-
-    /// Conservative structural API-key test that never false-positives on numbers
-    /// or prose: an `sk-` prefixed high-entropy tail, OR a long run carrying BOTH
-    /// a letter AND a digit (so pure-digit numbers and pure-word text are kept).
-    fn looks_like_api_key(word: &str) -> bool {
-        if let Some(tail) = word.strip_prefix("sk-") {
-            return tail.len() >= SK_MIN_TAIL_LEN;
-        }
-        if word.len() >= GENERIC_MIN_LEN {
-            let has_alpha = word.chars().any(|c| c.is_ascii_alphabetic());
-            let has_digit = word.chars().any(|c| c.is_ascii_digit());
-            return has_alpha && has_digit;
-        }
-        false
     }
 
     /// Redact a whole prompt: each message's text content is scrubbed while its
@@ -559,6 +539,38 @@ mod tests {
         let sent = user_text(&driven.received[0][0]);
         assert_eq!(sent, body);
         assert!(sent.contains(TAGGED_SECRET));
+    }
+
+    /// FIX C: the at-rest scrubber shares the compose-time prefix heuristic, so a
+    /// `xox`-prefixed (Slack-style) token is redacted from the PERSISTED copy even
+    /// with NO tagged secrets. Before the unification the at-rest test only matched
+    /// `sk-`/≥32-char, so an 18-char `xoxb-…` token LEAKED at rest — this guards the
+    /// "never weaker than compose-time" property.
+    #[tokio::test]
+    async fn at_rest_scrubber_redacts_prefixed_secret_tokens() {
+        const SLACK_TOKEN: &str = "xoxb-2401-abcdEFGH";
+        let prompt = vec![Message::user(format!("token {SLACK_TOKEN} here"))];
+        // Redactor::default() has NO tagged secrets — only the structural heuristic
+        // can catch this, so the assertion proves the heuristic (not a tagged value).
+        let driven = drive(
+            prompt,
+            Redactor::default(),
+            response("ok", 3, 1),
+            1_700_000_000_000,
+        )
+        .await;
+
+        let stored = user_text(&driven.saved[0].prompt_messages[0]);
+        assert!(
+            !stored.contains(SLACK_TOKEN),
+            "at-rest scrubber leaked the prefixed token: {stored}"
+        );
+        assert!(
+            stored.contains(REDACTED),
+            "token not redacted at rest: {stored}"
+        );
+        // surrounding words survive.
+        assert!(stored.contains("token") && stored.contains("here"));
     }
 
     #[tokio::test]

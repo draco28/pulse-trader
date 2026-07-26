@@ -69,7 +69,7 @@ impl LlmProvider for FakeProvider {
 fn test_prices() -> PriceTable {
     let mut models = HashMap::new();
     models.insert(
-        "gpt-oss:120b".to_owned(),
+        "glm-5.2".to_owned(),
         ModelPrice {
             input_per_mtok: Decimal::from(2),
             output_per_mtok: Decimal::from(8),
@@ -174,7 +174,7 @@ async fn logs_redacted_llm_call_over_fake_provider() {
     assert_eq!(call.cost.normalize(), Decimal::new(7, 3).normalize());
     assert_eq!(call.cost_currency, "CNY");
     assert_eq!(call.backend, LlmBackend::Ollama);
-    assert_eq!(call.model, "gpt-oss:120b");
+    assert_eq!(call.model, "glm-5.2");
 
     // (iii) OQ-A: the inner provider received the REAL, un-redacted prompt. Scope
     // the guard so it drops before the later read-back await (no lock held across

@@ -82,9 +82,10 @@ via `pulsehive_openai::OpenAICompatibleProvider` — NOT the GLM/Z.AI coding-pla
 (that endpoint is licensed for personal coding-agent use only; Ollama Cloud is a
 subscription API for programmatic use). A live spike verified clean `/v1` tool-calling on
 `gpt-oss:120b` and the full premium catalog. The VS-1.3.1 `GlmProvider` is generalized to a
-config-driven `OpenAiCompatProvider`; `LlmBackend::Glm` → `LlmBackend::Ollama`; the model is
-config-driven. This does not change the thin-transport premise (ADR-0012) — only the
-concrete base-URL/model/key. A native PulseHive `OllamaProvider` is a filed non-blocking
+config-driven `OpenAiCompatProvider`; `LlmBackend::Glm` → `LlmBackend::Ollama`; the base URL +
+model are config-driven from `config/prices.toml`'s `[llm]` table (each with a `const` fallback),
+realized at slice-close (FIX A). This does not change the thin-transport premise (ADR-0012) — only
+the concrete base-URL/model/key. A native PulseHive `OllamaProvider` is a filed non-blocking
 enhancement (`pulseai-labs/PulseHive#35`).
 
 ## Consequences

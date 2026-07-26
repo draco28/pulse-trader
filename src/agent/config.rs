@@ -91,10 +91,11 @@ pub(crate) enum ConfigError {
 }
 
 /// The on-disk `prices.toml` shape. Only `currency` + `models` are consumed by
-/// this item's [`PriceTable::from_config`] seam; the `[llm]` table
-/// (`base_url`/`model`) is forward-compat DATA the composition root (2.05)
-/// reads, so it is intentionally NOT modelled here (serde ignores it), keeping
-/// this loader free of any unused-field carry.
+/// this struct's [`PriceTable::from_config`] seam; the `[llm]` table
+/// (`base_url`/`model`) is parsed SEPARATELY by [`load_llm_transport`] (the
+/// composition root reads it to drive the model/base-url, slice-close FIX A), so
+/// it is intentionally NOT modelled here (serde ignores it), keeping this struct
+/// free of any unused-field carry.
 ///
 /// Crucially, the per-model VALUES deserialize DIRECTLY into the domain's
 /// [`ModelPrice`] — this module never spells out the per-Mtok price field
@@ -104,6 +105,37 @@ pub(crate) enum ConfigError {
 struct PricesConfig {
     currency: String,
     models: HashMap<String, ModelPrice>,
+}
+
+/// The resolved `[llm]` transport pinning read from `prices.toml` (slice-close
+/// FIX A, ADR-0013 "config-driven model/base-url"). Both fields are optional: a
+/// missing `[llm]` table or a missing field yields `None`, and the composition
+/// root falls back to its documented `const` — never an error.
+pub(crate) struct LlmTransport {
+    /// The OpenAI-compatible base URL override (e.g. `https://ollama.com/v1`), or
+    /// `None` to use the provider's `const` default.
+    pub(crate) base_url: Option<String>,
+    /// The model id override (e.g. `glm-5.2`), or `None` to use the compose
+    /// `const` default.
+    pub(crate) model: Option<String>,
+}
+
+/// The `[llm]` table's on-disk shape (only the two transport-pinning fields). A
+/// separate parse struct from [`PricesConfig`] so each loader models exactly what
+/// it consumes; toml ignores the sibling `currency`/`[models]` tables here.
+#[derive(Debug, Default, Deserialize)]
+struct TransportConfig {
+    #[serde(default)]
+    llm: Option<LlmTable>,
+}
+
+/// The `[llm]` table's two optional fields.
+#[derive(Debug, Default, Deserialize)]
+struct LlmTable {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Resolve the config directory per the README C6 order (override → dev default
@@ -158,6 +190,42 @@ fn load_price_table_from(config_dir: &Path) -> Result<PriceTable, ConfigError> {
     Ok(PriceTable::from_config(parsed.currency, parsed.models))
 }
 
+/// Load the `[llm]` transport pinning (`base_url` + model) from `prices.toml` in the
+/// resolved config dir (slice-close FIX A). Reuses the SAME config-dir resolution +
+/// file as [`load_price_table`]; a missing `[llm]` table or field is `None`, never
+/// an error.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if the config dir cannot be resolved, the file cannot be
+/// read, or its TOML cannot be parsed (the same failure modes as the price loader).
+pub(crate) fn load_llm_transport() -> Result<LlmTransport, ConfigError> {
+    load_llm_transport_from(&resolve_config_dir()?)
+}
+
+/// Load the `[llm]` transport pinning from `prices.toml` under an explicit
+/// `config_dir` (the testable core of [`load_llm_transport`]).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] if the file is absent/unreadable, or
+/// [`ConfigError::Parse`] if its TOML does not parse. A present file with no
+/// `[llm]` table (or empty fields) is `Ok` with `None`s — never an error.
+fn load_llm_transport_from(config_dir: &Path) -> Result<LlmTransport, ConfigError> {
+    let path = config_dir.join(PRICES_FILE);
+    let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let parsed: TransportConfig =
+        toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
+    let llm = parsed.llm.unwrap_or_default();
+    Ok(LlmTransport {
+        base_url: llm.base_url,
+        model: llm.model,
+    })
+}
+
 /// Load the composer system prompt.
 ///
 /// Resolution: if `$PULSE_PROMPT_DIR/composer.md` exists it wins (the
@@ -195,8 +263,8 @@ fn load_composer_prompt_from(prompt_dir: Option<&Path>) -> Result<String, Config
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        CONFIG_DIR_ENV, ConfigError, load_composer_prompt_from, load_price_table_from,
-        resolve_config_dir,
+        CONFIG_DIR_ENV, ConfigError, load_composer_prompt_from, load_llm_transport,
+        load_llm_transport_from, load_price_table_from, resolve_config_dir,
     };
     use crate::domain::{SchemaVersion, TokenUsage};
     use std::sync::Mutex;
@@ -312,5 +380,47 @@ mod tests {
             std::env::remove_var(CONFIG_DIR_ENV);
         }
         assert_eq!(resolved, dir.path());
+    }
+
+    /// FIX A: the `[llm]` table is now LIVE data — a `$PULSE_CONFIG_DIR` prices.toml
+    /// whose `[llm].model` is `kimi-k2.6` resolves through the SAME config-dir order
+    /// as the price table. The sole other env-mutating test shares `ENV_LOCK`.
+    #[test]
+    fn load_llm_transport_reads_model_from_config_dir_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("prices.toml"),
+            "currency = \"USD\"\n[llm]\nbase_url = \"https://example.test/v1\"\nmodel = \"kimi-k2.6\"\n",
+        )
+        .unwrap();
+        // SAFETY: serialized by ENV_LOCK; no other test reads $PULSE_CONFIG_DIR.
+        unsafe {
+            std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        }
+        let transport = load_llm_transport();
+        // SAFETY: same lock scope; restore the environment before releasing it.
+        unsafe {
+            std::env::remove_var(CONFIG_DIR_ENV);
+        }
+        let transport = transport.expect("transport loads from the env config dir");
+        assert_eq!(transport.model.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(
+            transport.base_url.as_deref(),
+            Some("https://example.test/v1")
+        );
+    }
+
+    /// FIX A: a present prices.toml with NO `[llm]` table yields `None`s (never an
+    /// error) — the composition root then falls back to its documented `const`s.
+    /// Race-free (explicit dir, no env mutation).
+    #[test]
+    fn load_llm_transport_missing_table_is_none_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prices.toml"), "currency = \"USD\"\n").unwrap();
+        let transport =
+            load_llm_transport_from(dir.path()).expect("no [llm] table is not an error");
+        assert!(transport.model.is_none());
+        assert!(transport.base_url.is_none());
     }
 }

@@ -275,24 +275,31 @@ struct SignalArgs {
     right: mapping::Operand,
 }
 
-/// `set_exit_rules` args — flat scalar fields; `Decimal`s carried as JSON
-/// strings (`"0.05"`), matching the DSL's `serde(with = "…str")` convention.
+/// `set_exit_rules` args — flat scalar fields; `Decimal`s are carried as JSON
+/// STRINGS (`"0.05"`), matching the DSL's `serde(with = "…str")` convention AND
+/// the advertised schema. `str_option` (NFR-2) rejects a bare JSON number so no
+/// float ever reaches a `Decimal` — a bare number becomes a correctable
+/// `FieldError` via `parse_args` (slice-close FIX E).
 #[derive(Debug, Deserialize)]
 struct ExitArgs {
-    #[serde(default)]
+    #[serde(default, with = "rust_decimal::serde::str_option")]
     stop_loss_pct: Option<Decimal>,
-    #[serde(default)]
+    #[serde(default, with = "rust_decimal::serde::str_option")]
     take_profit_r: Option<Decimal>,
-    #[serde(default)]
+    #[serde(default, with = "rust_decimal::serde::str_option")]
     trailing_pct: Option<Decimal>,
     #[serde(default)]
     time_bars: Option<u32>,
 }
 
-/// `set_risk_params` args — `Decimal`s carried as JSON strings.
+/// `set_risk_params` args — `Decimal`s carried as JSON STRINGS. `str` (NFR-2)
+/// rejects a bare JSON number so no float ever reaches a `Decimal`; a bare number
+/// becomes a correctable `FieldError` via `parse_args` (slice-close FIX E).
 #[derive(Debug, Deserialize)]
 struct RiskArgs {
+    #[serde(with = "rust_decimal::serde::str")]
     risk_per_trade_pct: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     max_leverage: Decimal,
 }
 
@@ -338,7 +345,11 @@ mod mapping {
         signal: Option<u32>,
         #[serde(default)]
         price_field: Option<String>,
-        #[serde(default)]
+        // A constant operand's `value` is a JSON STRING (`"30"`) per the advertised
+        // schema; `str_option` (NFR-2) rejects a bare JSON number so no float ever
+        // reaches a `Decimal` — a bare number becomes a correctable `FieldError`
+        // via `parse_args` (slice-close FIX E).
+        #[serde(default, with = "rust_decimal::serde::str_option")]
         value: Option<Decimal>,
     }
 
@@ -835,6 +846,42 @@ mod tests {
                 panic!("a missing operand source must be a correctable error")
             }
         }
+    }
+
+    /// FIX E (NFR-2): a flat `Decimal` arg sent as a JSON NUMBER (not a string) is
+    /// a correctable error — the f64 ingress path is closed, only decimal STRINGS
+    /// are accepted (matching the advertised schema), so no float ever reaches a
+    /// `Decimal`. A bare `0.01` (not `"0.01"`) must reject.
+    #[test]
+    fn numeric_decimal_arg_is_a_correctable_error() {
+        let mut builder = StrategyBuilder::new();
+        // `risk_per_trade_pct` as a bare JSON number 0.01 (NOT "0.01").
+        match set_risk_params(
+            &mut builder,
+            json!({ "risk_per_trade_pct": 0.01, "max_leverage": "3" }),
+        ) {
+            ToolOutcome::Err { errors } => assert!(!errors.is_empty()),
+            ToolOutcome::Ok { .. } => {
+                panic!("a numeric (f64) decimal arg must be a correctable Err, not Ok")
+            }
+        }
+        // A bare-number `stop_loss_pct` (Option<Decimal> via str_option) also rejects.
+        assert!(matches!(
+            set_exit_rules(&mut builder, json!({ "stop_loss_pct": 0.05 })),
+            ToolOutcome::Err { .. }
+        ));
+        // A bare-number constant operand `value` (Option<Decimal>) also rejects.
+        assert!(matches!(
+            add_entry_signal(
+                &mut builder,
+                json!({
+                    "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                    "op": "lt",
+                    "right": { "source": "constant", "value": 30 }
+                })
+            ),
+            ToolOutcome::Err { .. }
+        ));
     }
 
     /// AC-12: calling `set_risk_params` (and the other setters) BEFORE

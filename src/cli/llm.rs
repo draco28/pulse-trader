@@ -48,10 +48,10 @@ use crate::domain::{
     LlmResponse, Message, PriceTable,
 };
 
-/// The demo model id — `gpt-oss:120b` via Ollama Cloud (mirrors the
-/// `openai_compat.rs` `OLLAMA_MODEL_ID` const + the price-table key so `cost`
-/// resolves).
-const DEMO_MODEL: &str = "gpt-oss:120b";
+/// The demo model id — `glm-5.2` via Ollama Cloud (the tested main model; mirrors
+/// the `openai_compat.rs` `OLLAMA_MODEL_ID` default + the shipped price-table key so
+/// `cost` resolves). Slice-close FIX B retired the `gpt-oss:120b` placeholder.
+const DEMO_MODEL: &str = "glm-5.2";
 
 /// A conservative sampling temperature for the demo round-trip (wire-level `f32`,
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
@@ -269,7 +269,7 @@ pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()
     let repo = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
 
     // Prices load from `config/prices.toml` via the 2.03 loader (AC-11 — no price
-    // literal in `src/cli/`); the shipped gpt-oss:120b entry backs this demo.
+    // literal in `src/cli/`); the shipped glm-5.2 entry backs this demo.
     let prices = crate::agent::config::load_price_table()
         .map_err(|e| anyhow::anyhow!("load price table: {e}"))?;
     let prompt = build_prompt(args);
