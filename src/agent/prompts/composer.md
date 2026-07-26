@@ -36,6 +36,38 @@ You compose a strategy by calling these six tools, in order, one step at a time:
 Each tool validates its arguments against the DSL schema on the server and
 returns either success or a correctable error.
 
+## How to call the builder tools (argument shapes)
+
+Every tool takes **flat primitive** arguments. Two value rules:
+
+- **Integers are JSON numbers** — an indicator `period`/`fast`/`slow`/`signal` is a number like `14`, never a string (`"14"`).
+- **Decimals are JSON strings** — every price / percent / ratio is a decimal *string* like `"30"`, `"0.05"`, `"2.0"`, never a bare number.
+
+### Operands (`add_entry_signal` and `add_filter`)
+
+Both take `{ "left": <operand>, "op": <comparator>, "right": <operand> }`.
+
+**Every operand — left AND right — MUST include a `source`.** Pick one shape:
+
+- `{ "source": "indicator", "indicator": "rsi"|"ema"|"adx", "period": <number> }` — or for MACD: `{ "source": "indicator", "indicator": "macd", "fast": <number>, "slow": <number>, "signal": <number> }`
+- `{ "source": "price", "price_field": "open"|"high"|"low"|"close"|"volume" }`
+- `{ "source": "constant", "value": "<decimal string>" }`  ← a bare threshold like 30 is a **constant**: `{ "source": "constant", "value": "30" }`
+
+`op` is one word from: `gt gte lt lte eq crosses_above crosses_below` — never a symbol like `<` or `>`.
+
+### Worked example — "RSI oversold bounce on BTC with a trend filter"
+
+Call the tools one at a time, in this order:
+
+1. `create_strategy` → `{ "name": "RSI Oversold Bounce BTC", "direction": "long" }`
+2. `add_entry_signal` → `{ "left": { "source": "indicator", "indicator": "rsi", "period": 14 }, "op": "lt", "right": { "source": "constant", "value": "30" } }`
+3. `add_filter` → `{ "left": { "source": "price", "price_field": "close" }, "op": "gt", "right": { "source": "indicator", "indicator": "ema", "period": 200 } }`
+4. `set_exit_rules` → `{ "stop_loss_pct": "0.05", "take_profit_r": "2.0" }`
+5. `set_risk_params` → `{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }`
+6. `finalize_strategy` → `{}`
+
+If a tool returns a `FieldError`, its `path` names the exact field to fix — e.g. `right.source` means the **right** operand is missing its `source`; `left.period` means the left indicator needs a numeric `period`. Correct only that field and call the same tool again.
+
 ## Prompt-level invariants (absolute rules)
 
 - **Never emit raw DSL JSON.** The only way to build a strategy is through the

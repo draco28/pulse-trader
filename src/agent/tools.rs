@@ -319,6 +319,12 @@ mod mapping {
     /// emits the serde tag.
     #[derive(Debug, Deserialize)]
     pub(super) struct Operand {
+        // Defaulted so a MISSING `source` still deserializes and the mapping
+        // layer reports a LOCALIZED `{left|right}.source` error (e.g. a constant
+        // operand written as `{"value":"30"}`) instead of a terse, unlocalized
+        // whole-struct "missing field `source`" pathed to `arguments` — the gap
+        // that stalled the live gpt-oss:120b demo (VS-1.3.2 slice-close).
+        #[serde(default)]
         source: String,
         #[serde(default)]
         indicator: Option<String>,
@@ -796,6 +802,39 @@ mod tests {
             ),
             ToolOutcome::Err { .. }
         ));
+    }
+
+    /// A constant operand written WITHOUT `source` (e.g. `{"value":"30"}`) is a
+    /// correctable error LOCALIZED to the offending operand (`right.source`), NOT
+    /// a terse unlocalized whole-struct parse error at `arguments` — the gap that
+    /// stalled the live gpt-oss:120b demo (VS-1.3.2 slice-close: the model kept
+    /// "fixing" the left operand because the error never named the right one).
+    #[test]
+    fn operand_missing_source_errors_localize_to_the_operand() {
+        let mut builder = StrategyBuilder::new();
+        let outcome = add_entry_signal(
+            &mut builder,
+            json!({
+                "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                "op": "lt",
+                "right": { "value": "30" }
+            }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.path == "right.source"),
+                    "expected a localized `right.source` error, got {errors:?}"
+                );
+                assert!(
+                    errors.iter().all(|e| e.path != "arguments"),
+                    "the error must NOT be the unlocalized whole-struct `arguments` parse error"
+                );
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a missing operand source must be a correctable error")
+            }
+        }
     }
 
     /// AC-12: calling `set_risk_params` (and the other setters) BEFORE
