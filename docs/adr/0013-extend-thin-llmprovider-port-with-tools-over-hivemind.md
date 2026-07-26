@@ -4,11 +4,12 @@ Date: 2026-07-10T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
-(Companions VS-1.3.2 — Composer agent + builder tools. Proposed-then-flip: flips to
-Accepted via `/flip-adr` once the slice merges with the tools-carrying port + the
-PulseTrader-owned composer loop in place. Product ADR — the agent-orchestration
+(Companions VS-1.3.2 — Composer agent + builder tools. Proposed-then-flip: flipped to
+Accepted on 2026-07-26 when the slice merged into `sprint-1.3` (PR #93, merge commit
+`2a9d9f4`) with the tools-carrying port + the PulseTrader-owned composer loop in
+place — see § Empirical validation. Product ADR — the agent-orchestration
 architecture. Directly resolves the open follow-up ADR-0012 named at its close:
 "whether the composer (1.3.2) and coach (1.3.3) extend the thin port or adopt
 `HiveMind` is a tracked open decision.")
@@ -113,6 +114,30 @@ enhancement (`pulseai-labs/PulseHive#35`).
 
 ## Empirical validation
 
-_(populated post-merge via `/flip-adr` — the VS-1.3.2 merge signal: tools-carrying port
-+ `GlmProvider` tool translation + PulseTrader composer loop shipped; `pulsehive-db`
-still not activated; golden `142.29083294950040454` byte-unmoved.)_
+- **Validated:** 2026-07-26
+- **Signal:** A live end-to-end `pulse compose` run against glm-5.2 (Ollama Cloud,
+  OpenAI-compatible) drove the full natural-language → persisted `StrategyVersion`
+  round-trip through the thin tools-carrying port: streamed tool calls dispatched by
+  name, a finalized schema-valid document, and version `9ca7c9d7-a842-4b50-a95a-e49264a5bb3c`
+  persisted with `created_by = ComposerLlm` and 6 `creating_llm_call_ids`, with zero
+  secret leaks in the resulting `LlmCall` rows (NFR-6). The decision therefore holds in
+  practice: the composer reached a finalized strategy with **no** `HiveMind` / `Agent` /
+  `Lens` runtime and with `pulsehive-db` still not activated.
+- **Merged:** VS-1.3.2 landed on `sprint-1.3` as PR #93, merge commit `2a9d9f4`
+  (2026-07-26), after four review passes — 11 findings fixed, 10 tracked
+  (#92, #94–#100). `openai_compat.rs` remains the sole `PulseHive` importer and the
+  agent ring stays `HiveMind`/`pulsehive-db`-free.
+- **Determinism:** golden `142.29083294950040454` byte-unmoved across the whole slice;
+  100× sequential + 100× parallel determinism and the cross-arch (x86_64 == arm64)
+  `result_content_hash` compare green on the merged head.
+
+### What the review passes revealed about the decision
+
+The decision's `(−)` consequence — "PulseTrader hand-rolls a small agent loop … an
+accepted, bounded duplication" — is where the review concentrated. The loop needed
+several hardening fixes a mature runtime would have supplied (rejecting unknown tool
+arguments, sealing the untrusted-target delimiter, ordering within batched tool-call
+turns → #98). That is the predicted cost of option 2, arriving as predicted and at a
+bounded size; it did not change the verdict, but it sharpens the stated follow-up: if
+VS-1.3.3's coach grows the same class of loop concerns again, re-evaluate rather than
+hand-roll a second time.
