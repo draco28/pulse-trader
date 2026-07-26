@@ -27,7 +27,7 @@ jobs:
         run: rustup show
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9  # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2
         with:
           tool: cargo-nextest
 
