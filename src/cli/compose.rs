@@ -60,7 +60,11 @@ use super::llm::CapturingRepo;
 
 /// The Ollama Cloud model id the composer drives (README C2/C8). A model-id STRING
 /// (not a price literal) — AC-11 greps `src/cli/` only for price VALUE field names.
-const COMPOSE_MODEL: &str = "gpt-oss:120b";
+/// `glm-5.2` is the tested main model (Ollama Cloud, OpenAI-compat, tool-capable);
+/// `gpt-oss:120b` was a pre-subscription placeholder that returned reproducible
+/// HTTP 500s under multi-turn tool-calling (VS-1.3.2 slice-close correction,
+/// 2026-07-12 — the model is config-tunable per ADR-0013 decision 9).
+const COMPOSE_MODEL: &str = "glm-5.2";
 
 /// A conservative sampling temperature for the compose run (wire-level `f32`, never
 /// a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
