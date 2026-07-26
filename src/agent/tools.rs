@@ -261,7 +261,12 @@ pub(crate) fn finalize_strategy(builder: &StrategyBuilder) -> ToolOutcome {
 // -- per-tool flat arg structs (`#[derive(Deserialize)]`) ------------------------
 
 /// `create_strategy` args (flat primitives).
+///
+/// `deny_unknown_fields` (PR #93 review): an unrecognized argument is a
+/// CORRECTABLE `FieldError`, never a silent drop — see [`ExitArgs`] for why this
+/// matters most on the optional-field structs.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateStrategyArgs {
     name: String,
     direction: String,
@@ -269,6 +274,7 @@ struct CreateStrategyArgs {
 
 /// `add_entry_signal` / `add_filter` args (flat `{ left, op, right }`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignalArgs {
     left: mapping::Operand,
     op: String,
@@ -280,7 +286,15 @@ struct SignalArgs {
 /// the advertised schema. `str_option` (NFR-2) rejects a bare JSON number so no
 /// float ever reaches a `Decimal` — a bare number becomes a correctable
 /// `FieldError` via `parse_args` (slice-close FIX E).
+///
+/// `deny_unknown_fields` is load-bearing here (PR #93 review): EVERY field is
+/// optional, so without it a misspelled `take_profit` (for `take_profit_r`)
+/// deserializes fine, silently drops the requested take-profit, and finalizes a
+/// VALID stop-only strategy — a different strategy than the trader asked for,
+/// with no error anywhere. Rejecting the unknown key turns that into a
+/// correctable `FieldError` the model can fix on the next turn.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExitArgs {
     #[serde(default, with = "rust_decimal::serde::str_option")]
     stop_loss_pct: Option<Decimal>,
@@ -295,7 +309,9 @@ struct ExitArgs {
 /// `set_risk_params` args — `Decimal`s carried as JSON STRINGS. `str` (NFR-2)
 /// rejects a bare JSON number so no float ever reaches a `Decimal`; a bare number
 /// becomes a correctable `FieldError` via `parse_args` (slice-close FIX E).
+/// `deny_unknown_fields` per PR #93 review (see [`ExitArgs`]).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RiskArgs {
     #[serde(with = "rust_decimal::serde::str")]
     risk_per_trade_pct: Decimal,
@@ -878,6 +894,66 @@ mod tests {
                     "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
                     "op": "lt",
                     "right": { "source": "constant", "value": 30 }
+                })
+            ),
+            ToolOutcome::Err { .. }
+        ));
+    }
+
+    /// PR #93 review: a MISSPELLED optional arg must be a correctable error, not
+    /// a silent drop. Every `ExitArgs` field is optional, so before
+    /// `deny_unknown_fields` a `take_profit` typo (for `take_profit_r`)
+    /// deserialized fine and finalized a VALID stop-only strategy — silently a
+    /// different strategy than the trader asked for.
+    #[test]
+    fn misspelled_optional_exit_arg_is_correctable_not_silently_dropped() {
+        let mut builder = StrategyBuilder::new();
+        let outcome = set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05", "take_profit": "2.0" }),
+        );
+        match outcome {
+            ToolOutcome::Err { errors } => {
+                assert!(!errors.is_empty(), "an unknown field must report an error");
+            }
+            ToolOutcome::Ok { .. } => {
+                panic!("a misspelled optional arg must be a correctable Err, not a silent drop")
+            }
+        }
+        // The correctly-spelled call still works.
+        assert_ok(set_exit_rules(
+            &mut builder,
+            json!({ "stop_loss_pct": "0.05", "take_profit_r": "2.0" }),
+        ));
+    }
+
+    /// The same guard on the other three arg structs: an unknown key is always a
+    /// correctable error, never accepted.
+    #[test]
+    fn unknown_args_are_rejected_on_every_tool() {
+        let mut builder = StrategyBuilder::new();
+        assert!(matches!(
+            create_strategy(
+                &mut builder,
+                json!({ "name": "S", "direction": "long", "typo": 1 })
+            ),
+            ToolOutcome::Err { .. }
+        ));
+        assert!(matches!(
+            set_risk_params(
+                &mut builder,
+                json!({ "risk_per_trade_pct": "0.01", "max_leverage": "3", "typo": 1 })
+            ),
+            ToolOutcome::Err { .. }
+        ));
+        assert!(matches!(
+            add_entry_signal(
+                &mut builder,
+                json!({
+                    "left": { "source": "indicator", "indicator": "rsi", "period": 14 },
+                    "op": "lt",
+                    "right": { "source": "constant", "value": "30" },
+                    "typo": 1
                 })
             ),
             ToolOutcome::Err { .. }

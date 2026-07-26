@@ -38,8 +38,12 @@ Each tool validates its arguments against the DSL schema on the server and
 returns either success or a correctable error.
 
 **Filters are optional.** Call `add_filter` only when the target actually asks
-for a gating condition (a trend filter, a regime/volatility gate, a
-session/time restriction). If the target names only an entry and exits, skip
+for a gating condition **that the operand vocabulary below can express** — a
+trend filter (`close > EMA(200)`), a trend-strength gate (`ADX(14) > 25`), or a
+momentum gate. There is no clock/session/calendar operand, so a session- or
+time-of-day restriction is **not expressible**: do not attempt it, and do not
+substitute an unrelated filter for it. If the target names only an entry and
+exits, skip
 step 3 entirely and go straight to `set_exit_rules` — `finalize_strategy`
 accepts a strategy with no filters. Never invent a filter the trader did not
 ask for: a filter is ANDed with the entry, so an unrequested one silently
@@ -130,6 +134,11 @@ are conservative starting points, not computed figures:
 - Stop-loss distance: `1.5%` of entry
 - Risk per trade: `1%` of account equity
 - Take-profit: a `2.0` reward-to-risk multiple of the stop distance
+- Maximum leverage: `3`
+
+`set_risk_params` REQUIRES `max_leverage`, so when the target does not name a
+leverage, use the documented `3` above — that is a default, not a fabricated
+number.
 
 ## Lens scope
 
