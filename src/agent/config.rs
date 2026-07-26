@@ -62,6 +62,17 @@ const COMPOSER_FILE: &str = "composer.md";
 /// DATA per `PROMPT_GOVERNANCE` §3 — not a Rust `const` string literal).
 const COMPOSER_PROMPT_DEFAULT: &str = include_str!("prompts/composer.md");
 
+/// The compiled-in default price table — the SHIPPED `config/prices.toml`,
+/// embedded verbatim so a relocated or packaged binary is self-contained.
+///
+/// Without this floor, [`resolve_config_dir`] falls through to an app-support
+/// directory that no code in this crate ever populates, so `pulse compose` and
+/// `pulse llm-check` would both fail before contacting the provider whenever the
+/// compile-time `CARGO_MANIFEST_DIR` checkout is absent. Embedding (rather than
+/// carrying Rust price literals) keeps AC-8's grep of this file for a price
+/// literal empty — the numbers still live only in the data file.
+const PRICES_DEFAULT: &str = include_str!("../../config/prices.toml");
+
 /// A config-loading failure — a missing file or a parse error. Carries the
 /// offending path and the underlying error for a clear message; never a panic.
 #[derive(Debug, thiserror::Error)]
@@ -176,18 +187,41 @@ pub(crate) fn load_price_table() -> Result<PriceTable, ConfigError> {
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::Read`] if the file is absent/unreadable, or
-/// [`ConfigError::Parse`] if its TOML does not match the expected shape.
+/// Returns [`ConfigError::Read`] if the file is present but unreadable, or
+/// [`ConfigError::Parse`] if its TOML does not match the expected shape. An
+/// ABSENT file is not an error — it falls back to [`PRICES_DEFAULT`].
 fn load_price_table_from(config_dir: &Path) -> Result<PriceTable, ConfigError> {
-    let path = config_dir.join(PRICES_FILE);
-    let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-        path: path.clone(),
-        source,
-    })?;
+    let (text, path) = read_prices_text(config_dir)?;
     let parsed: PricesConfig =
         toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
     // Reuse the domain cost model's loader seam — no price VALUES live here.
     Ok(PriceTable::from_config(parsed.currency, parsed.models))
+}
+
+/// Read `prices.toml` from `config_dir`, falling back to the compiled-in
+/// [`PRICES_DEFAULT`] when the file is ABSENT (a relocated/packaged binary).
+///
+/// Returns the TOML text plus the path to blame in a [`ConfigError::Parse`] —
+/// the real path when the file was read, else the would-be path (so a malformed
+/// SHIPPED default still reports a meaningful location).
+///
+/// A file that EXISTS but cannot be read stays a hard [`ConfigError::Read`]: an
+/// unreadable override is an operator error worth surfacing, not something to
+/// paper over with the default.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] when the file exists but cannot be read.
+fn read_prices_text(config_dir: &Path) -> Result<(String, PathBuf), ConfigError> {
+    let path = config_dir.join(PRICES_FILE);
+    if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        return Ok((text, path));
+    }
+    Ok((PRICES_DEFAULT.to_owned(), path))
 }
 
 /// Load the `[llm]` transport pinning (`base_url` + model) from `prices.toml` in the
@@ -208,15 +242,12 @@ pub(crate) fn load_llm_transport() -> Result<LlmTransport, ConfigError> {
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::Read`] if the file is absent/unreadable, or
+/// Returns [`ConfigError::Read`] if the file is present but unreadable, or
 /// [`ConfigError::Parse`] if its TOML does not parse. A present file with no
-/// `[llm]` table (or empty fields) is `Ok` with `None`s — never an error.
+/// `[llm]` table (or empty fields) is `Ok` with `None`s — never an error, and an
+/// ABSENT file falls back to [`PRICES_DEFAULT`] (same seam as the price loader).
 fn load_llm_transport_from(config_dir: &Path) -> Result<LlmTransport, ConfigError> {
-    let path = config_dir.join(PRICES_FILE);
-    let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-        path: path.clone(),
-        source,
-    })?;
+    let (text, path) = read_prices_text(config_dir)?;
     let parsed: TransportConfig =
         toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
     let llm = parsed.llm.unwrap_or_default();
@@ -307,12 +338,36 @@ mod tests {
         );
     }
 
-    /// A missing price file is a clear [`ConfigError::Read`], never a panic.
+    /// An ABSENT price file falls back to the compiled-in shipped table, so a
+    /// relocated/packaged binary stays self-contained (PR #93 Codex P1: nothing
+    /// in this crate ever installs `prices.toml` into the app-support dir).
     #[test]
-    fn load_price_table_from_missing_file_is_read_error() {
+    fn load_price_table_from_missing_file_uses_the_shipped_default() {
         let dir = tempfile::tempdir().unwrap();
-        let err = load_price_table_from(dir.path()).expect_err("absent file errors");
-        assert!(matches!(err, ConfigError::Read { .. }));
+        let table = load_price_table_from(dir.path()).expect("absent file falls back");
+        // Same nominal the shipped file encodes (guards the embed, not a literal).
+        assert_eq!(table.currency(), "USD");
+        assert!(
+            table
+                .cost(
+                    "gpt-oss:120b",
+                    &TokenUsage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 1_000_000,
+                    },
+                )
+                .is_ok(),
+            "the embedded default must price the shipped models"
+        );
+    }
+
+    /// The `[llm]` transport pinning also survives an absent file — same seam,
+    /// so `pulse compose` still resolves its model/base-url off a packaged binary.
+    #[test]
+    fn load_llm_transport_from_missing_file_uses_the_shipped_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = load_llm_transport_from(dir.path()).expect("absent file falls back");
+        assert_eq!(transport.model.as_deref(), Some("glm-5.2"));
     }
 
     /// Malformed TOML is a clear [`ConfigError::Parse`], never a panic.

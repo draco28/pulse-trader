@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use pulse::{
     ComposeCliOutcome, ComposeWiring, ComposerEvent, CreatedBy, Db, FakeClock, LlmBackend,
-    LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message,
+    LlmCallId, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message,
     ModelPrice, PriceTable, Redactor, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository,
     TokenUsage, ToolCall, ToolDefinition, run_compose_with,
 };
@@ -251,15 +251,40 @@ async fn composes_and_persists_strategy_version_over_fake_provider() {
         "the persisted DSL re-derives equal"
     );
 
-    // (c) NFR-6: every persisted LlmCall row has a REDACTED prompt — the secret is
-    // gone at rest and a redaction marker is present.
+    // (c) NFR-6 + provenance: every persisted LlmCall row is redacted at rest AND
+    // attributed to the composer.
     let ledger = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
     assert_eq!(
         outcome.llm_call_ids.len(),
         6,
         "one LlmCall persisted per model turn"
     );
-    for id in &outcome.llm_call_ids {
+    assert_ledger_rows_redacted_and_composer_attributed(&ledger, &outcome.llm_call_ids).await;
+
+    // Streaming: the callback saw the recorded events, ending in Finalized.
+    assert_eq!(
+        streamed, outcome.events,
+        "the streamed callback matches the recorded event copy"
+    );
+    assert!(matches!(
+        outcome.events.last(),
+        Some(ComposerEvent::Finalized { .. })
+    ));
+}
+
+/// Assert every persisted `LlmCall` row is safe at rest AND correctly attributed:
+///
+/// - NFR-6: the prompt carries no secret and does carry a redaction marker.
+/// - PR #93 review (Codex): `created_by` must be `ComposerLlm`, agreeing with the
+///   `StrategyVersion` these rows are provenance-linked from. `RedactingLoggingProvider`
+///   defaults to `CreatedBy::Human`, so the compose composition root MUST override it —
+///   and `llm_call` is UPDATE/DELETE-trigger-immutable, so a row written under the wrong
+///   actor could never be corrected in place.
+async fn assert_ledger_rows_redacted_and_composer_attributed(
+    ledger: &SqliteLlmCallRepo<FakeClock>,
+    ids: &[LlmCallId],
+) {
+    for id in ids {
         let call = ledger
             .get_call(id)
             .await
@@ -276,17 +301,13 @@ async fn composes_and_persists_strategy_version_over_fake_provider() {
             "persisted LlmCall {} prompt not redacted: {wire}",
             id.as_str()
         );
+        assert_eq!(
+            call.created_by,
+            CreatedBy::ComposerLlm,
+            "LlmCall {} must be attributed to the composer, not a human",
+            id.as_str()
+        );
     }
-
-    // Streaming: the callback saw the recorded events, ending in Finalized.
-    assert_eq!(
-        streamed, outcome.events,
-        "the streamed callback matches the recorded event copy"
-    );
-    assert!(matches!(
-        outcome.events.last(),
-        Some(ComposerEvent::Finalized { .. })
-    ));
 }
 
 /// The correctable-recovery script: create → an out-of-range risk (> 1) rejected as

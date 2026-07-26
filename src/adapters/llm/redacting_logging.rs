@@ -253,6 +253,20 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
             created_by: CreatedBy::Human,
         }
     }
+
+    /// Override the provenance actor stamped on every persisted [`LlmCall`]
+    /// (default [`CreatedBy::Human`], set by [`new`](Self::new)).
+    ///
+    /// An agent-driven composition root MUST call this: `llm_call` is
+    /// UPDATE/DELETE-trigger-immutable, so a row written under the wrong actor
+    /// can never be corrected in place. The composer wires
+    /// [`CreatedBy::ComposerLlm`] so the ledger agrees with the
+    /// `StrategyVersion.created_by` it provenance-links.
+    #[must_use]
+    pub fn with_created_by(mut self, created_by: CreatedBy) -> Self {
+        self.created_by = created_by;
+        self
+    }
 }
 
 impl<P, R, C> LlmProvider for RedactingLoggingProvider<P, R, C>
@@ -544,11 +558,18 @@ mod tests {
     /// FIX C: the at-rest scrubber shares the compose-time prefix heuristic, so a
     /// `xox`-prefixed (Slack-style) token is redacted from the PERSISTED copy even
     /// with NO tagged secrets. Before the unification the at-rest test only matched
-    /// `sk-`/≥32-char, so an 18-char `xoxb-…` token LEAKED at rest — this guards the
+    /// `sk-`/≥32-char, so a `xoxb-…` token LEAKED at rest — this guards the
     /// "never weaker than compose-time" property.
+    ///
+    /// The fixture carries a REAL Slack token shape: PR #93 review tightened the
+    /// heuristic so a bare `xox` prefix no longer matches on its own (`xoxo` in a
+    /// trader's prose must survive), which a toy 18-char fixture would not exercise.
     #[tokio::test]
     async fn at_rest_scrubber_redacts_prefixed_secret_tokens() {
-        const SLACK_TOKEN: &str = "xoxb-2401-abcdEFGH";
+        // Assembled from fragments so the literal never appears whole in source:
+        // GitHub push protection matches the real `xox<type>-…` pattern and would
+        // (correctly) block a verbatim fixture.
+        const SLACK_TOKEN: &str = concat!("xoxb", "-2401234567-1234567890123-AbCdEfGhIjKlMnOp");
         let prompt = vec![Message::user(format!("token {SLACK_TOKEN} here"))];
         // Redactor::default() has NO tagged secrets — only the structural heuristic
         // can catch this, so the assertion proves the heuristic (not a tagged value).

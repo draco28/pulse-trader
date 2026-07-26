@@ -56,7 +56,7 @@ use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_
 use crate::agent::{
     ComposeOutcome, Composer, ComposerEvent, LlmCallCapture, builder_tool_definitions,
 };
-use crate::domain::strategy::{NewVersion, Strategy, StrategyVersion};
+use crate::domain::strategy::{CreatedBy, NewVersion, Strategy, StrategyVersion};
 use crate::domain::{
     Clock, LlmBackend, LlmCallId, LlmCallRepository, LlmConfig, LlmProvider, PriceTable,
     StrategyRepository,
@@ -179,7 +179,11 @@ where
 
     // The composition root: provider → redacting + cost-logging decorator over the
     // capturing repo, sharing the SINGLE clock (the ledger repo owns created_at, #82).
-    let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices);
+    // `with_created_by(ComposerLlm)` is load-bearing: every row this decorator writes is
+    // provenance-linked from a `StrategyVersion { created_by: ComposerLlm }`, and
+    // `llm_call` is trigger-immutable — a row stamped `Human` here could never be fixed.
+    let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices)
+        .with_created_by(CreatedBy::ComposerLlm);
     let composer = Composer::new(
         decorator,
         builder_tool_definitions(),
