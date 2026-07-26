@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use pulse::{
     Db, FakeClock, LlmBackend, LlmCallRepository, LlmCheckOutcome, LlmConfig, LlmError,
     LlmProvider, LlmResponse, MIGRATOR, Message, ModelPrice, PriceTable, Redactor,
-    SqliteLlmCallRepo, TokenUsage, run_llm_check_with,
+    SqliteLlmCallRepo, TokenUsage, ToolDefinition, run_llm_check_with,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -51,6 +51,7 @@ impl LlmProvider for FakeProvider {
     async fn chat(
         &self,
         messages: Vec<Message>,
+        _tools: &[ToolDefinition],
         _config: &LlmConfig,
     ) -> Result<LlmResponse, LlmError> {
         self.received.lock().expect("received lock").push(messages);
@@ -172,7 +173,7 @@ async fn logs_redacted_llm_call_over_fake_provider() {
     );
     assert_eq!(call.cost.normalize(), Decimal::new(7, 3).normalize());
     assert_eq!(call.cost_currency, "CNY");
-    assert_eq!(call.backend, LlmBackend::Glm);
+    assert_eq!(call.backend, LlmBackend::Ollama);
     assert_eq!(call.model, "glm-5.2");
 
     // (iii) OQ-A: the inner provider received the REAL, un-redacted prompt. Scope

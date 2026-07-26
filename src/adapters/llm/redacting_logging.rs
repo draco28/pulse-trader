@@ -28,32 +28,28 @@
 //! fully offline (MASTER-SPEC section 9.4).
 
 use chrono::DateTime;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
     Clock, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    Message, PriceTable, TokenUsage,
+    Message, PriceTable, TokenUsage, ToolCall, ToolDefinition,
 };
 
 /// The placeholder substituted for every redacted span in the persisted copy.
 const REDACTED: &str = "«REDACTED»";
 
-/// Minimum length of the high-entropy tail after an `sk-` prefix for a token to
-/// count as an API key (conservative — a short `sk-`-word is left alone).
-const SK_MIN_TAIL_LEN: usize = 16;
-
-/// Minimum length of a prefix-less token for the generic high-entropy branch
-/// (a long mixed-alphanumeric run — session/API tokens).
-const GENERIC_MIN_LEN: usize = 32;
-
 /// A scoped, data-driven secret scrubber for the PERSISTED copy of a prompt +
 /// completion (NFR-6, README C7, audit ch1).
 ///
 /// v1 strips exactly two things and nothing else:
-/// - **API-key-shaped tokens** — a conservative structural pattern (an `sk-`
-///   prefixed high-entropy tail, or a long mixed-alphanumeric run). This is
-///   detection LOGIC, not secret DATA, so it lives in code.
+/// - **API-key-shaped tokens** — a conservative structural pattern (a known key
+///   prefix — `sk-`/`sk_`/`pk-`/`ghp_`/`gho_`/`xox`/`akia` — or a long
+///   mixed-alphanumeric run), shared with the compose-time scrub via the
+///   [`looks_like_secret_token`](crate::domain) kernel so the at-rest copy is
+///   never weaker than compose-time (slice-close FIX C). This is detection LOGIC,
+///   not secret DATA, so it lives in code.
 /// - **Caller-declared tagged secrets** — the exact secret VALUES the caller
 ///   marks as sensitive (e.g. a live key value), supplied as DATA via
 ///   [`from_config`](Self::from_config) so no production secret is a public-Rust
@@ -118,6 +114,32 @@ impl Redactor {
         Self::redact_api_keys(&scrubbed)
     }
 
+    /// Recursively redact every string leaf of a JSON [`Value`] for the PERSISTED
+    /// copy (NFR-6, #81). Object/array structure, object KEYS, and non-string
+    /// scalars (numbers/bools/null) are preserved verbatim; each string leaf is
+    /// passed through [`redact`](Self::redact) (the tagged-secret + api-key-shape
+    /// rules). Used to scrub `Assistant.tool_calls[i].arguments` — a
+    /// `serde_json::Value` — before it lands in the ledger copy (defense-in-depth
+    /// per audit F2: the composer's builder-tool args are non-secret strategy
+    /// params, so this is a general backstop, not a live leak fix).
+    #[must_use]
+    pub fn redact_value(&self, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.redact(text)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| self.redact_value(item)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, val)| (key.clone(), self.redact_value(val)))
+                    .collect(),
+            ),
+            // Numbers / bools / null carry no string leaf — preserved verbatim (we
+            // do NOT strip numbers; that would erase the coach's context).
+            other => other.clone(),
+        }
+    }
+
     /// Replace API-key-shaped word tokens with the placeholder, keeping every
     /// separator (whitespace/punctuation) verbatim so formatting + numbers survive.
     fn redact_api_keys(text: &str) -> String {
@@ -141,7 +163,7 @@ impl Redactor {
         if word.is_empty() {
             return;
         }
-        if Self::looks_like_api_key(word) {
+        if crate::domain::looks_like_secret_token(word) {
             out.push_str(REDACTED);
         } else {
             out.push_str(word);
@@ -154,21 +176,6 @@ impl Redactor {
     /// pure-digit words (never key-shaped) and survives.
     fn is_word_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
-    }
-
-    /// Conservative structural API-key test that never false-positives on numbers
-    /// or prose: an `sk-` prefixed high-entropy tail, OR a long run carrying BOTH
-    /// a letter AND a digit (so pure-digit numbers and pure-word text are kept).
-    fn looks_like_api_key(word: &str) -> bool {
-        if let Some(tail) = word.strip_prefix("sk-") {
-            return tail.len() >= SK_MIN_TAIL_LEN;
-        }
-        if word.len() >= GENERIC_MIN_LEN {
-            let has_alpha = word.chars().any(|c| c.is_ascii_alphabetic());
-            let has_digit = word.chars().any(|c| c.is_ascii_digit());
-            return has_alpha && has_digit;
-        }
-        false
     }
 
     /// Redact a whole prompt: each message's text content is scrubbed while its
@@ -191,7 +198,16 @@ impl Redactor {
                 tool_calls,
             } => Message::Assistant {
                 content: content.as_ref().map(|c| self.redact(c)),
-                tool_calls: tool_calls.clone(),
+                // #81: scrub every string leaf of each tool call's `arguments`
+                // (id + name are non-secret structural identifiers — kept verbatim).
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: self.redact_value(&tc.arguments),
+                    })
+                    .collect(),
             },
             Message::ToolResult {
                 tool_call_id,
@@ -237,6 +253,20 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
             created_by: CreatedBy::Human,
         }
     }
+
+    /// Override the provenance actor stamped on every persisted [`LlmCall`]
+    /// (default [`CreatedBy::Human`], set by [`new`](Self::new)).
+    ///
+    /// An agent-driven composition root MUST call this: `llm_call` is
+    /// UPDATE/DELETE-trigger-immutable, so a row written under the wrong actor
+    /// can never be corrected in place. The composer wires
+    /// [`CreatedBy::ComposerLlm`] so the ledger agrees with the
+    /// `StrategyVersion.created_by` it provenance-links.
+    #[must_use]
+    pub fn with_created_by(mut self, created_by: CreatedBy) -> Self {
+        self.created_by = created_by;
+        self
+    }
 }
 
 impl<P, R, C> LlmProvider for RedactingLoggingProvider<P, R, C>
@@ -248,6 +278,7 @@ where
     async fn chat(
         &self,
         messages: Vec<Message>,
+        tools: &[ToolDefinition],
         config: &LlmConfig,
     ) -> Result<LlmResponse, LlmError> {
         // Preflight the price table BEFORE the billed inner call: an unknown-model
@@ -257,10 +288,10 @@ where
         // lookup fails (close-review Codex C2).
         self.prices.cost(&config.model, &TokenUsage::default())?;
 
-        // OQ-A: the inner provider gets the REAL, un-redacted prompt; we keep a
-        // copy only to scrub the persisted record.
+        // OQ-A: the inner provider gets the REAL, un-redacted prompt AND tools; we
+        // keep a copy of the messages only to scrub the persisted record.
         let prompt_copy = messages.clone();
-        let response = self.inner.chat(messages, config).await?;
+        let response = self.inner.chat(messages, tools, config).await?;
 
         // Cost from usage times the price table — model already validated above.
         let cost = self.prices.cost(&config.model, &response.usage)?;
@@ -305,7 +336,8 @@ mod tests {
     use crate::domain::strategy::CreatedBy;
     use crate::domain::{
         DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError,
-        LlmProvider, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage,
+        LlmProvider, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage, ToolCall,
+        ToolDefinition,
     };
     use rust_decimal::Decimal;
     use std::collections::HashMap;
@@ -323,6 +355,7 @@ mod tests {
         async fn chat(
             &self,
             messages: Vec<Message>,
+            _tools: &[ToolDefinition],
             _config: &LlmConfig,
         ) -> Result<LlmResponse, LlmError> {
             self.received.lock().expect("received lock").push(messages);
@@ -356,19 +389,19 @@ mod tests {
 
     fn config() -> LlmConfig {
         LlmConfig {
-            backend: LlmBackend::Glm,
-            model: "glm-5.2".to_owned(),
+            backend: LlmBackend::Ollama,
+            model: "gpt-oss:120b".to_owned(),
             temperature: 0.2,
             max_tokens: 256,
         }
     }
 
-    /// A minimal test price table keyed on `glm-5.2` (README C5), CNY-native.
+    /// A minimal test price table keyed on `gpt-oss:120b` (README C5), CNY-native.
     /// These are TEST values, not the production moat data (decision 4).
     fn prices() -> PriceTable {
         let mut models = HashMap::new();
         models.insert(
-            "glm-5.2".to_owned(),
+            "gpt-oss:120b".to_owned(),
             ModelPrice {
                 input_per_mtok: Decimal::from(2),
                 output_per_mtok: Decimal::from(8),
@@ -420,7 +453,7 @@ mod tests {
             prices(),
         );
         let returned = decorator
-            .chat(prompt, &config())
+            .chat(prompt, &[], &config())
             .await
             .expect("decorator chat succeeds");
         let saved = saved.lock().expect("saved lock").clone();
@@ -522,6 +555,45 @@ mod tests {
         assert!(sent.contains(TAGGED_SECRET));
     }
 
+    /// FIX C: the at-rest scrubber shares the compose-time prefix heuristic, so a
+    /// `xox`-prefixed (Slack-style) token is redacted from the PERSISTED copy even
+    /// with NO tagged secrets. Before the unification the at-rest test only matched
+    /// `sk-`/≥32-char, so a `xoxb-…` token LEAKED at rest — this guards the
+    /// "never weaker than compose-time" property.
+    ///
+    /// The fixture carries a REAL Slack token shape: PR #93 review tightened the
+    /// heuristic so a bare `xox` prefix no longer matches on its own (`xoxo` in a
+    /// trader's prose must survive), which a toy 18-char fixture would not exercise.
+    #[tokio::test]
+    async fn at_rest_scrubber_redacts_prefixed_secret_tokens() {
+        // Assembled from fragments so the literal never appears whole in source:
+        // GitHub push protection matches the real `xox<type>-…` pattern and would
+        // (correctly) block a verbatim fixture.
+        const SLACK_TOKEN: &str = concat!("xoxb", "-2401234567-1234567890123-AbCdEfGhIjKlMnOp");
+        let prompt = vec![Message::user(format!("token {SLACK_TOKEN} here"))];
+        // Redactor::default() has NO tagged secrets — only the structural heuristic
+        // can catch this, so the assertion proves the heuristic (not a tagged value).
+        let driven = drive(
+            prompt,
+            Redactor::default(),
+            response("ok", 3, 1),
+            1_700_000_000_000,
+        )
+        .await;
+
+        let stored = user_text(&driven.saved[0].prompt_messages[0]);
+        assert!(
+            !stored.contains(SLACK_TOKEN),
+            "at-rest scrubber leaked the prefixed token: {stored}"
+        );
+        assert!(
+            stored.contains(REDACTED),
+            "token not redacted at rest: {stored}"
+        );
+        // surrounding words survive.
+        assert!(stored.contains("token") && stored.contains("here"));
+    }
+
     #[tokio::test]
     async fn persists_llm_call_with_cost_and_tokens() {
         let prompt = vec![Message::user("size a long")];
@@ -536,14 +608,14 @@ mod tests {
 
         assert_eq!(driven.saved.len(), 1, "exactly one ledger row persisted");
         let call = &driven.saved[0];
-        assert_eq!(call.backend, LlmBackend::Glm);
-        assert_eq!(call.model, "glm-5.2");
+        assert_eq!(call.backend, LlmBackend::Ollama);
+        assert_eq!(call.model, "gpt-oss:120b");
         assert_eq!(call.input_tokens, 1500);
         assert_eq!(call.output_tokens, 500);
         // cost is the price-table figure, in native currency (no silent FX).
         let expected = prices()
             .cost(
-                "glm-5.2",
+                "gpt-oss:120b",
                 &TokenUsage {
                     input_tokens: 1500,
                     output_tokens: 500,
@@ -579,7 +651,10 @@ mod tests {
 
         // 1500/1e6 * 2  +  500/1e6 * 8  =  0.003 + 0.004  =  0.007 CNY.
         let call = &driven.saved[0];
-        assert_eq!(call.cost, prices().cost("glm-5.2", &usage).expect("cost"));
+        assert_eq!(
+            call.cost,
+            prices().cost("gpt-oss:120b", &usage).expect("cost")
+        );
         assert_eq!(call.cost.normalize(), Decimal::new(7, 3).normalize());
         assert_eq!(call.cost_currency, "CNY");
     }
@@ -626,17 +701,17 @@ mod tests {
             repo,
             FakeClock::at(1_700_000_000_000),
             Redactor::default(),
-            prices(), // keyed on "glm-5.2" only
+            prices(), // keyed on "gpt-oss:120b" only
         );
         let cfg = LlmConfig {
-            backend: LlmBackend::Glm,
+            backend: LlmBackend::Ollama,
             model: "unpriced-model".to_owned(),
             temperature: 0.2,
             max_tokens: 64,
         };
 
         let err = decorator
-            .chat(vec![Message::user("hi")], &cfg)
+            .chat(vec![Message::user("hi")], &[], &cfg)
             .await
             .expect_err("an unpriced model must error");
         assert!(
@@ -651,5 +726,63 @@ mod tests {
             saved.lock().expect("saved lock").is_empty(),
             "no ledger row may be written when the model is unpriced"
         );
+    }
+
+    /// Extract the first tool call's `arguments` `Value` from an `Assistant` message.
+    fn assistant_tool_call_args(message: &Message) -> &serde_json::Value {
+        match message {
+            Message::Assistant { tool_calls, .. } => &tool_calls[0].arguments,
+            other => panic!("expected an Assistant message, got {other:?}"),
+        }
+    }
+
+    /// AC-8 (#81 proof): the decorator scrubs `Assistant.tool_calls[i].arguments`
+    /// in the PERSISTED copy. A secret nested inside a JSON string leaf of a tool
+    /// call's arguments is redacted at rest (via the recursive `redact_value`),
+    /// while the inner provider still received the arguments in the CLEAR (OQ-A).
+    /// Non-secret structural params (numbers) survive verbatim.
+    #[tokio::test]
+    async fn redacts_tool_call_arguments() {
+        // An Assistant turn in the PROMPT carrying a tool call whose arguments embed
+        // BOTH a structural api-key-shaped token AND a caller-tagged secret, NESTED
+        // inside a JSON object (proves the redactor recurses into string leaves).
+        let arguments = serde_json::json!({
+            "config": {
+                "note": format!("use {FAKE_KEY} and {TAGGED_SECRET}"),
+            },
+            "size": 1000,
+        });
+        let prompt = vec![Message::Assistant {
+            content: Some("calling a tool".to_owned()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_owned(),
+                name: "set_risk".to_owned(),
+                arguments: arguments.clone(),
+            }],
+        }];
+        let redactor = Redactor::from_config(vec![TAGGED_SECRET.to_owned()]);
+        let driven = drive(prompt, redactor, response("ok", 5, 1), 1_700_000_000_000).await;
+
+        // (i) the PERSISTED tool-call arguments have BOTH secrets scrubbed ...
+        let stored_args = assistant_tool_call_args(&driven.saved[0].prompt_messages[0]);
+        let stored_str = stored_args.to_string();
+        assert!(
+            !stored_str.contains(FAKE_KEY),
+            "persisted args leak the api key: {stored_str}"
+        );
+        assert!(
+            !stored_str.contains(TAGGED_SECRET),
+            "persisted args leak the tagged secret: {stored_str}"
+        );
+        assert!(
+            stored_str.contains(REDACTED),
+            "persisted args not redacted: {stored_str}"
+        );
+        // ... while a non-secret numeric param survives (we did NOT strip numbers).
+        assert_eq!(stored_args["size"], serde_json::json!(1000));
+
+        // (ii) OQ-A: the inner provider received the UN-redacted arguments in the clear.
+        let sent_args = assistant_tool_call_args(&driven.received[0][0]);
+        assert_eq!(sent_args, &arguments);
     }
 }

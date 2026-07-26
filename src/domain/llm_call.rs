@@ -58,9 +58,9 @@ impl LlmCallId {
 pub struct LlmCall {
     /// Primary key (adapter-generated).
     pub id: LlmCallId,
-    /// Which backend served the call (stored as its serde tag, e.g. `"glm"`).
+    /// Which backend served the call (stored as its serde tag, e.g. `"ollama"`).
     pub backend: LlmBackend,
-    /// The model id, e.g. `"glm-5.1"`.
+    /// The model id, e.g. `"glm-5.2"`.
     pub model: String,
     /// The VERBATIM prompt AFTER redaction (NFR-6) — what we persist.
     pub prompt_messages: Vec<Message>,
@@ -105,8 +105,8 @@ mod tests {
     fn llm_call_roundtrips_verbatim_and_stays_native_currency() {
         let call = LlmCall {
             id: LlmCallId::new("call-1"),
-            backend: LlmBackend::Glm,
-            model: "glm-5.1".to_owned(),
+            backend: LlmBackend::Ollama,
+            model: "glm-5.2".to_owned(),
             prompt_messages: vec![Message::system("be terse"), Message::user("hello")],
             completion: Some("hi".to_owned()),
             input_tokens: 12,
@@ -122,7 +122,7 @@ mod tests {
         // native currency + verbatim prompt survived the round-trip.
         assert_eq!(back.cost_currency, "CNY");
         assert_eq!(back.prompt_messages.len(), 2);
-        assert_eq!(back.backend, LlmBackend::Glm);
+        assert_eq!(back.backend, LlmBackend::Ollama);
     }
 
     #[test]

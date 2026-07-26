@@ -40,6 +40,11 @@ pub(crate) mod sizing;
 // curated `lib.rs` surface can re-export via the `domain::strategy::` path — the
 // types still leave the crate only through the explicit `pub use` re-exports.
 pub(crate) mod strategy;
+// VS-1.3.2 slice-close FIX C: the ONE structural secret-token heuristic shared by
+// the compose-time redactor (`agent::composer`) AND the at-rest ledger scrubber
+// (`adapters::llm::redacting_logging`), so the persisted copy is never weaker than
+// the compose-time scrub. Pure string logic, zero-I/O — a domain-kernel utility.
+mod secret;
 mod timeframe;
 mod version;
 
@@ -103,6 +108,11 @@ pub use port::{
     BacktestRunRepository, ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource,
     StrategyRepository,
 };
+// VS-1.3.2 slice-close FIX C: the shared secret-token heuristic. `pub(crate)` (an
+// internal cross-ring utility, not a public API surface) — used by the composer
+// (agent ring) + the redacting-logging decorator (adapters ring), so it is never
+// dead code under `deny(warnings)`.
+pub(crate) use secret::looks_like_secret_token;
 // VS-1.3.1 work-1.01: the LLM domain ring surface (FR-23 / FR-24, README C2–C5).
 // The message/response/usage/config value types + the dedicated `LlmError` + the
 // pure cost model (`ModelPrice`/`PriceTable`), and the `LlmCall` ledger entity +
@@ -113,6 +123,11 @@ pub use llm::{
     LlmBackend, LlmConfig, LlmError, LlmResponse, Message, ModelPrice, PriceTable, TokenUsage,
     ToolCall,
 };
+// VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
+// Appended as its own line (NOT folded into the block above) so the parallel 2.03
+// re-export additions merge cleanly. Re-exported here so `lib.rs` can curate the
+// crate surface — an un-re-exported public domain type is a `dead_code` BUILD error.
+pub use llm::ToolDefinition;
 pub use llm_call::{LlmCall, LlmCallId};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the
