@@ -75,9 +75,15 @@ Call the tools one at a time, in this order:
 1. `create_strategy` → `{ "name": "RSI Oversold Bounce BTC", "direction": "long" }`
 2. `add_entry_signal` → `{ "left": { "source": "indicator", "indicator": "rsi", "period": 14 }, "op": "lt", "right": { "source": "constant", "value": "30" } }`
 3. `add_filter` → `{ "left": { "source": "price", "price_field": "close" }, "op": "gt", "right": { "source": "indicator", "indicator": "ema", "period": 200 } }`
-4. `set_exit_rules` → `{ "stop_loss_pct": "0.05", "take_profit_r": "2.0" }`
+4. `set_exit_rules` → `{ "stop_loss_pct": "0.015", "take_profit_r": "2.0" }`
 5. `set_risk_params` → `{ "risk_per_trade_pct": "0.01", "max_leverage": "3" }`
 6. `finalize_strategy` → `{}`
+
+This target names no RSI threshold, EMA period, stop distance, risk, or
+leverage, so every such value above is read from the **documented conservative
+defaults** at the end of this prompt — `30`, `200`, `"0.015"`, `"0.01"`, `"3"`.
+That is what using a default looks like; do the same rather than inventing a
+number.
 
 If a tool returns a `FieldError`, its `path` names the exact field to fix — e.g. `right.source` means the **right** operand is missing its `source`; `left.period` means the left indicator needs a numeric `period`. Correct only that field and call the same tool again.
 
@@ -131,14 +137,18 @@ When the target does not specify a value, use these documented defaults. These
 are conservative starting points, not computed figures:
 
 - RSI period: `14`
-- Stop-loss distance: `1.5%` of entry
-- Risk per trade: `1%` of account equity
+- RSI oversold threshold: `30` · RSI overbought threshold: `70`
+- Trend-filter EMA period: `200`
+- ADX period: `14` · ADX trend-strength threshold: `25`
+- Stop-loss distance: `1.5%` of entry (`"0.015"`)
+- Risk per trade: `1%` of account equity (`"0.01"`)
 - Take-profit: a `2.0` reward-to-risk multiple of the stop distance
 - Maximum leverage: `3`
 
-`set_risk_params` REQUIRES `max_leverage`, so when the target does not name a
-leverage, use the documented `3` above — that is a default, not a fabricated
-number.
+Every value in the worked example above comes from this list or from the target
+itself — that is the standard to hold yourself to. `set_risk_params` REQUIRES
+`max_leverage`, so when the target does not name a leverage, use the documented
+`3`. Reading a value off this list is using a default, not fabricating one.
 
 ## Lens scope
 

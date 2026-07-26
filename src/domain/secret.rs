@@ -37,29 +37,60 @@ const AWS_BODY_LEN: usize = 16;
 /// long mixed-alphanumeric run — session/API tokens).
 const GENERIC_MIN_LEN: usize = 32;
 
+/// Minimum length of a separator-delimited SEGMENT that must also mix letters and
+/// digits for a separator-bearing token to read as opaque (see
+/// [`looks_like_opaque_run`]).
+const OPAQUE_SEGMENT_MIN_LEN: usize = 8;
+
 /// Whether a `[A-Za-z0-9_-]` token looks like an API key / secret: it matches a
 /// known credential SHAPE (prefix **and** the length/charset that family
-/// carries), OR it is a long unbroken alphanumeric run holding BOTH a letter and
-/// a digit (an opaque high-entropy token).
+/// carries), or it reads as a long opaque high-entropy run.
 ///
 /// Deliberately conservative so strategy words and plain numbers survive:
 /// pure-digit numbers (`12345`), prose (`crossover`), and hyphenated strategy
 /// phrases (`EMA-200-crossover-with-RSI-14`) never match.
 #[must_use]
 pub(crate) fn looks_like_secret_token(token: &str) -> bool {
-    if matches_credential_shape(token) {
+    matches_credential_shape(token) || looks_like_opaque_run(token)
+}
+
+/// Whether `token` reads as a long opaque credential rather than human text.
+///
+/// Both directions matter here, and a naive charset rule gets one of them wrong:
+///
+/// - Requiring EVERY character to be alphanumeric spares hyphenated strategy
+///   phrases, but silently stops redacting **base64url** credentials — whose
+///   alphabet is exactly `[A-Za-z0-9_-]` (PR #93 review).
+/// - Allowing separators unconditionally redacts
+///   `EMA-200-crossover-with-RSI-14-filter`, because the composer's tokenizer
+///   keeps `-`/`_` INSIDE a run, so that phrase arrives as one 36-char token.
+///
+/// The discriminator is what the separators DELIMIT. A human-readable phrase
+/// splits into word-like segments that are each pure-alphabetic or pure-numeric
+/// (`EMA` / `200` / `crossover`). An opaque credential carries at least one long
+/// segment that MIXES letters and digits. So a separator-bearing token counts as
+/// opaque only when such a segment is present.
+///
+/// Still imperfect in the other direction: an unbroken human-readable identifier
+/// (`EMA200CrossoverWithRSI14TrendFilter`) has no separators to inspect and is
+/// classified as opaque. That residual false positive needs real entropy
+/// evidence rather than shape, and is tracked separately.
+fn looks_like_opaque_run(token: &str) -> bool {
+    if token.len() < GENERIC_MIN_LEN {
+        return false;
+    }
+    if !token.chars().any(|c| c.is_ascii_alphabetic()) || !token.chars().any(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    if !token.contains(['-', '_']) {
         return true;
     }
-    // Generic opaque token: an UNBROKEN alphanumeric run. Requiring no `-`/`_`
-    // is what keeps a long hyphenated strategy phrase from being mistaken for a
-    // 32-char opaque secret — the composer's tokenizer treats `-`/`_` as token
-    // characters, so `EMA-200-crossover-with-RSI-14-filter` arrives here as ONE
-    // 36-char run. Real separator-bearing credentials all carry a recognizable
-    // prefix and are caught above.
-    token.len() >= GENERIC_MIN_LEN
-        && token.chars().all(|c| c.is_ascii_alphanumeric())
-        && token.chars().any(|c| c.is_ascii_alphabetic())
-        && token.chars().any(|c| c.is_ascii_digit())
+    token.split(['-', '_']).any(|segment| {
+        segment.len() >= OPAQUE_SEGMENT_MIN_LEN
+            && segment.chars().any(|c| c.is_ascii_alphabetic())
+            && segment.chars().any(|c| c.is_ascii_digit())
+    })
 }
 
 /// Whether `token` matches a known credential family in FULL — prefix plus the
@@ -130,6 +161,24 @@ mod tests {
         assert!(looks_like_secret_token(
             "abcdEFGH1234abcdEFGH1234abcdEFGH1234"
         ));
+    }
+
+    /// PR #93 review: a base64url credential's alphabet is exactly
+    /// `[A-Za-z0-9_-]`, so an "all characters must be alphanumeric" rule would
+    /// silently stop redacting unprefixed session/API tokens — a detection hole,
+    /// the opposite failure from the strategy-phrase false positive below.
+    #[test]
+    fn matches_unprefixed_base64url_credentials() {
+        for token in [
+            "v1_9fK2mQ7xR4tZ8pL3nW6yB1cV5sD0gH-jN2kM4qP",
+            "dGhpc2lz-YVRlc3QxMjM0NTY3ODkw_QWJjRGVmR2hJ",
+            "9fK2mQ7xR4tZ8pL3nW6yB1cV5sD0gHjN-kM4qP7rS2t",
+        ] {
+            assert!(
+                looks_like_secret_token(token),
+                "separator-bearing credential must still be redacted: {token}"
+            );
+        }
     }
 
     #[test]
