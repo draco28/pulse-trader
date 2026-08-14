@@ -1,0 +1,51 @@
+name: Code Review Trigger
+
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-review-trigger-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Request code review
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Mint a scoped App token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.PULSEAI_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.PULSEAI_DISPATCH_PRIVATE_KEY }}
+          owner: pulseai-labs
+          repositories: pulse-trader-internal
+          permission-actions: write
+
+      - name: Dispatch to pulse-trader-internal
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR: ${{ github.event.pull_request.number || 0 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::bad sha"; exit 1; }
+          printf '%s' "$PR"  | grep -Eq '^[0-9]{1,10}$'  || { echo "::error::bad pr"; exit 1; }
+          gh api -X POST \
+            /repos/pulseai-labs/pulse-trader-internal/actions/workflows/droid.yml/dispatches \
+            -f ref=main \
+            -f "inputs[sha]=$SHA" \
+            -f "inputs[pr]=$PR"
+          echo "requested code review for $SHA (PR #$PR)"
+
+      - name: Note where the result appears
+        run: |
+          echo "Code review runs in pulse-trader-internal and comments back on this PR." >>"$GITHUB_STEP_SUMMARY"
+          echo "Run log: https://github.com/pulseai-labs/pulse-trader-internal/actions" >>"$GITHUB_STEP_SUMMARY"
