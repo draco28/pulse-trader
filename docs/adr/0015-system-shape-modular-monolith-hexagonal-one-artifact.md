@@ -25,6 +25,15 @@ A **modular monolith** with **hexagonal (ports-and-adapters)** discipline: ports
 traits in the domain layer, adapters implement them, and dependency direction is
 always inward.
 
+**The invariant holds for most external concerns, not all — and the exception is
+named rather than glossed.** `src/domain/port.rs` defines `ExchangeAdapter`,
+`MarketDataSource`, `StrategyRepository`, `BacktestRunRepository`, `LlmProvider` and
+`LlmCallRepository`. **Candle storage has no port**: the `CandleSeriesRepository` trait
+ADR-0002 named was never built, and the CLI imports and constructs the concrete
+`CandleStore` adapter directly. So the current candle path is the one place that does
+*not* satisfy this decision, and a contributor should not read it as the compliant
+pattern. Closing that gap is tracked in **#112**.
+
 **The domain invariant is "zero I/O", not "zero dependencies"** — `src/domain/mod.rs`
 states that policy explicitly. Domain types freely use `serde`, `rust_decimal`,
 `chrono` and `thiserror`; `rust_decimal::Decimal` appears directly in port
