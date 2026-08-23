@@ -53,11 +53,11 @@ not use.
 
 ## Relationship to the ADR-0001 decision queue
 
-`0001-record-architecture-decisions.md` carries a decision index listing
-**ADR-0002** (hexagonal), **ADR-0003** (single Tauri shell, zero sidecars) and
-**ADR-0004** (PulseHive as the in-Rust agent framework) as *Proposed* placeholders
-never written up. This ADR is where two of those land, and leaving the index
-unreconciled would give the same architecture two live statuses:
+`0001-record-architecture-decisions.md` carries a decision index that listed
+**ADR-0002** (hexagonal), **ADR-0003** (Tauri shell, zero sidecars) and **ADR-0004**
+(PulseHive as the in-Rust agent framework) as placeholders never written up. That
+index is now reconciled and is authoritative: 0002 and 0004 are **superseded**, and
+**only ADR-0003 remains `Proposed`**. This ADR is where two of the three land:
 
 - **ADR-0002 (hexagonal)** — written up here. Superseded.
 - **ADR-0003 (zero sidecars)** — the zero-sidecar half is written up here and

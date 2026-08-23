@@ -16,7 +16,12 @@ standing decision, it does not introduce one.)
 ## Context
 
 The agent loop sends provider credentials upstream and persists an `LlmCall`
-provenance ledger containing model inputs and outputs. Both are disclosure surfaces. v1
+provenance ledger containing model inputs and **text** outputs — `LlmCall` has no
+`tool_calls` field and `RedactingLoggingProvider` persists only `response.content`, so
+a tool-calls-only response (the normal compose flow, including the terminal
+`finalize_strategy` turn) leaves no completion in the ledger at all. That provenance
+gap is tracked as **#96**; what matters here is that the ledger is a disclosure surface
+for what it *does* hold. Both are disclosure surfaces. v1
 is backtest-only: no code path places an order or moves funds.
 
 ## Decision

@@ -20,12 +20,20 @@ licence (PolyForm Noncommercial 1.0, see `LICENSE`) restricts commercial use;
 
 - **Secrets, in any committed file.** No API keys, no tokens, no credentials in
   any tracked file, any branch, or any test fixture. At runtime a credential
-  reaches the process through exactly three channels — the **macOS Keychain**,
-  the **process environment**, or a **gitignored `.env`** (checked in that
-  order). The environment and `.env` are both plaintext and both supported
-  development paths, so the rule is *never committed*, not *never on disk*.
-  Keep `.env` out of the index and out of every diff, and keep exported
-  credentials out of shell history and CI logs. Persisted LLM records are redacted before they are written by
+  reaches the process through the **macOS Keychain**, the **process
+  environment**, or a **gitignored `.env`** — and **which sources a command
+  consults is per-command, not a global fallback chain**:
+
+  - `pulse compose` reads `OLLAMA_API_KEY` from the process environment, then
+    from `.env`. It never consults the Keychain.
+  - `pulse llm-check` reads the Keychain only. It never consults the
+    environment or `.env`.
+
+  So configuring one channel does not make every command work. The environment
+  and `.env` are both plaintext and both supported development paths, so the
+  rule is *never committed*, not *never on disk*: keep `.env` out of the index
+  and out of every diff, and keep exported credentials out of shell history and
+  CI logs. Persisted LLM records are redacted before they are written by
   the shipped composition roots.
 - **Tuned runtime data.** Some configuration shipped here as a working default
   is superseded at runtime by an operator-supplied override directory. The
