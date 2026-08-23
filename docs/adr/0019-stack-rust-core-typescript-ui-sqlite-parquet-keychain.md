@@ -4,14 +4,17 @@ Date: 2026-08-23T00:00:00Z
 
 ## Status
 
-Accepted
+**Accepted** for the backend and storage stack. **Proposed** for the desktop stack.
 
-(Accepted at adoption. This decision was made and exercised under the scaffold-dev
-stack across sprints 1.1-1.3; `/ossify:adopt` recorded it as a bone on 2026-08-23
-against baseline `49f229a`. Per ossify's bones protocol, decisions the adopted
-baseline already exercises are minted `Accepted`, not `Proposed` — the baseline
-*is* the release that exercised them. Retrospective record: it documents a
-standing decision, it does not introduce one.)
+(Recorded at adoption on 2026-08-23 against baseline `49f229a`. Ossify's bones
+protocol mints a decision `Accepted` when the adopted baseline already exercises it —
+and that is true of only half of this one. The Rust core, SQLite/WAL, Parquet,
+Keychain and filesystem tiers are exercised by three sprints of shipped work. The
+**desktop stack is not**: the tree at this baseline contains no TypeScript files, no
+package manifest, and no Tauri, React, Vite or tauri-specta dependency, and
+`src/tauri/mod.rs` is an explicit empty stub. Marking those choices retrospectively
+validated would mislead exactly the implementation and release planning that reads
+this registry, so they stay `Proposed` until v1.5 exercises them.)
 
 ## Context
 
@@ -20,12 +23,19 @@ runtime. Python was eliminated when PulseHive made in-Rust agent orchestration v
 
 ## Decision
 
-**Rust** for the core engine, agent orchestration and Tauri backend; **TypeScript
-(React + Vite)** for the UI in Tauri's WebView, glued by the Tauri command bus with
-types generated via tauri-specta. Storage is four tiers: **SQLite** (WAL, single file)
-for entities and event logs with sqlx migrations; **Parquet** for immutable
-`CandleSeries`; the **macOS Keychain** for secrets; the **filesystem** for logs and
-exports. No Postgres, no Redis, no separate vector database.
+**Exercised at this baseline (Accepted).** **Rust** for the core engine and agent
+orchestration. Storage in four tiers: **SQLite** (WAL, single file) for entities and
+event logs with sqlx migrations; **Parquet** for immutable `CandleSeries`; the
+**macOS Keychain** for secrets; the **filesystem** for logs and exports. No Postgres,
+no Redis, no separate vector database.
+
+**Not yet exercised (Proposed).** **TypeScript (React + Vite)** for the UI in Tauri's
+WebView, a Tauri backend in the same Rust crate, glued by the Tauri command bus with
+types generated via **tauri-specta**. None of this exists at `49f229a` — it is the
+v1.5 shell, and the hexagonal layout (`src/tauri/mod.rs`, pinned as an empty stub at
+WI-01) is the only thing reserving space for it. Treat it as a direction, not a
+settled contract: the first slice that actually builds the shell may revisit it, and
+doing so is not a bone violation.
 
 ## Consequences
 

@@ -20,9 +20,12 @@ page, and no operator other than the person who typed the command.
 
 ## Decision
 
-Failures surface as **typed domain errors** rendered at the CLI edge. Structured
-tracing is **deliberately deferred** — the `eprintln!`-vs-`tracing` question was
-parked at the VS-1.2.4 close rather than answered.
+Domain and adapter layers use **typed errors**. The **CLI edge does not preserve
+them**: `cli::run() -> anyhow::Result<()>`, and the verbs convert with
+`anyhow::anyhow!("<context>: {e}")`, which stringifies and discards the variant. The
+operator gets a contextual message; a caller cannot branch by variant at that
+boundary. Structured tracing is **deliberately deferred** — the `eprintln!`-vs-
+`tracing` question was parked at the VS-1.2.4 close rather than answered.
 
 ## Consequences
 

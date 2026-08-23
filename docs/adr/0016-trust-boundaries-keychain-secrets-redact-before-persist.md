@@ -21,10 +21,23 @@ is backtest-only: no code path places an order or moves funds.
 
 ## Decision
 
-Secrets live in the macOS Keychain (or a gitignored `.env` for the Ollama transport)
-and are injected as constructor arguments — never a committed config file, never baked
-into the binary, never plaintext on disk. Every `LlmCall` is redacted **before**
-persistence. **No order-placing or fund-moving path ships in v1**; the money risk gate
+Secrets are injected as constructor arguments and never appear in a committed file,
+in the binary, or in a log.
+
+**Two storage paths, and they are not equally strong.** The macOS Keychain is the
+intended one. The Ollama transport instead reads `OLLAMA_API_KEY` from the environment
+or a **gitignored `.env`** — which *is* plaintext on disk. That is a deliberate
+development-path exception rather than an oversight: the Keychain path is currently
+unreachable on a fresh install (ADOPTION.md gap 1), so `.env` is the only working path
+today. The guarantee here is therefore **"never in a committed artifact"**, not "never
+plaintext on disk".
+
+**Redaction is enforced by the composition root, not by the persistence boundary.**
+`RedactingLoggingProvider` scrubs before writing and every shipped composition root
+routes through it. But `SqliteLlmCallRepo` is publicly exported (`src/lib.rs`) and its
+`save_call` serializes `prompt_messages` and copies `completion` verbatim, so a caller
+constructing it directly can persist an unredacted `LlmCall`. The guarantee holds for
+the current composition roots and is **not** enforced at the write boundary. **No order-placing or fund-moving path ships in v1**; the money risk gate
 arrives with live execution, not before.
 
 ## Consequences
