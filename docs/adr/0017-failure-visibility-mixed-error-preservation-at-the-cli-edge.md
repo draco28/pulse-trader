@@ -1,4 +1,4 @@
-# 17. Failure visibility: contextual string errors at the CLI edge; structured tracing deferred
+# 17. Failure visibility: mixed error preservation at the CLI edge; structured tracing deferred
 
 Date: 2026-08-23T00:00:00Z
 

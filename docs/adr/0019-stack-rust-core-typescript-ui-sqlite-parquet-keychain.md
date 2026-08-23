@@ -17,8 +17,10 @@ everything this ADR decides and of nothing it excludes.)
 
 ## Context
 
-Two languages, chosen so the deterministic engine and the agent orchestration share one
-runtime. Python was eliminated when PulseHive made in-Rust agent orchestration viable.
+One language for everything this baseline ships, so the deterministic engine and the
+agent loop share a runtime. Python was eliminated when in-Rust agent orchestration
+became viable. A second language for the UI is anticipated but **not decided here** —
+see *Deliberately out of scope*.
 
 ## Decision
 
@@ -28,10 +30,18 @@ entities and event logs with sqlx migrations, and **Parquet** for immutable
 `CandleSeries`.
 
 **"Embedded", not "single-file".** `Db::with_path` unconditionally selects
-`SqliteJournalMode::Wal`, so the database is `pulse.db` **plus** its `-wal` and `-shm`
-companions (the repo's `.gitignore` handles both). While the database is open or holds
-uncheckpointed frames, copying `pulse.db` alone can omit committed transactions — so
-any backup, export or packaging path must take all three, or checkpoint first. No Postgres, no Redis, no separate vector database.
+`SqliteJournalMode::Wal`, so on disk the database is `pulse.db` **plus** its `-wal` and
+`-shm` companions (the repo's `.gitignore` handles both), and copying `pulse.db` alone
+can omit committed transactions.
+
+**Copying the three files is not the remedy.** Read as ordinary separate files they are
+not guaranteed to represent the same instant, and a manual checkpoint races any
+subsequent write unless the database is quiesced. `src/adapters/db/migrate.rs` already
+names the right tool: **`VACUUM INTO`**, SQLite's first-class consistent-backup
+primitive — *"WAL-safe by construction (no manual `wal_checkpoint`, no `-wal`/`-shm`
+sidecar copy, no torn snapshot)"*. Any backup, export or packaging path must use
+`VACUUM INTO`, an atomic filesystem snapshot, or an exclusive shutdown — never a
+file-by-file copy of a live database. No Postgres, no Redis, no separate vector database.
 
 ## Deliberately out of scope
 
@@ -40,12 +50,15 @@ the baseline does not exercise any of them. Each needs its own ADR when somethin
 does. They are listed so the omission reads as deliberate rather than forgotten.
 
 - **Keychain provisioning.** The Keychain is the intended secret store (ADR-0016) and
-  the read path is implemented and tested, but no credential can be *provisioned*
+  a read path exists, but no credential can be *provisioned*
   through the shipped application: `keyring` binds the code-identity-scoped
   data-protection keychain, so only the `pulse` binary can seed a key it can later
   read back, and `pulse setup-keys` does not exist. `src/adapters/secrets.rs` records
   that the live transport was validated by **injecting the key directly**, not through
-  this tier. Secret provisioning is already a Release 1 candidate.
+  this tier. Test coverage is narrower than "implemented and tested" suggests: the only
+  test queries a deliberately absent account and asserts the error mapping, so
+  **successful retrieval is unverified through the shipped application**. Secret
+  provisioning is already a Release 1 candidate.
 - **A filesystem logging / export tier.** No production writer exists: the crate has
   no `tracing` or `log` dependency, `eprintln!` is the CLI warning channel (as
   `src/adapters/db/backtest_run_repo.rs` records, noting the spec names

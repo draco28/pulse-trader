@@ -53,7 +53,9 @@ unreconciled would give the same architecture two live statuses:
 - **ADR-0002 (hexagonal)** — written up here. Superseded.
 - **ADR-0003 (zero sidecars)** — the zero-sidecar half is written up here and
   superseded. The **Tauri desktop shell** half is *not*: it is unbuilt at this
-  baseline and stays Proposed under ADR-0019.
+  baseline. Its Proposed placeholder is **ADR-0003** in ADR-0001's queue, and it needs
+  its own dedicated ADR when a slice builds it — **not** ADR-0019, which scopes itself
+  to the exercised stack and expressly refuses ownership of the shell.
 - **ADR-0004 (PulseHive as the agent framework)** — superseded by **ADR-0012** and
   **ADR-0013**, which chose the opposite of what the queue entry proposed: a thin
   PulseTrader-owned port over PulseHive rather than its agent substrate. The queue
