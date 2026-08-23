@@ -1,20 +1,19 @@
-# 19. Stack: Rust core on SQLite + Parquet today; Keychain, filesystem and the Tauri/TypeScript shell proposed
+# 19. Stack: Rust core with embedded SQLite (WAL) and Parquet storage
 
 Date: 2026-08-23T00:00:00Z
 
 ## Status
 
-**Accepted** for the Rust core, SQLite and Parquet. **Proposed** for the macOS
-Keychain, the filesystem tier and the desktop stack.
+Accepted
 
-(Recorded at adoption on 2026-08-23 against baseline `49f229a`. Ossify's bones
-protocol mints a decision `Accepted` when the adopted baseline already exercises it,
-and this decision splits: the Rust core, SQLite/WAL and Parquet are exercised by
-three sprints of shipped work, while three other components named in the title are
-not. Each is separated in the Decision below with the evidence for why. Marking any
-of them retrospectively validated would mislead exactly the implementation and
-release planning that reads this registry, so each stays `Proposed` until something
-exercises it.)
+(Recorded at adoption on 2026-08-23 against baseline `49f229a`. **This ADR is
+deliberately narrow**: it decides only the stack the adopted baseline actually
+exercises, so it can carry one authoritative status per ADR-0001's vocabulary. The
+Keychain provisioning path, the filesystem logging/export tier and the
+Tauri/TypeScript desktop shell were all named in the original stack plan and are
+**not decided here** — see *Deliberately out of scope* below. Ossify's bones protocol
+mints a decision `Accepted` when the baseline exercises it; that is true of
+everything this ADR decides and of nothing it excludes.)
 
 ## Context
 
@@ -24,36 +23,42 @@ runtime. Python was eliminated when PulseHive made in-Rust agent orchestration v
 ## Decision
 
 **Exercised at this baseline (Accepted).** **Rust** for the core engine and agent
-orchestration. Storage in **two** operational tiers: **SQLite** (WAL, single file) for
+orchestration. Storage in **two** operational tiers: **SQLite** in WAL mode for
 entities and event logs with sqlx migrations, and **Parquet** for immutable
-`CandleSeries`. No Postgres, no Redis, no separate vector database.
+`CandleSeries`.
 
-**Decided but not yet operational — the macOS Keychain.** The Keychain remains the
-intended secret store (ADR-0016) and the read path is implemented and tested, but no
-credential can be *provisioned* through the shipped application: `keyring` binds the
-data-protection keychain, which is scoped by code identity, so only the `pulse` binary
-itself can seed a key it can later read back — and the verb that would do it,
-`pulse setup-keys`, does not exist. `src/adapters/secrets.rs` records that the live
-transport was validated by **injecting the key directly**, not through this tier.
-Counting it among the exercised tiers would repeat exactly the retrospective-validation
-error corrected above for the desktop and filesystem tiers. It becomes operational
-when secret provisioning ships — already a Release 1 feature-map candidate.
+**"Embedded", not "single-file".** `Db::with_path` unconditionally selects
+`SqliteJournalMode::Wal`, so the database is `pulse.db` **plus** its `-wal` and `-shm`
+companions (the repo's `.gitignore` handles both). While the database is open or holds
+uncheckpointed frames, copying `pulse.db` alone can omit committed transactions — so
+any backup, export or packaging path must take all three, or checkpoint first. No Postgres, no Redis, no separate vector database.
 
-**Not yet exercised (Proposed) — the filesystem tier.** Logs and exports were
-specified as a storage tier, and no production writer exists: the crate has no
-`tracing` or `log` dependency at all, `eprintln!` is the CLI warning channel (as
-`src/adapters/db/backtest_run_repo.rs` records, noting the spec names `tracing::warn`
-aspirationally), LLM-call records go to SQLite, and there is no export path. Counting
-it as validated would misdirect storage and release planning. It arrives with the
-structured-logging work ADR-0017 defers.
+## Deliberately out of scope
 
-**Not yet exercised (Proposed) — the desktop stack.** **TypeScript (React + Vite)** for the UI in Tauri's
-WebView, a Tauri backend in the same Rust crate, glued by the Tauri command bus with
-types generated via **tauri-specta**. None of this exists at `49f229a` — it is the
-v1.5 shell, and the hexagonal layout (`src/tauri/mod.rs`, pinned as an empty stub at
-WI-01) is the only thing reserving space for it. Treat it as a direction, not a
-settled contract: the first slice that actually builds the shell may revisit it, and
-doing so is not a bone violation.
+Three components of the original stack plan are **not decided by this ADR**, because
+the baseline does not exercise any of them. Each needs its own ADR when something
+does. They are listed so the omission reads as deliberate rather than forgotten.
+
+- **Keychain provisioning.** The Keychain is the intended secret store (ADR-0016) and
+  the read path is implemented and tested, but no credential can be *provisioned*
+  through the shipped application: `keyring` binds the code-identity-scoped
+  data-protection keychain, so only the `pulse` binary can seed a key it can later
+  read back, and `pulse setup-keys` does not exist. `src/adapters/secrets.rs` records
+  that the live transport was validated by **injecting the key directly**, not through
+  this tier. Secret provisioning is already a Release 1 candidate.
+- **A filesystem logging / export tier.** No production writer exists: the crate has
+  no `tracing` or `log` dependency, `eprintln!` is the CLI warning channel (as
+  `src/adapters/db/backtest_run_repo.rs` records, noting the spec names
+  `tracing::warn` aspirationally), LLM-call records go to SQLite, and there is no
+  export path. It arrives with the structured-logging work ADR-0017 defers.
+- **The Tauri/TypeScript desktop shell** — React + Vite in Tauri's WebView, a Tauri
+  backend, tauri-specta-generated bindings. None of it exists at `49f229a`;
+  `src/tauri/mod.rs` is an empty stub pinned at WI-01 to reserve the layout. It is a
+  direction, not a settled contract, and the first slice that builds it may revisit
+  the choice without violating any bone.
+
+`ARCHITECTURE.md` and `EXECUTIVE-SUMMARY.md` still describe some of these as present;
+that drift is tracked in **#111**.
 
 ## Consequences
 

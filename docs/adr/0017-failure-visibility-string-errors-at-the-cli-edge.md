@@ -20,11 +20,20 @@ page, and no operator other than the person who typed the command.
 
 ## Decision
 
-Domain and adapter layers use **typed errors**. The **CLI edge does not preserve
-them**: `cli::run() -> anyhow::Result<()>`, and the verbs convert with
-`anyhow::anyhow!("<context>: {e}")`, which stringifies and discards the variant. The
-operator gets a contextual message; a caller cannot branch by variant at that
-boundary. Structured tracing is **deliberately deferred** — the `eprintln!`-vs-
+Domain and adapter layers use **typed errors**. The CLI edge is `anyhow`, and
+preservation across it is **mixed rather than uniform** — which is the honest
+statement, and the one a caller has to plan around:
+
+- Verbs that propagate with `?` (e.g. `run_indicators` over `store.read_head`,
+  `store.read_snapshot`, `IndicatorEngine::from_specs`) convert `DataError` and
+  `EngineError` into `anyhow::Error` **preserving the concrete source**, so
+  `downcast_ref` still recovers the variant.
+- Verbs that wrap with a formatting `map_err` — `anyhow::anyhow!("<context>: {e}")`,
+  as in `run_compose` — **stringify and discard** it.
+
+So a caller cannot rely on branching by variant at this boundary, because whether it
+works depends on which verb it went through. `cli::run() -> anyhow::Result<()>` either
+way. Structured tracing is **deliberately deferred** — the `eprintln!`-vs-
 `tracing` question was parked at the VS-1.2.4 close rather than answered.
 
 ## Consequences
