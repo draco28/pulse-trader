@@ -18,10 +18,13 @@ licence (PolyForm Noncommercial 1.0, see `LICENSE`) restricts commercial use;
 
 ## What does not live here
 
-- **Secrets of any kind.** No API keys, no tokens, no credentials, in any file,
-  in any branch, in any test fixture. Secrets are read from the macOS Keychain
-  or a gitignored `.env` at runtime and are redacted before anything is
-  persisted.
+- **Secrets, in any committed file.** No API keys, no tokens, no credentials in
+  any tracked file, any branch, or any test fixture. At runtime a credential is
+  read from the macOS Keychain or from a **gitignored `.env`** — that file is
+  plaintext on disk and is the supported development path, so the rule is
+  *never committed*, not *never on disk*. Keep `.env` out of the index and out
+  of every diff. Persisted LLM records are redacted before they are written by
+  the shipped composition roots.
 - **Tuned runtime data.** Some configuration shipped here as a working default
   is superseded at runtime by an operator-supplied override directory. The
   override mechanism, the file format, and the defaults are public; the tuned

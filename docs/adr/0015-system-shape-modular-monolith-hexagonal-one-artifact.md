@@ -22,8 +22,15 @@ Rust core plus a Python agent sidecar, which the PulseHive decision eliminated.
 ## Decision
 
 A **modular monolith** with **hexagonal (ports-and-adapters)** discipline: ports are
-traits in the domain layer with no external dependencies; adapters implement them;
-dependency direction is always inward. **One shippable artifact**, **zero sidecar
+traits in the domain layer, adapters implement them, and dependency direction is
+always inward.
+
+**The domain invariant is "zero I/O", not "zero dependencies"** — `src/domain/mod.rs`
+states that policy explicitly. Domain types freely use `serde`, `rust_decimal`,
+`chrono` and `thiserror`; `rust_decimal::Decimal` appears directly in port
+signatures. What the domain must not do is perform I/O or reach an external system.
+Recording the stronger dependency-free claim would make compliant changes look like
+architecture violations. **One shippable artifact**, **zero sidecar
 processes**.
 
 **Agent orchestration is first-party and in-process; PulseHive is the transport.**

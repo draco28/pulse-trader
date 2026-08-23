@@ -8,8 +8,8 @@ Date: 2026-08-23T00:00:00Z
 
 (Recorded at adoption on 2026-08-23 against baseline `49f229a`. Ossify's bones
 protocol mints a decision `Accepted` when the adopted baseline already exercises it —
-and that is true of only half of this one. The Rust core, SQLite/WAL, Parquet,
-Keychain and filesystem tiers are exercised by three sprints of shipped work. The
+and that is true of only half of this one. The Rust core, SQLite/WAL, Parquet
+and Keychain tiers are exercised by three sprints of shipped work. The
 **desktop stack is not**: the tree at this baseline contains no TypeScript files, no
 package manifest, and no Tauri, React, Vite or tauri-specta dependency, and
 `src/tauri/mod.rs` is an explicit empty stub. Marking those choices retrospectively

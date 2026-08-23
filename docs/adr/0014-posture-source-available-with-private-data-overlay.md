@@ -18,7 +18,7 @@ standing decision, it does not introduce one.)
 The canonical repo `pulseai-labs/pulse-trader` is public under PolyForm Noncommercial
 1.0; the AI workspace `pulse-trader-internal` is private. VS-1.3.2 work item 2.03
 deliberately built a *moat-in-data* config seam: the composer prompt and the
-per-model price table load from `\$PULSE_PROMPT_DIR` / `\$PULSE_CONFIG_DIR`
+per-model price table load from `$PULSE_PROMPT_DIR` / `$PULSE_CONFIG_DIR`
 overrides, falling back to compiled-in defaults. Ossify adoption requires an explicit
 posture; absence would have to resolve `fully-private`, which contradicts a repo that
 is already public.
@@ -26,9 +26,12 @@ is already public.
 ## Decision
 
 Posture is **source-available**, with a **data-overlay** moat channel seamed at
-`\$PULSE_PROMPT_DIR`. The code is readable and non-commercially usable; the tuned
-prompt and price data are the withheld asset and ship from a private overlay rather
-than from a private code fork. No moat item is named in the public
+**`$PULSE_PROMPT_DIR` and `$PULSE_CONFIG_DIR`**. Both are binding: the tuned composer
+prompt loads through the first and the per-model price table through the second
+(`src/agent/config.rs`), and the withheld asset is both files — naming only the prompt
+override would leave removal of the price-table seam outside this decision. The code
+is readable and non-commercially usable; the tuned prompt and price data ship from a
+private overlay rather than from a private code fork. No moat item is named in the public
 `PUBLIC_BOUNDARY.md`; the inventory lives in the AI workspace.
 
 ## Consequences
