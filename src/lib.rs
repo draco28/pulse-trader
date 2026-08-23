@@ -154,6 +154,27 @@ pub use adapters::store::{CandleStore, SnapshotProvenance};
 pub use cli::fetch_data::{Action, TfOutcome, TfSummary, ensure_one_tf, years_window_start_ms};
 pub use cli::{FetchArgs, run_fetch_data};
 
+// VS-1.3.1 work-1.05: the composition-root demo surface. The OFFLINE e2e test
+// (`tests/llm_roundtrip_cli.rs`, the auto-demo per audit C2) drives the injectable
+// core `run_llm_check_with` over a FAKE provider + a tempfile-`Db` repo (never a
+// live `GlmProvider`, never network/Keychain — MASTER-SPEC §9.4); `LlmCheckOutcome`
+// is the persisted-`LlmCall` + response it returns. `LlmArgs`/`run_llm_check` are
+// the live-arm surface, re-exported like the other `cli::` entrypoints.
+pub use cli::llm::{LlmArgs, LlmCheckOutcome, run_llm_check, run_llm_check_with};
+
+// VS-1.3.2 work-2.05: the `pulse compose` composition-root + demo surface (FR-3 /
+// FR-4 / NFR-6, README C8). The OFFLINE e2e (`tests/compose_cli.rs`, demo criterion
+// 1) drives the injectable core `run_compose_with` over a FAKE provider + the REAL
+// composer + REAL builder tools + a tempfile SQLite repo (never a live LLM —
+// MASTER-SPEC §9.4); `ComposeWiring` bundles the LLM-side deps, `ComposeCliOutcome`
+// is the persisted `StrategyVersion` + provenance it returns. `ComposeArgs` /
+// `run_compose` are the live-arm surface, re-exported like the other `cli::`
+// entrypoints. REQUIRED under `deny(warnings)` — a `pub` item unused outside its
+// private `cli::compose` module is a `dead_code` build error, not a warning.
+pub use cli::compose::{
+    ComposeArgs, ComposeCliOutcome, ComposeWiring, run_compose, run_compose_with,
+};
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
@@ -216,6 +237,15 @@ pub use adapters::db::SqliteStrategyRepo;
 // sufficient). 4.05's CLI consumes it through the `BacktestRunRepository` port.
 // Append-only (keep-both with 1.03's re-export at merge).
 pub use adapters::db::SqliteBacktestRunRepo;
+// VS-1.3.1 work-1.02: the SQLite `LlmCallRepository` adapter. `SqliteLlmCallRepo`
+// implements the FR-24 append-only ledger surface over `query!` (the committed
+// `.sqlx/` cache), `created_at` from an injected `Clock`, Decimal-as-TEXT cost, and
+// a `schema_version` read-reject. REQUIRED under `deny(warnings)` + `pub(crate) mod
+// adapters` — a new public adapter type unused outside its module is a `dead_code`
+// build error (the `db/mod.rs` re-export alone is necessary but NOT sufficient).
+// 1.04's decorator constructs it; 1.05's demo reads a row back. Append-only
+// (keep-both with 1.03's re-export at merge).
+pub use adapters::db::SqliteLlmCallRepo;
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -300,6 +330,66 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // public domain type is a `dead_code` build error, not a warning. 4.05's CLI
 // consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
 pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
+
+// VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The
+// PulseTrader-OWNED `LlmProvider` port + the message/response/usage/config value
+// types + the dedicated `LlmError` + the pure cost model
+// (`ModelPrice`/`PriceTable`) + the `LlmCall` ledger entity + its `LlmCallId`
+// newtype — all free of any `PulseHive` dep (ADR-0012 insulation; AC-8). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported public domain
+// type is a `dead_code` BUILD error, not a warning (the `domain/mod.rs` re-export
+// alone is necessary but NOT sufficient — the harvested dead-code gotcha). 1.02
+// (persistence) + 1.03 (GLM adapter) + 1.04 (redacting-logging decorator) consume
+// these through the `LlmProvider` port + the value/cost types.
+pub use domain::{
+    LlmBackend, LlmCall, LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, Message,
+    ModelPrice, PriceTable, TokenUsage, ToolCall,
+};
+// VS-1.3.2 work-2.01: the additive tool-calling transport type (FR-23 / FR-3).
+// Mirror of the `domain/mod.rs` re-export (REQUIRED — the dead-code gotcha: the
+// module-level re-export alone is necessary but NOT sufficient under
+// `deny(warnings)`). Appended as its own line so the parallel 2.03 additions merge
+// cleanly.
+pub use domain::ToolDefinition;
+// VS-1.3.1 work-1.02: the append-only `LlmCall` persistence port (FR-24, README C6)
+// — create + read only, `DataError::Db`-erroring, immutability structural in the API
+// (enforced by the migration-`0004` triggers). REQUIRED under `deny(warnings)` +
+// `pub(crate) mod domain` — an un-re-exported public domain type is a `dead_code`
+// BUILD error, not a warning (the `domain/mod.rs` re-export alone is necessary but
+// NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
+pub use domain::LlmCallRepository;
+
+// VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
+// the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).
+// `OpenAiCompatProvider` (generalized from 1.03's `GlmProvider`, pointed at Ollama
+// Cloud) is the anti-corruption layer implementing the `LlmProvider` port over the
+// `PulseHive` OpenAI-compatible transport (the ONLY `PulseHive`-importing module —
+// AC-9); `glm_api_key` sources the API key from the login Keychain (READ path only).
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter
+// item unused outside its module is a `dead_code` BUILD error, not a warning. 1.04's
+// decorator composes over the provider; 1.05's composition root injects the key.
+pub use adapters::llm::openai_compat::OpenAiCompatProvider;
+pub use adapters::secrets::glm_api_key;
+
+// VS-1.3.1 work-1.04: the redacting + cost-logging `LlmProvider` decorator
+// (README C7, FR-24 / NFR-6). `RedactingLoggingProvider` wraps any inner provider
+// (1.05 wraps `GlmProvider`), redacts the PERSISTED copy of the prompt/completion
+// (grill OQ-A — the model still gets the real bytes), computes the `Decimal` cost
+// from `usage` times the `PriceTable`, and writes an `LlmCall` through the
+// `LlmCallRepository`; `Redactor` is the scoped, config-driven secret scrubber.
+// REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public
+// adapter type unused outside its module is a `dead_code` BUILD error, not a
+// warning (the `llm/mod.rs` re-export alone is necessary but NOT sufficient).
+pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+
+// VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
+// `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +
+// the streamed `ComposerEvent` + the dedicated `ComposerError` + the `LlmCallCapture`
+// provenance handle. Mirror of the `agent/mod.rs` re-export (REQUIRED — the dead-code
+// gotcha: the module-level `pub use` alone is necessary but NOT sufficient under
+// `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
+// BUILD error). 2.05's `pulse compose` verb + composition root consume these.
+pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

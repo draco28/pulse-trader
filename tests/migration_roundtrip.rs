@@ -4,8 +4,9 @@
 //! Drives 1.04's protocol (`run_migrations_with_backup` / `undo_to`) + 1.01's
 //! `Db` open API through the `pulse::` surface — no new protocol code (§9). The
 //! embedded migration set ships `0001_init` (tables + immutability triggers),
-//! `0002` (the `idx_strategy_name` index), and `0003` (the `backtest_run` + `trade`
-//! system-of-record tables, VS-1.2.4 work-4.03); the embedded max is therefore 3.
+//! `0002` (the `idx_strategy_name` index), `0003` (the `backtest_run` + `trade`
+//! system-of-record tables, VS-1.2.4 work-4.03), and `0004` (the append-only
+//! `llm_call` ledger, VS-1.3.1 work-1.02); the embedded max is therefore 4.
 //!
 //! §4a-4: this uses the EXPORTED `undo_to(&pool, target)` wrapper, NOT
 //! `Migrator::undo` (a crate-root name collision resolving to the DSL document
@@ -88,8 +89,8 @@ async fn migrate_up_then_undo_is_reversible() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        3,
-        "migrated to embedded max (3)"
+        4,
+        "migrated to embedded max (4)"
     );
     assert!(
         object_present(db.pool(), "table", "strategy").await,
@@ -117,7 +118,7 @@ async fn migrate_up_then_undo_is_reversible() {
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 3, "after re-run, max == 3");
+    assert_eq!(applied_max(db.pool()).await, 4, "after re-run, max == 4");
     assert!(
         index_present(db.pool()).await,
         "after re-run, 0002 index back"
@@ -149,7 +150,7 @@ async fn backup_written_before_migrate() {
     match outcome {
         pulse::MigrationOutcome::Migrated { from, to, backup } => {
             assert_eq!(from, 1, "from == the pre-migration version");
-            assert_eq!(to, 3, "to == the embedded max");
+            assert_eq!(to, 4, "to == the embedded max");
             assert!(backup.exists(), "backup file exists: {}", backup.display());
             let name = backup.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
@@ -164,7 +165,7 @@ async fn backup_written_before_migrate() {
 
     // The migration completed to the embedded max.
     let db = Db::with_path(&path).await.expect("reopen migrated db");
-    assert_eq!(applied_max(db.pool()).await, 3, "schema now at 0003");
+    assert_eq!(applied_max(db.pool()).await, 4, "schema now at 0004");
     assert!(
         index_present(db.pool()).await,
         "0002 index present post-migrate"
@@ -195,8 +196,8 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
 
     assert_eq!(
         applied_max(db.pool()).await,
-        3,
-        "migrated to embedded max (3)"
+        4,
+        "migrated to embedded max (4)"
     );
     assert!(
         schema_0003_present(db.pool()).await,
@@ -228,14 +229,80 @@ async fn migration_0003_backtest_run_and_trade_roundtrip() {
         "after undo to 2, the earlier 0002 index survives"
     );
 
-    // (c) re-running brings 0003 back (reversible round): 2 → 3.
+    // (c) re-running brings 0003 back (reversible round): 2 → 4 (0004 rides along).
     MIGRATOR
         .run(db.pool())
         .await
         .expect("re-run to embedded max");
-    assert_eq!(applied_max(db.pool()).await, 3, "after re-run, max == 3");
+    assert_eq!(applied_max(db.pool()).await, 4, "after re-run, max == 4");
     assert!(
         schema_0003_present(db.pool()).await,
         "after re-run, 0003 backtest_run + trade tables and both indexes back"
+    );
+}
+
+// ---- VS-1.3.1 work-1.02: the 0004 llm_call up/down reversibility ------------
+
+/// Whether all three `0004` objects (the table + both immutability triggers +
+/// the index) are present.
+async fn schema_0004_present(pool: &SqlitePool) -> bool {
+    object_present(pool, "table", "llm_call").await
+        && object_present(pool, "trigger", "llm_call_no_update").await
+        && object_present(pool, "trigger", "llm_call_no_delete").await
+        && object_present(pool, "index", "idx_llm_call_created_at").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0004_llm_call_roundtrip() {
+    // (a) a fresh db migrated to the embedded max sits at 0004 with the llm_call
+    //     table, both immutability triggers, and the created_at index present.
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("pulse.db");
+    let db = Db::with_path(&path).await.expect("open fresh db");
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("migrate to embedded max");
+
+    assert_eq!(
+        applied_max(db.pool()).await,
+        4,
+        "migrated to embedded max (4)"
+    );
+    assert!(
+        schema_0004_present(db.pool()).await,
+        "0004 llm_call table + both triggers + index present after up"
+    );
+
+    // (b) undo_to(pool, 3) reverses ONLY 0004 — the llm_call objects are gone, max
+    //     drops to 3, while the 0003 backtest_run table (an earlier step) survives.
+    undo_to(db.pool(), 3).await.expect("undo to 3");
+    assert_eq!(applied_max(db.pool()).await, 3, "after undo, max == 3");
+    assert!(
+        !object_present(db.pool(), "table", "llm_call").await,
+        "after undo to 3, llm_call table gone"
+    );
+    assert!(
+        !object_present(db.pool(), "trigger", "llm_call_no_update").await,
+        "after undo to 3, llm_call_no_update trigger gone"
+    );
+    assert!(
+        !object_present(db.pool(), "index", "idx_llm_call_created_at").await,
+        "after undo to 3, idx_llm_call_created_at gone"
+    );
+    assert!(
+        object_present(db.pool(), "table", "backtest_run").await,
+        "after undo to 3, the earlier 0003 backtest_run table survives"
+    );
+
+    // (c) re-running brings 0004 back (reversible round): 3 → 4.
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("re-run to embedded max");
+    assert_eq!(applied_max(db.pool()).await, 4, "after re-run, max == 4");
+    assert!(
+        schema_0004_present(db.pool()).await,
+        "after re-run, 0004 llm_call table + triggers + index back"
     );
 }

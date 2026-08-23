@@ -468,7 +468,7 @@ mod tests {
         match outcome {
             MigrationOutcome::Migrated { from, to, backup } => {
                 assert_eq!(from, 1, "from must be the pre-migration version");
-                assert_eq!(to, 3, "to must be the embedded max");
+                assert_eq!(to, 4, "to must be the embedded max");
                 assert!(
                     backup.exists(),
                     "backup file must exist: {}",
@@ -486,7 +486,7 @@ mod tests {
         }
 
         let db = Db::with_path(&path).await.expect("reopen db");
-        assert_eq!(applied_max(&db).await, 3, "schema must now be at 0003");
+        assert_eq!(applied_max(&db).await, 4, "schema must now be at 0004");
         assert!(
             index_present(&db).await,
             "idx_strategy_name must exist after migrate"
@@ -512,7 +512,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::AlreadyCurrent { version } => {
-                assert_eq!(version, 3, "version must be the embedded max");
+                assert_eq!(version, 4, "version must be the embedded max");
             }
             other @ MigrationOutcome::Migrated { .. } => {
                 panic!("expected AlreadyCurrent, got {other:?}")
@@ -603,27 +603,27 @@ mod tests {
 
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // run → undo_to(1) → re-run. Index gone then back; max 3→1→3.
+        // run → undo_to(1) → re-run. Index gone then back; max 4→1→4.
         let (_tmp, path) = db_at_0001().await;
 
-        // Up: 1 → 3 (the embedded max, now that 0003 ships).
-        run_migrations_with_backup(&path).await.expect("up to 0003");
+        // Up: 1 → 4 (the embedded max, now that 0004 ships).
+        run_migrations_with_backup(&path).await.expect("up to 0004");
         let db = Db::with_path(&path).await.expect("reopen after up");
-        assert_eq!(applied_max(&db).await, 3, "after run, max == 3");
+        assert_eq!(applied_max(&db).await, 4, "after run, max == 4");
         assert!(index_present(&db).await, "after run, index present");
 
-        // Down: 3 → 1.
+        // Down: 4 → 1.
         undo_to(db.pool(), 1).await.expect("undo to 1");
         assert_eq!(applied_max(&db).await, 1, "after undo, max == 1");
         assert!(!index_present(&db).await, "after undo, index gone");
         drop(db);
 
-        // Re-run: 1 → 3.
+        // Re-run: 1 → 4.
         run_migrations_with_backup(&path)
             .await
-            .expect("re-run to 0003");
+            .expect("re-run to 0004");
         let db = Db::with_path(&path).await.expect("reopen after re-run");
-        assert_eq!(applied_max(&db).await, 3, "after re-run, max == 3");
+        assert_eq!(applied_max(&db).await, 4, "after re-run, max == 4");
         assert!(index_present(&db).await, "after re-run, index back");
     }
 
