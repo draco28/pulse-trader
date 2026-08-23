@@ -1,4 +1,4 @@
-# 18. Evolution: forward-only sqlx migrations, immutable content-addressed snapshots, immutable StrategyVersion
+# 18. Evolution: forward-only migrations on the startup path, immutable content-addressed snapshots, immutable StrategyVersion
 
 Date: 2026-08-23T00:00:00Z
 
@@ -35,7 +35,11 @@ describes the startup path, **not the crate's public API**. Restricting or gatin
 
 ## Consequences
 
-Reproducibility holds by construction and the determinism fingerprint means something.
-The cost is storage growth and no cheap way to fix a bad row — a destructive or
-non-forward migration would break the reproducibility claim outright, which is exactly
-why it is the revisit trigger rather than a routine option.
+Reproducibility holds by construction **on the normal startup path**, and there the
+determinism fingerprint means something. It does **not** survive the `undo_to`
+exception above: a library caller that runs the down migrations destroys the persisted
+inputs a result would be re-derived from, so the guarantee is scoped to a database that
+has only ever migrated forward. The cost of the immutability discipline is storage
+growth and no cheap way to fix a bad row — a destructive or non-forward migration on
+the startup path would break the claim outright, which is why it is the revisit trigger
+rather than a routine option, and why gating `undo_to` is open work.

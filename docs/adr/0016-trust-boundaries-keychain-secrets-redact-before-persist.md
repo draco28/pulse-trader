@@ -1,4 +1,4 @@
-# 16. Trust boundaries: Keychain-only secrets, redact-before-persist, no order-placing path in v1
+# 16. Trust boundaries: secrets never committed, redact-before-persist, no order-placing path in v1
 
 Date: 2026-08-23T00:00:00Z
 
@@ -28,7 +28,10 @@ in the binary, or in a log.
 intended one. The Ollama transport instead reads `OLLAMA_API_KEY` from the environment
 or a **gitignored `.env`** — which *is* plaintext on disk. That is a deliberate
 development-path exception rather than an oversight: the Keychain path is currently
-unreachable on a fresh install (ADOPTION.md gap 1), so `.env` is the only working path
+unreachable on a fresh install — `keyring` binds the code-identity-scoped
+data-protection keychain, so only the `pulse` binary can seed a key it can later read
+back, and the verb that would do it (`pulse setup-keys`) does not exist in this tree.
+`src/adapters/secrets.rs` carries the full account. So `.env` is the only working path
 today. The guarantee here is therefore **"never in a committed artifact"**, not "never
 plaintext on disk".
 
@@ -46,5 +49,5 @@ Disclosure is bounded to the redactor's correctness, which is why the redaction 
 a registered risk-gate surface carrying audit-trail, least-privilege and
 no-secret-in-log controls. The Keychain choice has a live cost: `keyring` binds the
 data-protection keychain, so only the `pulse` binary can seed a key it can later read
-— and the seeding verb does not exist (see ADOPTION.md gap 1). The moment any path can
+— and the seeding verb (`pulse setup-keys`) does not exist in this tree. The moment any path can
 place an order, this bone is revisited and a Money gate is added.

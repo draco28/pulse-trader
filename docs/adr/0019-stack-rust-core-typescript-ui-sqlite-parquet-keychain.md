@@ -1,4 +1,4 @@
-# 19. Stack: Rust core + agent + Tauri backend, TypeScript/React UI, SQLite WAL + Parquet + Keychain
+# 19. Stack: Rust core on SQLite + Parquet today; Keychain, filesystem and the Tauri/TypeScript shell proposed
 
 Date: 2026-08-23T00:00:00Z
 
