@@ -24,10 +24,17 @@ runtime. Python was eliminated when PulseHive made in-Rust agent orchestration v
 ## Decision
 
 **Exercised at this baseline (Accepted).** **Rust** for the core engine and agent
-orchestration. Storage in four tiers: **SQLite** (WAL, single file) for entities and
-event logs with sqlx migrations; **Parquet** for immutable `CandleSeries`; the
-**macOS Keychain** for secrets; the **filesystem** for logs and exports. No Postgres,
-no Redis, no separate vector database.
+orchestration. Storage in **three** tiers: **SQLite** (WAL, single file) for entities
+and event logs with sqlx migrations; **Parquet** for immutable `CandleSeries`; the
+**macOS Keychain** for secrets. No Postgres, no Redis, no separate vector database.
+
+**Not yet exercised (Proposed) — the filesystem tier.** Logs and exports were
+specified as a fourth tier, and no production writer exists: the crate has no
+`tracing` or `log` dependency at all, `eprintln!` is the CLI warning channel (as
+`src/adapters/db/backtest_run_repo.rs` records, noting the spec names `tracing::warn`
+aspirationally), LLM-call records go to SQLite, and there is no export path. Counting
+it as validated would misdirect storage and release planning. It arrives with the
+structured-logging work ADR-0017 defers.
 
 **Not yet exercised (Proposed).** **TypeScript (React + Vite)** for the UI in Tauri's
 WebView, a Tauri backend in the same Rust crate, glued by the Tauri command bus with

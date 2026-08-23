@@ -24,7 +24,35 @@ Rust core plus a Python agent sidecar, which the PulseHive decision eliminated.
 A **modular monolith** with **hexagonal (ports-and-adapters)** discipline: ports are
 traits in the domain layer with no external dependencies; adapters implement them;
 dependency direction is always inward. **One shippable artifact**, **zero sidecar
-processes** — agent orchestration runs in-process via PulseHive.
+processes**.
+
+**Agent orchestration is first-party and in-process; PulseHive is the transport.**
+`src/agent/composer.rs` is the orchestrator — it drives the model through the builder
+tools and finalizes the `StrategyVersion` itself. PulseHive is reached only through
+the thin `LlmProvider` port (ADR-0012, ADR-0013); `src/adapters/llm/openai_compat.rs`
+states the boundary explicitly: *"Thin transport ONLY: no `HiveMind`/agent/lens
+substrate."* The zero-sidecar property comes from orchestrating in-process at all,
+not from adopting PulseHive's agent substrate — which this baseline deliberately does
+not use.
+
+## Relationship to the ADR-0001 decision queue
+
+`0001-record-architecture-decisions.md` carries a decision index listing
+**ADR-0002** (hexagonal), **ADR-0003** (single Tauri shell, zero sidecars) and
+**ADR-0004** (PulseHive as the in-Rust agent framework) as *Proposed* placeholders
+never written up. This ADR is where two of those land, and leaving the index
+unreconciled would give the same architecture two live statuses:
+
+- **ADR-0002 (hexagonal)** — written up here. Superseded.
+- **ADR-0003 (zero sidecars)** — the zero-sidecar half is written up here and
+  superseded. The **Tauri desktop shell** half is *not*: it is unbuilt at this
+  baseline and stays Proposed under ADR-0019.
+- **ADR-0004 (PulseHive as the agent framework)** — superseded by **ADR-0012** and
+  **ADR-0013**, which chose the opposite of what the queue entry proposed: a thin
+  PulseTrader-owned port over PulseHive rather than its agent substrate. The queue
+  entry itself even records that alternative ("A2") as the one to revisit; it won.
+
+The index in ADR-0001 is annotated accordingly.
 
 ## Consequences
 
