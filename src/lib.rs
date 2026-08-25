@@ -11,6 +11,10 @@ pub(crate) mod domain;
 mod adapters;
 mod agent;
 mod cli;
+// r1.s1.w1 (ADR-0020): the argv dispatch that decides GUI vs CLI. Kept OUT of
+// `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
+// inside one of them.
+mod entry;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -390,6 +394,35 @@ pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
 // `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
 // BUILD error). 2.05's `pulse compose` verb + composition root consume these.
 pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+
+// r1.s1.w1 (ADR-0020): the executable-topology surface. `launch_mode` is the pure
+// argv decision (`tests/entry_topology.rs` drives both directions over it);
+// `launch_mode_from_env` is the call the binary shim makes; `LaunchMode` is the
+// two-variant answer. `run_desktop` is the GUI entry point the shim calls when the
+// launch carries no user arguments. REQUIRED under `deny(warnings)` + private
+// `mod entry`/`mod tauri` -- a `pub` item unused outside its private module is a
+// `dead_code` BUILD error, not a warning (the harvested gotcha).
+pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
+
+// r1.s1.w1 (ADR-0020): the desktop-shell surface. NOTE the `crate::` qualifier -- at the
+// crate root, the bare path `tauri::` is AMBIGUOUS between this crate's `mod tauri` (the
+// outer ring) and the `tauri` DEPENDENCY, and rustc rejects it (E0659). `crate::tauri`
+// names the ring unambiguously. The dependency deliberately keeps its own name because
+// `#[tauri::command]` / `generate_handler!` expand to hard-coded `::tauri::` paths.
+//
+// `run_desktop` is the GUI entry point the binary shim dispatches to. Everything else is
+// the command-bus contract `tests/tauri_bus_contract.rs` (AC-3/4/5) pins and `r1.s1.w3`,
+// `r1.s1.w4` and `r1.s1.w5` code against: `BusError`/`BusErrorCode` (the ONE serializable
+// error shape), `BusEvent`/`BusEventPayload`/`RunId`/`EventSink` (the per-invocation typed
+// channel), `DesktopState` (managed state), `BUS_COMMANDS` (the append-only registration
+// list), and the transport-free cores. REQUIRED under `deny(warnings)` + private
+// `mod tauri` -- a `pub` item unused outside its private module is a `dead_code` BUILD
+// error, not a warning (the harvested gotcha).
+pub use crate::tauri::{
+    BUS_COMMANDS, BusError, BusErrorCode, BusEvent, BusEventPayload, DesktopState, EventSink,
+    RunId, ShellInfo, StreamOutcome, demo_stream_core, export_bindings, run_desktop,
+    shell_info_core,
+};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

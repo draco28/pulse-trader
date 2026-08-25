@@ -29,3 +29,12 @@ AGENTS.md
 .env
 .env.*
 !.env.example
+
+# r1.s1.w1 (ADR-0020) — the desktop shell's build artifacts.
+# `ui/dist` is Vite output (build.rs writes a placeholder into it when absent so a
+# Rust-only `cargo test` still compiles — see build.rs::ensure_frontend_dist).
+# `gen/` is Tauri's generated schema directory. `ui/src/bindings.ts` is deliberately
+# NOT ignored: it is COMMITTED and AC-8 fails on any regeneration diff.
+/node_modules
+/ui/dist
+/gen

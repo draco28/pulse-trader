@@ -13,6 +13,11 @@
 //!      SAME `schema_version_const.rs` the crate reads — the non-drift seam);
 //!   4. the full target triple (`$TARGET`, set by Cargo for build scripts).
 //!
+//! **r1.s1.w1 (ADR-0020) additions.** The script also (a) guarantees the frontend
+//! `dist` directory exists before `tauri_build::build()` runs, and (b) runs
+//! `tauri_build::build()` itself. See `ensure_frontend_dist` for why (a) is here and
+//! not left to npm.
+//!
 //! It then bakes the digest into the binary via
 //! `cargo:rustc-env=PULSE_ENGINE_FINGERPRINT=<hex>` and the triple via
 //! `PULSE_TARGET_TRIPLE`, plus `cargo:rerun-if-changed=` for `Cargo.lock` and the
@@ -97,4 +102,39 @@ fn main() {
     // resolved rustc / target are picked up on every build invocation anyway.
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src/domain/dsl/schema_version_const.rs");
+
+    // r1.s1.w1 (ADR-0020): the desktop half. Order matters -- the dist directory must
+    // exist before `tauri_build::build()` reads the config that points at it.
+    ensure_frontend_dist(Path::new(&manifest_dir));
+    tauri_build::build();
+}
+
+/// Guarantee `ui/dist/index.html` exists before the Tauri build script reads the config.
+///
+/// **Why this is in build.rs and not left to npm.** `tauri::generate_context!` embeds the
+/// frontend assets at COMPILE time and hard-fails when `frontendDist` is missing. Without
+/// this fallback, a bare `cargo test`, `cargo clippy` or a fresh clone would fail to
+/// compile until someone had run `npm install && npm run build` -- which would make
+/// AC-2/AC-3/AC-4/AC-5 (all plain `cargo test` invocations) depend on a Node toolchain
+/// they have nothing to do with, and would break CI's Rust-only job.
+///
+/// It writes ONLY when the file is absent, so it never clobbers a real Vite build. The
+/// placeholder it writes is deliberately inert: `just check` runs the real `npm run
+/// build`, which overwrites it. `ui/dist` is gitignored, so this never dirties the tree.
+fn ensure_frontend_dist(manifest_dir: &Path) {
+    let dist = manifest_dir.join("ui").join("dist");
+    let index = dist.join("index.html");
+    if index.exists() {
+        return;
+    }
+    std::fs::create_dir_all(&dist)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist.display()));
+    std::fs::write(
+        &index,
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\
+         <title>PulseTrader</title></head>\n<body>\n\
+         <p>Placeholder asset written by build.rs. Run `npm run build` for the real bundle.</p>\n\
+         </body></html>\n",
+    )
+    .unwrap_or_else(|e| panic!("failed to write {}: {e}", index.display()));
 }
