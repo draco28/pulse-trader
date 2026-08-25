@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::llm::{LlmBackend, Message};
+use super::secret::CredentialSource;
 use super::strategy::CreatedBy;
 
 /// Identifier of an [`LlmCall`] — a `#[serde(transparent)]` `String` newtype.
@@ -79,6 +80,18 @@ pub struct LlmCall {
     pub created_at: DateTime<Utc>,
     /// Who/what triggered the call (`Human` | `ComposerLlm` | `CoachLlm` | …).
     pub created_by: CreatedBy,
+    /// Which credential source supplied the API key for this call — the r1.s1.w2
+    /// audit-trail control, so a call's provenance is reconstructible from the
+    /// ledger alone.
+    ///
+    /// A LABEL (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir`), never the key
+    /// or any fragment of it. `None` means the provenance was not recorded: either a
+    /// row written before migration `0007`, or a caller that supplied none.
+    /// `#[serde(default)]` so a pre-`0007` serialized row still deserializes instead
+    /// of failing on the absent field — the same backward-compatibility reasoning
+    /// that keeps `LLM_CALL_SCHEMA_VERSION` at 1.
+    #[serde(default)]
+    pub key_source: Option<CredentialSource>,
 }
 
 #[cfg(test)]
@@ -86,6 +99,7 @@ pub struct LlmCall {
 mod tests {
     use super::{LlmCall, LlmCallId};
     use crate::domain::llm::{LlmBackend, Message};
+    use crate::domain::secret::CredentialSource;
     use crate::domain::strategy::CreatedBy;
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
@@ -115,6 +129,7 @@ mod tests {
             cost_currency: "CNY".to_owned(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: CreatedBy::ComposerLlm,
+            key_source: Some(CredentialSource::ConfigDir),
         };
         let json = serde_json::to_string(&call).expect("serialize LlmCall");
         let back: LlmCall = serde_json::from_str(&json).expect("deserialize LlmCall");

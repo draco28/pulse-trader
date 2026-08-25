@@ -6,8 +6,10 @@
 //! live arm ([`run_compose`]) wires:
 //!
 //! ```text
-//! .env OLLAMA_API_KEY  →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.2)
+//! resolve_llm_api_key()  →  ApiKey (opaque; carries the CredentialSource label)
+//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.2)
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
+//!                         .with_key_source(source)  — the audit label, never the key
 //!                         where capturing = CapturingRepo<SqliteLlmCallRepo> sharing ONE
 //!                         LlmCallCapture buffer + ONE SystemClock (repo owns created_at, #82)
 //!                      →  Composer::new(decorator, builder_tool_definitions(), prompt, config, buffer)
@@ -58,8 +60,8 @@ use crate::agent::{
 };
 use crate::domain::strategy::{CreatedBy, NewVersion, Strategy, StrategyVersion};
 use crate::domain::{
-    Clock, LlmBackend, LlmCallId, LlmCallRepository, LlmConfig, LlmProvider, PriceTable,
-    StrategyRepository,
+    ApiKey, Clock, CredentialSource, LlmBackend, LlmCallId, LlmCallRepository, LlmConfig,
+    LlmProvider, PriceTable, StrategyRepository,
 };
 
 use super::llm::CapturingRepo;
@@ -82,9 +84,6 @@ const COMPOSE_TEMPERATURE: f32 = 0.2;
 /// count against this cap BEFORE its tool calls, so keep generous headroom past the
 /// reasoning ([VS-1.3.1 GLM]; the live demo uses 4096).
 const COMPOSE_MAX_TOKENS: u32 = 4096;
-
-/// The `.env` variable naming the Ollama Cloud API key (live-dev inject, deferral d).
-const OLLAMA_API_KEY_VAR: &str = "OLLAMA_API_KEY";
 
 /// `pulse compose "<NL target>" [--db <path>]` — turn a natural-language strategy
 /// target into a persisted, attributable [`StrategyVersion`] via the composer.
@@ -118,6 +117,11 @@ pub struct ComposeWiring<P, R, C> {
     pub clock: C,
     /// The composer system prompt (2.03 `load_composer_prompt`).
     pub prompt: String,
+    /// Which credential source supplied the API key, stamped on every persisted
+    /// `LlmCall` (r1.s1.w2 — the risk gate's audit-trail control). A LABEL, never
+    /// the key: it is `ApiKey::source()`, a type that cannot carry a value.
+    /// `None` when provenance was not recorded (a test double, say).
+    pub key_source: Option<CredentialSource>,
     /// The per-request chat config (backend / model / temperature / `max_tokens`).
     pub config: LlmConfig,
 }
@@ -170,6 +174,7 @@ where
         clock,
         prompt,
         config,
+        key_source,
     } = wiring;
 
     // ONE shared LlmCallCapture buffer wired into BOTH the capturing ledger repo
@@ -183,7 +188,10 @@ where
     // provenance-linked from a `StrategyVersion { created_by: ComposerLlm }`, and
     // `llm_call` is trigger-immutable — a row stamped `Human` here could never be fixed.
     let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices)
-        .with_created_by(CreatedBy::ComposerLlm);
+        .with_created_by(CreatedBy::ComposerLlm)
+        // r1.s1.w2: which credential source answered rides onto every ledger row, so
+        // a call's provenance is reconstructible without the key ever being stored.
+        .with_key_source(key_source);
     let composer = Composer::new(
         decorator,
         builder_tool_definitions(),
@@ -245,13 +253,17 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
     let transport = load_llm_transport().map_err(|e| anyhow::anyhow!("load llm transport: {e}"))?;
 
     let key = ollama_api_key()?;
+    // The provenance LABEL, captured up front: it is all that reaches the ledger.
+    let key_source = key.source();
     // Tag the live key as a secret so an accidental echo is scrubbed at rest too
-    // (structural api-key-shaped stripping is always on). Clone before the ctor move.
-    let redactor = Redactor::from_config(vec![key.clone()]);
+    // (structural api-key-shaped stripping is always on). `expose()` is the ONE
+    // in-crate read of the value; it never leaves this function as a bare String
+    // beyond the two consumers below.
+    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
     // Base URL: config `[llm].base_url` → the provider's const default.
     let provider = match transport.base_url {
-        Some(base_url) => OpenAiCompatProvider::with_base_url(key, base_url),
-        None => OpenAiCompatProvider::new(key),
+        Some(base_url) => OpenAiCompatProvider::with_base_url(key.expose().to_owned(), base_url),
+        None => OpenAiCompatProvider::new(key.expose().to_owned()),
     };
 
     // SINGLE SHARED CLOCK (#82): ONE SystemClock into the ledger repo AND the
@@ -274,6 +286,8 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
         prompt,
         // Model: config `[llm].model` → the COMPOSE_MODEL const fallback (FIX A).
         config: compose_config(transport.model.as_deref()),
+        // r1.s1.w2: the LABEL for wherever the key came from — the audit trail.
+        key_source: Some(key_source),
     };
 
     let mut on_event = |event: ComposerEvent| println!("{}", render_event(&event));
@@ -324,74 +338,36 @@ fn print_outcome(outcome: &ComposeCliOutcome) {
     );
 }
 
-/// Source the Ollama Cloud API key for the LIVE compose run (the `user:` demo).
+/// Source the LLM API key for the LIVE compose run (the `user:` demo).
 ///
-/// Order: (1) the process environment `OLLAMA_API_KEY`; (2) a gitignored `.env` in
-/// the working directory or the crate manifest dir (the VS-1.3.1-validated dev
-/// inject, deferral d). The real seeded-keychain read is VS-1.3.4's `pulse
-/// setup-keys`. The `.env` is read IN-PROCESS only and is NEVER committed (gitignored).
+/// **This function keeps NO resolution logic of its own (r1.s1.w2 step 1).** It is a
+/// one-line adapter onto
+/// [`resolve_llm_api_key`](crate::adapters::secrets::resolve_llm_api_key), which
+/// lives on the *LLM credential handling and redaction* risk gate's registered
+/// surface — `src/adapters/secrets.rs`. The precedence chain, the fail-closed
+/// permission validation and the error text all belong to the resolver; the search
+/// order, the `.env` reader (`parse_dotenv`) and the location list moved there with
+/// it rather than being duplicated here.
+///
+/// The move is also what makes the key reachable from `src/tauri/` (`r1.s1.w4`):
+/// `mod cli` is private in `src/lib.rs`, so a private `fn` in this file could never
+/// be called from the Tauri ring.
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] naming `OLLAMA_API_KEY` + `.env` / `pulse setup-keys`
-/// when no key can be sourced.
-fn ollama_api_key() -> anyhow::Result<String> {
-    if let Ok(key) = std::env::var(OLLAMA_API_KEY_VAR)
-        && !key.is_empty()
-    {
-        return Ok(key);
-    }
-    if let Some(key) = dotenv_value(OLLAMA_API_KEY_VAR) {
-        return Ok(key);
-    }
-    anyhow::bail!(
-        "no {OLLAMA_API_KEY_VAR} found — set it in the environment or the gitignored \
-         `.env` (dev inject), or seed the Keychain via `pulse setup-keys` (VS-1.3.4)"
-    )
-}
-
-/// Look up `var` in the first `.env` found in the working directory or the crate
-/// manifest dir. Reads the file in-process only — the caller never stages/commits it.
-fn dotenv_value(var: &str) -> Option<String> {
-    let candidates = [
-        std::env::current_dir().ok().map(|dir| dir.join(".env")),
-        Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env")),
-    ];
-    for path in candidates.into_iter().flatten() {
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(value) = parse_dotenv(&text, var)
-        {
-            return Some(value);
-        }
-    }
-    None
-}
-
-/// Extract `var`'s value from `.env` text (the first matching `KEY=VALUE` line;
-/// blank + `#`-comment lines ignored). Surrounding quotes are trimmed.
-fn parse_dotenv(text: &str, var: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == var {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
-        }
-    }
-    None
+/// Returns an [`anyhow::Error`] carrying the resolver's [`LlmError`] message, which
+/// names every location searched and — on a refusal — which permission check failed.
+///
+/// [`LlmError`]: crate::domain::LlmError
+fn ollama_api_key() -> anyhow::Result<ApiKey> {
+    crate::adapters::secrets::resolve_llm_api_key()
+        .map_err(|e| anyhow::anyhow!("resolve LLM API key: {e}"))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{COMPOSE_MODEL, compose_config, parse_dotenv};
+    use super::{COMPOSE_MODEL, compose_config};
     use crate::cli::{Cli, Command};
     use crate::domain::LlmBackend;
     use clap::Parser;
@@ -442,14 +418,7 @@ mod tests {
         assert_eq!(compose_config(None).model, COMPOSE_MODEL);
     }
 
-    #[test]
-    fn parse_dotenv_reads_key_ignoring_comments_and_quotes() {
-        let env = "# a comment\n\nOLLAMA_API_KEY = \"abc123\"\nOTHER=nope\n";
-        assert_eq!(
-            parse_dotenv(env, "OLLAMA_API_KEY").as_deref(),
-            Some("abc123")
-        );
-        assert_eq!(parse_dotenv(env, "OTHER").as_deref(), Some("nope"));
-        assert!(parse_dotenv(env, "MISSING").is_none());
-    }
+    // `parse_dotenv_reads_key_ignoring_comments_and_quotes` moved with the reader
+    // itself to `adapters::secrets` (r1.s1.w2 step 1) — `src/cli/compose.rs` keeps
+    // no resolution logic, and therefore no test of resolution logic either.
 }

@@ -31,6 +31,10 @@ pub mod llm_call_repo;
 // documented exception to spec §9's "no new re-exports" rule — a minimal,
 // intentional 1.01-surface touch. `pub(crate)` keeps it crate-internal (no leak).
 pub(crate) use paths::default_db_path;
+// r1.s1.w2: the app-data DIRECTORY half of the same helper. `adapters::secrets`
+// resolves the credential `.env` through it, so the key sits beside `pulse.db`
+// rather than in a second invented location (spec step 2 / the binding constraint).
+pub(crate) use paths::default_data_dir;
 
 pub use strategy_repo::SqliteStrategyRepo;
 // VS-1.2.4 work-4.04: the run-repo adapter type. REQUIRED under `deny(warnings)` —
@@ -96,6 +100,27 @@ impl Db {
     /// Returns [`DataError::Db`] if the pool cannot be opened (the flattened
     /// `sqlx::Error` message).
     pub async fn with_path(path: &Path) -> Result<Self, DataError> {
+        // r1.s1.w2 / issue #42: create the parent directory BEFORE building the
+        // connect options. sqlx's `create_if_missing` creates the database FILE but
+        // not the directory holding it, so on a machine that has never run `pulse`
+        // this call fails with SQLITE_CANTOPEN. Every existing test injects an
+        // already-present tempdir through `--db`, which is exactly why the only
+        // zero-config path was never exercised — and a Finder-launched app has no
+        // `--db` flag to inject one.
+        //
+        // It lives here rather than in `open_default` so every caller of the seam
+        // benefits, and it is a no-op when the directory already exists.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                DataError::Io(format!(
+                    "could not create the database directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
