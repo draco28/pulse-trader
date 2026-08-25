@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::Mutex;
 
 use pulse::{
@@ -50,18 +51,18 @@ impl FakeComposerProvider {
 }
 
 impl LlmProvider for FakeComposerProvider {
-    async fn chat(
+    fn chat(
         &self,
         _messages: Vec<Message>,
         _tools: &[ToolDefinition],
         _config: &LlmConfig,
-    ) -> Result<LlmResponse, LlmError> {
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
         let next = self.scripts.lock().expect("scripts lock").pop_front();
-        Ok(next.unwrap_or_else(|| LlmResponse {
+        std::future::ready(Ok(next.unwrap_or_else(|| LlmResponse {
             content: Some("(script exhausted)".to_owned()),
             tool_calls: Vec::new(),
             usage: usage(),
-        }))
+        })))
     }
 }
 

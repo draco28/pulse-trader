@@ -15,6 +15,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 
 use pulse::{
@@ -274,20 +275,20 @@ fn file_owner_uid(path: &Path) -> u32 {
 struct FakeProvider;
 
 impl LlmProvider for FakeProvider {
-    async fn chat(
+    fn chat(
         &self,
         _messages: Vec<Message>,
         _tools: &[ToolDefinition],
         _config: &LlmConfig,
-    ) -> Result<LlmResponse, LlmError> {
-        Ok(LlmResponse {
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
+        std::future::ready(Ok(LlmResponse {
             content: Some("ok".to_owned()),
             tool_calls: Vec::new(),
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
             },
-        })
+        }))
     }
 }
 

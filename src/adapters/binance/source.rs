@@ -178,20 +178,20 @@ mod tests {
     /// A bulk source that returns one month of two candles for any month asked.
     struct OneMonthBulk;
     impl MonthSource for OneMonthBulk {
-        async fn load_month(
+        fn load_month(
             &self,
             _pair: &Pair,
             _tf: Timeframe,
             _year: i32,
             _month: u32,
-        ) -> Result<MonthOutcome, DataError> {
-            Ok(MonthOutcome::Loaded(MonthData {
+        ) -> impl Future<Output = Result<MonthOutcome, DataError>> {
+            std::future::ready(Ok(MonthOutcome::Loaded(MonthData {
                 candles: vec![candle(0), candle(M15)],
                 funding: vec![FundingEvent {
                     calc_time: 0,
                     rate: Decimal::new(1, 4),
                 }],
-            }))
+            })))
         }
     }
 
@@ -277,27 +277,27 @@ mod tests {
 
     struct FakeSource;
     impl MarketDataSource for FakeSource {
-        async fn fetch_historical(
+        fn fetch_historical(
             &self,
             pair: &Pair,
             tf: Timeframe,
             _s: i64,
             _e: i64,
-        ) -> Result<CandleSeries, DataError> {
-            Ok(CandleSeries {
+        ) -> impl Future<Output = Result<CandleSeries, DataError>> {
+            std::future::ready(Ok(CandleSeries {
                 pair: pair.clone(),
                 timeframe: tf,
                 version: DataVersion::new("fake"),
                 candles: Vec::new(),
-            })
+            }))
         }
-        async fn fetch_incremental(
+        fn fetch_incremental(
             &self,
             _p: &Pair,
             _t: Timeframe,
             _s: i64,
-        ) -> Result<Vec<Candle>, DataError> {
-            Ok(Vec::new())
+        ) -> impl Future<Output = Result<Vec<Candle>, DataError>> {
+            std::future::ready(Ok(Vec::new()))
         }
     }
 
