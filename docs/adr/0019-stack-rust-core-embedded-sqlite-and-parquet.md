@@ -84,3 +84,9 @@ One toolchain for all deterministic work, and no cross-language serialization bo
 in the hot path. Embedded storage keeps the app installable with no service to run,
 at the cost of ruling out multi-machine deployment without revisiting this bone. A
 second backend language or any server-side component is the revisit trigger.
+
+**The exact toolchain *version* `rust-toolchain.toml` pins is not decided here.**
+This ADR decides Rust as the language; the specific channel string is a separate,
+narrower decision `rust-toolchain.toml`'s own header comment requires an ADR to
+move. [ADR-0022](0022-toolchain-bump-1-98.md) is where that move — and any future
+one — is recorded.

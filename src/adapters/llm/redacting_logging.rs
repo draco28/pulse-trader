@@ -361,6 +361,7 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::{Arc, Mutex};
 
     /// A canned inner provider that RECORDS the exact messages it received, so a
@@ -372,14 +373,14 @@ mod tests {
     }
 
     impl LlmProvider for FakeProvider {
-        async fn chat(
+        fn chat(
             &self,
             messages: Vec<Message>,
             _tools: &[ToolDefinition],
             _config: &LlmConfig,
-        ) -> Result<LlmResponse, LlmError> {
+        ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
             self.received.lock().expect("received lock").push(messages);
-            Ok(self.response.clone())
+            std::future::ready(Ok(self.response.clone()))
         }
     }
 
@@ -391,19 +392,22 @@ mod tests {
     }
 
     impl LlmCallRepository for RecordingRepo {
-        async fn save_call(&self, call: &LlmCall) -> Result<LlmCallId, DataError> {
+        fn save_call(&self, call: &LlmCall) -> impl Future<Output = Result<LlmCallId, DataError>> {
             self.saved.lock().expect("saved lock").push(call.clone());
-            Ok(call.id.clone())
+            std::future::ready(Ok(call.id.clone()))
         }
 
-        async fn get_call(&self, id: &LlmCallId) -> Result<Option<LlmCall>, DataError> {
-            Ok(self
+        fn get_call(
+            &self,
+            id: &LlmCallId,
+        ) -> impl Future<Output = Result<Option<LlmCall>, DataError>> {
+            std::future::ready(Ok(self
                 .saved
                 .lock()
                 .expect("saved lock")
                 .iter()
                 .find(|c| c.id == *id)
-                .cloned())
+                .cloned()))
         }
     }
 
