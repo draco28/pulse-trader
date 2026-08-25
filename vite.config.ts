@@ -7,10 +7,17 @@
 //
 // `emptyOutDir` is on: a stale asset from a previous build must not survive into the
 // bundle, because `generate_context!` embeds whatever is in that directory.
+//
+// `@vitejs/plugin-react` (r1.s1.w5, ADR-0020 step 1) is the JSX/Fast-Refresh transform
+// for the ported design system -- pinned to the `^5.x` line because `^6.x` requires
+// Vite 8, and this item ports the design system into the existing Vite 5 toolchain
+// rather than bumping it (an unrelated, larger change this item does not make).
+import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 export default defineConfig({
   root: "ui",
+  plugins: [react()],
   build: {
     outDir: "dist",
     emptyOutDir: true,

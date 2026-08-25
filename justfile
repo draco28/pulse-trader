@@ -50,20 +50,23 @@ clippy:
 test:
     cargo nextest run
 
-# --- desktop shell gates (r1.s1.w1) -----------------------------------------
+# --- desktop shell gates (r1.s1.w1, r1.s1.w5) -------------------------------
 
-# The four content gates for the shell. Each asserts a property that review
+# The five content gates for the shell. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
-# frontend; the window stays 1440x900 non-resizable with no scale-transform; and
-# the committed bindings match a fresh generation.
+# frontend; the window stays 1440x900 non-resizable with no scale-transform; the
+# committed bindings match a fresh generation; and the ported design system
+# (tokens.css/shared.css, no per-screen sheet, no macos-window.jsx) landed for
+# real (r1.s1.w5, AC-2).
 
-# Run the four desktop-shell content gates (ADR, capabilities, window, bindings).
+# Run the five desktop-shell content gates (ADR, capabilities, window, bindings, design system).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
     bash scripts/check-window-config.sh
     bash scripts/check-bindings.sh
+    bash scripts/check-design-system.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's
@@ -79,7 +82,8 @@ prepare:
 
 # --- desktop bundle (r1.s1.w1) ----------------------------------------------
 
-# Build PulseTrader.app for a LOCAL dev run — this is what AC-10's manual walk needs.
+# Build PulseTrader.app for a LOCAL dev run — this is what r1.s1.w5's AC-11 manual
+# walk needs.
 #
 # Deliberately NOT part of `just check`: it is a release build of the whole Tauri
 # graph (minutes, not seconds), and gating every local check run on it would make the
@@ -87,7 +91,7 @@ prepare:
 # scope for r1.s1.w1 (ADR-0020) — this produces an unsigned local artifact at
 # `target/release/bundle/macos/PulseTrader.app`.
 
-# Build an unsigned local PulseTrader.app (what AC-10's manual walk needs).
+# Build an unsigned local PulseTrader.app (what AC-11's manual walk needs).
 bundle:
     npm run bundle
 

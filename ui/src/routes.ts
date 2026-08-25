@@ -16,6 +16,11 @@
 //
 // r1.s1.w5 replaces the placeholder screen's rendering wholesale. It must keep the
 // TABLE, not just the file.
+//
+// r1.s1.w5 retitles the one entry below (the placeholder page it replaces is gone,
+// so "Shell placeholder" no longer describes anything) without adding a row -- w5
+// mounts no product screen, so there is still exactly one entry. w3/w4 append
+// theirs in round 3.
 
 /** One screen in the shell. */
 export interface Route {
@@ -28,7 +33,7 @@ export interface Route {
 export const ROUTES: readonly Route[] = [
   {
     path: "/",
-    title: "Shell placeholder",
+    title: "PulseTrader",
   },
 ];
 

@@ -39,6 +39,8 @@ use super::error::BusError;
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteStrategyRepo, default_db_path, open_migrated};
+use crate::adapters::secrets::llm_credential_status;
+use crate::domain::CredentialStatus;
 use crate::domain::EngineFingerprint;
 use crate::domain::StrategyRepository;
 
@@ -67,6 +69,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "shell_info",
     "bus_selftest_failure",
     "start_demo_stream",
+    "credential_status",
 ];
 
 // ---------------------------------------------------------------------------
@@ -300,6 +303,27 @@ pub async fn start_demo_stream(
 ) -> Result<StreamOutcome, BusError> {
     let run_id = RunId::new();
     demo_stream_core(&run_id, steps.min(64), &channel).await
+}
+
+// ---------------------------------------------------------------------------
+// The no-credential banner's seam (r1.s1.w5, grill G4/A7)
+// ---------------------------------------------------------------------------
+
+/// Report which credential source would answer an LLM call, without exposing the
+/// credential itself — the no-credential banner's read.
+///
+/// This is `llm_credential_status`'s first production caller (`src/adapters/secrets.rs`
+/// r1.s1.w2), which is what makes removing its `#[allow(dead_code)]` sound rather than
+/// a bare grep of convenience: `deny(warnings)` would not let the allow come off before
+/// a real caller existed.
+///
+/// No `Result`: the read has no failure mode (an unresolvable credential reads as
+/// [`CredentialStatus::None`], not an error), so wrapping it in one would claim a
+/// failure mode this command does not have.
+#[tauri::command]
+#[specta::specta]
+pub async fn credential_status() -> CredentialStatus {
+    llm_credential_status()
 }
 
 #[cfg(test)]

@@ -115,7 +115,12 @@ impl ApiKey {
 /// This is the seam `r1.s1.w5` renders its no-credential banner from. It carries no
 /// key material at all, so it is safe to send across the Tauri IPC boundary, and it
 /// is computed without performing any LLM request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `specta::Type` (r1.s1.w5): this is the one domain type that crosses the Tauri
+/// boundary directly rather than through a `src/tauri/`-ring wire type — it already IS
+/// the value-free wire shape the banner needs, so a wrapper struct would add a
+/// translation step with nothing to translate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialStatus {
     /// The process environment answered.

@@ -49,6 +49,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::shell_info,
         commands::bus_selftest_failure,
         commands::start_demo_stream,
+        commands::credential_status,
     ])
 }
 
