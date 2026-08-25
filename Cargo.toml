@@ -110,25 +110,23 @@ tauri = { version = "2", features = ["specta"] }
 # The typed seam (ADR-0020): `tauri-specta` reflects the command signatures + the
 # bus types into `ui/src/bindings.ts`, and AC-8 fails on any regeneration diff.
 #
-# EXACT `=` pins, for TWO independent reasons:
+# EXACT `=` pins, for ONE reason now (r1.s5 closed the second):
 #  1. specta 2 and tauri-specta 2 are both PRE-RELEASE (`-rc.N`), and an rc bump
 #     changes generated-TypeScript output. A caret would let a background
 #     `cargo update` silently rewrite the committed bindings and red AC-8 with no
 #     source change. Same reasoning as the ta-rs/sqlx determinism pins, applied to
 #     a generated artifact instead of a numeric one.
-#  2. The NEWEST specta DOES NOT BUILD on this crate's pinned toolchain. specta
-#     2.0.0-rc.24 and rc.25 both use `core::fmt::from_fn` (the unstable
-#     `debug_closure_helpers` feature, rust-lang#117729), which is not stable in
-#     Rust 1.92.0 — the exact channel `rust-toolchain.toml` pins because the
-#     toolchain hash feeds `engine_fingerprint` (audit C4). specta rc.23 and below
-#     compile; tauri-specta HARD-pins its specta (`specta = "=2.0.0-rc.N"`), so the
-#     pair has to move together, and `tauri-specta 2.0.0-rc.21 -> specta rc.22` is
-#     the newest COMPILABLE pair. DO NOT bump these without first bumping the
-#     toolchain — and the toolchain bump needs its own ADR, because it moves the
-#     engine fingerprint (NFR-2 byte-reproducibility).
-specta = { version = "=2.0.0-rc.22", features = ["derive"] }
-specta-typescript = "=0.0.9"
-tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+#  2. (retired by r1.s5.w1/w2) The newest specta used to not build on this crate's
+#     pinned toolchain: rc.24+ needs `core::fmt::from_fn` (the unstable
+#     `debug_closure_helpers` feature, rust-lang#117729), which was not stable on
+#     the old 1.92.0 pin. `r1.s5.w1` moved `rust-toolchain.toml` to 1.98.0 and
+#     verified `core::fmt::from_fn` compiles there; this item (`r1.s5.w2`) is the
+#     one that actually moves these three pins onto the newest published trio.
+#     tauri-specta HARD-pins its specta (`specta = "=2.0.0-rc.N"`), so the pair
+#     still has to move together — re-resolve, don't assume the numbers align.
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-typescript = "=0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 # VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
 # the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock
