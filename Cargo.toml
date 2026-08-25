@@ -85,6 +85,45 @@ keyring = "3"
 # transitive graph does not bump rust_decimal/ta/polars — OQ-C lockfile guard).
 toml = "0.9"
 
+# ---------------------------------------------------------------------------
+# r1.s1.w1 (ADR-0020) — the desktop shell.
+#
+# ADR-0011 (dual-license surface) note: every crate added here resolves inside
+# `deny.toml`'s permissive-only global allow-list (MIT / Apache-2.0 / BSD / ISC /
+# Unicode-3.0 / Zlib / MPL-via-named-exception). NOTHING here is copyleft, so the
+# commercial self-grant is untouched and no new named exception was needed.
+# `cargo deny check licenses` is the gate that holds this true over time.
+#
+# `tauri` is the desktop runtime: window, WKWebView, IPC. Its crate name COLLIDES
+# with this crate's own `mod tauri` (the outer ring). The module keeps its name
+# because ADR-0020's registered touch surface is `src/tauri/**`; the collision is
+# resolved at every use site with a leading `::tauri` (extern crate) versus
+# `crate::tauri` (our ring). Do NOT rename the dependency: the `#[tauri::command]`
+# and `generate_handler!` macros expand to hard-coded `::tauri::` paths.
+tauri = { version = "2", features = ["specta"] }
+# The typed seam (ADR-0020): `tauri-specta` reflects the command signatures + the
+# bus types into `ui/src/bindings.ts`, and AC-8 fails on any regeneration diff.
+#
+# EXACT `=` pins, for TWO independent reasons:
+#  1. specta 2 and tauri-specta 2 are both PRE-RELEASE (`-rc.N`), and an rc bump
+#     changes generated-TypeScript output. A caret would let a background
+#     `cargo update` silently rewrite the committed bindings and red AC-8 with no
+#     source change. Same reasoning as the ta-rs/sqlx determinism pins, applied to
+#     a generated artifact instead of a numeric one.
+#  2. The NEWEST specta DOES NOT BUILD on this crate's pinned toolchain. specta
+#     2.0.0-rc.24 and rc.25 both use `core::fmt::from_fn` (the unstable
+#     `debug_closure_helpers` feature, rust-lang#117729), which is not stable in
+#     Rust 1.92.0 — the exact channel `rust-toolchain.toml` pins because the
+#     toolchain hash feeds `engine_fingerprint` (audit C4). specta rc.23 and below
+#     compile; tauri-specta HARD-pins its specta (`specta = "=2.0.0-rc.N"`), so the
+#     pair has to move together, and `tauri-specta 2.0.0-rc.21 -> specta rc.22` is
+#     the newest COMPILABLE pair. DO NOT bump these without first bumping the
+#     toolchain — and the toolchain bump needs its own ADR, because it moves the
+#     engine fingerprint (NFR-2 byte-reproducibility).
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+specta-typescript = "=0.0.9"
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+
 # VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
 # the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock
 # as direct/transitive deps (sha2 "0.11", hex "0.4") — no lockfile churn. These are
@@ -92,6 +131,11 @@ toml = "0.9"
 [build-dependencies]
 sha2 = "0.11"
 hex = "0.4"
+# r1.s1.w1 (ADR-0020): `tauri_build::build()` reads `tauri.conf.json`, emits the
+# platform metadata `tauri::generate_context!` consumes, and re-runs the build when
+# the config or the frontend dist changes. Build-script-only — it never enters the
+# crate's runtime dependency surface (same discipline as sha2/hex above).
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 serde_json = "1"

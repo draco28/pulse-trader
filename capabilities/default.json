@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Least-privilege capability set for the PulseTrader main window (ADR-0020). Core app/event/window/webview permissions only. NO filesystem, shell or HTTP capability is granted, and scripts/check-capabilities.sh asserts that absence at both the capability and the dependency level rather than trusting review. Note that the app's own #[tauri::command] functions need no permission entry -- Tauri v2 permissions gate CORE and PLUGIN commands, so this list stays short as screens are added.",
+  "windows": ["main"],
+  "permissions": [
+    "core:app:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default"
+  ]
+}

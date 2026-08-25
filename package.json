@@ -1,0 +1,24 @@
+{
+  "name": "pulsetrader-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PulseTrader desktop frontend (ADR-0020). r1.s1.w1 ships a deliberately unstyled placeholder; r1.s1.w5 ports the design system into it.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri",
+    "bundle": "tauri build",
+    "desktop": "tauri dev"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "@tauri-apps/cli": "^2"
+  }
+}
