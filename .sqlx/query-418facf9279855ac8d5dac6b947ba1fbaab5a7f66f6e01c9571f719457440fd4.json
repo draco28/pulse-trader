@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 id               AS \"id!: String\",\n                 backend          AS \"backend!: String\",\n                 model            AS \"model!: String\",\n                 prompt_messages  AS \"prompt_messages!: String\",\n                 completion       AS \"completion?: String\",\n                 input_tokens     AS \"input_tokens!: i64\",\n                 output_tokens    AS \"output_tokens!: i64\",\n                 cost             AS \"cost!: String\",\n                 cost_currency    AS \"cost_currency!: String\",\n                 created_at       AS \"created_at!: String\",\n                 created_by       AS \"created_by!: String\",\n                 schema_version   AS \"schema_version!: i64\"\n               FROM llm_call WHERE id = ?1",
+  "query": "SELECT\n                 id               AS \"id!: String\",\n                 backend          AS \"backend!: String\",\n                 model            AS \"model!: String\",\n                 prompt_messages  AS \"prompt_messages!: String\",\n                 completion       AS \"completion?: String\",\n                 input_tokens     AS \"input_tokens!: i64\",\n                 output_tokens    AS \"output_tokens!: i64\",\n                 cost             AS \"cost!: String\",\n                 cost_currency    AS \"cost_currency!: String\",\n                 created_at       AS \"created_at!: String\",\n                 created_by       AS \"created_by!: String\",\n                 schema_version   AS \"schema_version!: i64\",\n                 key_source       AS \"key_source?: String\"\n               FROM llm_call WHERE id = ?1",
   "describe": {
     "columns": [
       {
@@ -62,6 +62,11 @@
         "name": "schema_version!: i64",
         "ordinal": 11,
         "type_info": "Text"
+      },
+      {
+        "name": "key_source?: String",
+        "ordinal": 12,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -79,8 +84,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "4d9370f1ccfb4650e8e13754cf1720de14decb6490347028fde6fcf761093f7a"
+  "hash": "418facf9279855ac8d5dac6b947ba1fbaab5a7f66f6e01c9571f719457440fd4"
 }

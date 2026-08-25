@@ -1058,6 +1058,7 @@ mod llm_call_repository_tests {
             cost_currency: "CNY".to_owned(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: CreatedBy::ComposerLlm,
+            key_source: None,
         }
     }
 

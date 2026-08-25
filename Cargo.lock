@@ -4720,6 +4720,7 @@ dependencies = [
  "directories",
  "hex",
  "keyring",
+ "libc",
  "polars",
  "proptest",
  "pulsehive",

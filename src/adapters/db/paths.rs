@@ -29,7 +29,25 @@ const DB_FILE: &str = "pulse.db";
 ///
 /// [`Db::open_default`]: crate::adapters::db::Db::open_default
 pub(crate) fn default_db_path() -> Result<PathBuf, DataError> {
+    Ok(default_data_dir()?.join(DB_FILE))
+}
+
+/// Resolve the platform application data DIRECTORY
+/// (`~/Library/Application Support/PulseTrader/` on macOS) — the one location
+/// `pulse.db` and the credential `.env` share.
+///
+/// r1.s1.w2 lifted this out of [`default_db_path`] so the credential resolver
+/// (`adapters::secrets`) reaches the app-data location through the SAME
+/// `directories::ProjectDirs` helper rather than inventing a second one. Were the
+/// two to drift, a Finder-launched app would look for its key somewhere other than
+/// where its database lives.
+///
+/// # Errors
+///
+/// Returns [`DataError::Io`] when no platform data directory can be determined
+/// (the `directories` crate returns `None`).
+pub(crate) fn default_data_dir() -> Result<PathBuf, DataError> {
     let dirs = directories::ProjectDirs::from("", "", APP_DIR)
         .ok_or_else(|| DataError::Io("no platform data directory available".to_string()))?;
-    Ok(dirs.data_dir().join(DB_FILE))
+    Ok(dirs.data_dir().to_path_buf())
 }

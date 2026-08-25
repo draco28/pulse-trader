@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
-    Clock, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    Message, PriceTable, TokenUsage, ToolCall, ToolDefinition,
+    Clock, CredentialSource, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError,
+    LlmProvider, LlmResponse, Message, PriceTable, TokenUsage, ToolCall, ToolDefinition,
 };
 
 /// The placeholder substituted for every redacted span in the persisted copy.
@@ -235,6 +235,7 @@ pub struct RedactingLoggingProvider<P, R, C> {
     redactor: Redactor,
     prices: PriceTable,
     created_by: CreatedBy,
+    key_source: Option<CredentialSource>,
 }
 
 impl<P, R, C> RedactingLoggingProvider<P, R, C> {
@@ -251,6 +252,7 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
             redactor,
             prices,
             created_by: CreatedBy::Human,
+            key_source: None,
         }
     }
 
@@ -265,6 +267,23 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
     #[must_use]
     pub fn with_created_by(mut self, created_by: CreatedBy) -> Self {
         self.created_by = created_by;
+        self
+    }
+
+    /// Record WHICH credential source supplied the API key on every persisted
+    /// [`LlmCall`] (r1.s1.w2 — the risk gate's audit-trail control).
+    ///
+    /// A LABEL, never the key: the decorator is handed
+    /// [`ApiKey::source()`](crate::domain::ApiKey::source), a value type that cannot
+    /// carry the credential, so this seam is incapable of leaking one.
+    ///
+    /// A builder rather than a `new` parameter so every existing call site keeps
+    /// compiling and defaults to `None` (provenance not recorded) — the same shape
+    /// as [`with_created_by`](Self::with_created_by). The live composition root
+    /// (`src/cli/compose.rs`) sets it; a test double that does not care may omit it.
+    #[must_use]
+    pub fn with_key_source(mut self, key_source: Option<CredentialSource>) -> Self {
+        self.key_source = key_source;
         self
     }
 }
@@ -317,6 +336,7 @@ where
             cost_currency,
             created_at,
             created_by: self.created_by,
+            key_source: self.key_source,
         };
 
         self.repo

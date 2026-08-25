@@ -13,9 +13,13 @@
 //! cost-logged path in the decorator needs `usage`, which only the non-streaming
 //! `chat()` carries), no key env-read (the key is a ctor arg the composition root
 //! supplies — `llm-check` reads the Keychain via
-//! [`glm_api_key`](crate::adapters::secrets::glm_api_key), `compose` reads
-//! `OLLAMA_API_KEY` from the environment / gitignored `.env`), and no redaction /
-//! cost / persistence (that is the redacting-logging decorator).
+//! [`glm_api_key`](crate::adapters::secrets::glm_api_key); `compose` resolves it
+//! through
+//! [`resolve_llm_api_key`](crate::adapters::secrets::resolve_llm_api_key), the
+//! r1.s1.w2 precedence chain — environment, `$PULSE_CONFIG_DIR/.env`, the
+//! working/manifest `.env`, then the application data directory, each file
+//! permission-validated fail-closed), and no redaction / cost / persistence (that
+//! is the redacting-logging decorator).
 //!
 //! **Tool-calling (VS-1.3.2 work-2.01, FR-3).** `chat` now forwards a borrowed
 //! `&[ToolDefinition]` slice — each `PulseTrader` [`ToolDefinition`] is translated to
@@ -79,7 +83,9 @@ impl OpenAiCompatProvider {
     /// The key is a **ctor argument** (never env-read here) — the composition root
     /// supplies it (`llm-check` from the macOS Keychain via
     /// [`glm_api_key`](crate::adapters::secrets::glm_api_key); `compose` from
-    /// `OLLAMA_API_KEY`). Use [`with_base_url`](Self::with_base_url) to override the
+    /// [`resolve_llm_api_key`](crate::adapters::secrets::resolve_llm_api_key),
+    /// which hands back an opaque `ApiKey` the composition root unwraps exactly
+    /// once). Use [`with_base_url`](Self::with_base_url) to override the
     /// endpoint from config (slice-close FIX A). The timeout / retry posture is
     /// pinned to the Ollama Cloud config (README C2/C8, audit ch4).
     #[must_use]

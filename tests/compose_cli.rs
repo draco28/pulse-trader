@@ -185,6 +185,10 @@ async fn composes_and_persists_strategy_version_over_fake_provider() {
         prices: test_prices(),
         clock,
         prompt: TEST_PROMPT.to_owned(),
+        // r1.s1.w2: the e2e's fake provider has no resolved credential behind it,
+        // so it records no provenance. `None` is the honest label, and it keeps
+        // this fixture asserting composition rather than credential resolution.
+        key_source: None,
         config: config(),
     };
 
@@ -374,6 +378,10 @@ async fn invalid_tool_input_surfaces_correctable_error_then_finalizes() {
         prices: test_prices(),
         clock,
         prompt: TEST_PROMPT.to_owned(),
+        // r1.s1.w2: the e2e's fake provider has no resolved credential behind it,
+        // so it records no provenance. `None` is the honest label, and it keeps
+        // this fixture asserting composition rather than credential resolution.
+        key_source: None,
         config: config(),
     };
 

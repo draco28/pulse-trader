@@ -37,7 +37,9 @@ use sqlx::SqlitePool;
 
 use crate::adapters::clock::SystemClock;
 use crate::domain::strategy::CreatedBy;
-use crate::domain::{Clock, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, Message};
+use crate::domain::{
+    Clock, CredentialSource, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, Message,
+};
 
 /// The row-schema tag `save_call` writes into every `llm_call.schema_version` and
 /// that every read ASSERTS (mirror `RUN_SCHEMA_VERSION`, #68). v1 reads only v1 and
@@ -136,13 +138,17 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
         // `created_at` from the injected Clock (D7), NOT the in-memory value.
         let created_at = self.now_rfc3339()?;
         let created_by = enum_token(&call.created_by)?;
+        // r1.s1.w2: the credential provenance LABEL (`env` / `config-dir` /
+        // `cwd-dotenv` / `app-data-dir`), or NULL when the caller recorded none.
+        // Never the key — `CredentialSource` cannot hold a value to leak.
+        let key_source = call.key_source.as_ref().map(enum_token).transpose()?;
         let schema_version = LLM_CALL_SCHEMA_VERSION;
 
         sqlx::query!(
             "INSERT INTO llm_call \
              (id, backend, model, prompt_messages, completion, input_tokens, output_tokens, \
-              cost, cost_currency, created_at, created_by, schema_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              cost, cost_currency, created_at, created_by, schema_version, key_source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             id,
             backend,
             model,
@@ -155,6 +161,7 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
             created_at,
             created_by,
             schema_version,
+            key_source,
         )
         .execute(&self.pool)
         .await
@@ -178,7 +185,8 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
                  cost_currency    AS "cost_currency!: String",
                  created_at       AS "created_at!: String",
                  created_by       AS "created_by!: String",
-                 schema_version   AS "schema_version!: i64"
+                 schema_version   AS "schema_version!: i64",
+                 key_source       AS "key_source?: String"
                FROM llm_call WHERE id = ?1"#,
             id_str,
         )
@@ -201,6 +209,15 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
         let prompt_messages: Vec<Message> =
             parse_json("llm_call.prompt_messages", &r.prompt_messages)?;
         let created_by: CreatedBy = parse_json("llm_call.created_by", &json_token(&r.created_by))?;
+        // A NULL `key_source` is a row written before migration `0007` (or by a
+        // caller that recorded no provenance) — `None`, not an error. A PRESENT but
+        // unrecognised label IS an error: fail-closed, mirroring the schema_version
+        // read-reject, so a corrupt provenance label can never read as "absent".
+        let key_source: Option<CredentialSource> = r
+            .key_source
+            .as_deref()
+            .map(|token| parse_json("llm_call.key_source", &json_token(token)))
+            .transpose()?;
         let cost = parse_decimal("llm_call.cost", &r.cost)?;
         let created_at = DateTime::parse_from_rfc3339(&r.created_at)
             .map_err(|e| DataError::Db(format!("malformed created_at `{}`: {e}", r.created_at)))?
@@ -230,6 +247,7 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
             cost_currency: r.cost_currency,
             created_at,
             created_by,
+            key_source,
         }))
     }
 }
@@ -241,7 +259,9 @@ mod tests {
     use crate::adapters::clock::FakeClock;
     use crate::adapters::db::{Db, MIGRATOR};
     use crate::domain::strategy::CreatedBy;
-    use crate::domain::{DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, Message};
+    use crate::domain::{
+        CredentialSource, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, Message,
+    };
     use chrono::DateTime;
     use rust_decimal::Decimal;
     use sqlx::SqlitePool;
@@ -283,6 +303,7 @@ mod tests {
             cost_currency: "CNY".to_owned(),
             created_at: DateTime::from_timestamp_millis(now_ms).expect("clock in range"),
             created_by: CreatedBy::ComposerLlm,
+            key_source: Some(CredentialSource::Env),
         }
     }
 

@@ -18,6 +18,129 @@
 //! requires the FULL credential shape — a bare prefix is never enough. This
 //! restores the `sk-` tail-length constraint VS-1.3.1's `redacting_logging`
 //! carried and the FIX C unification dropped (PR #93 review).
+//!
+//! # The credential value types (r1.s1.w2)
+//!
+//! This file also carries the pure value half of the *LLM credential handling and
+//! redaction* risk gate: [`ApiKey`] (an opaque key wrapper), [`CredentialSource`]
+//! (which location answered) and [`CredentialStatus`] (the value-free banner
+//! read). The resolution I/O — searching, permission-validating and reading the
+//! credential file — lives in the adapter ring
+//! ([`adapters::secrets`](crate::adapters)); these three types are zero-I/O, so
+//! they belong here beside the redaction heuristic they exist to protect.
+
+use serde::{Deserialize, Serialize};
+
+/// Which location a resolved LLM credential came from — the persisted `key_source`
+/// label on an [`LlmCall`](crate::domain::LlmCall) (r1.s1.w2 step 7, the audit-trail
+/// control).
+///
+/// The serde tags (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir`) are the
+/// literal strings stored in `llm_call.key_source`, so a call's provenance is
+/// reconstructible from the ledger alone. It is a LABEL, never the value: the whole
+/// point of the audit trail is that it can be read by someone who must not learn
+/// the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialSource {
+    /// The process environment variable `OLLAMA_API_KEY`.
+    Env,
+    /// A `.env` under `$PULSE_CONFIG_DIR` (ADR-0014's data-overlay seam).
+    ConfigDir,
+    /// A gitignored `.env` in the working directory or the crate manifest dir.
+    CwdDotenv,
+    /// A `.env` in the application data directory, beside `pulse.db`.
+    AppDataDir,
+}
+
+/// A resolved LLM API key plus the [`CredentialSource`] that answered.
+///
+/// **Opaque by construction, not by policy.** It implements neither
+/// [`std::fmt::Display`] nor a value-revealing [`std::fmt::Debug`], so the key
+/// cannot reach a log line, an error message or a panic payload through an
+/// accidental `{}` / `{:?}` / `dbg!`. The only way to the bytes is
+/// [`expose`](Self::expose), which is `pub(crate)` — an out-of-crate caller
+/// receives a key it can pass on but can never read (the least-privilege control).
+#[derive(Clone)]
+pub struct ApiKey {
+    value: String,
+    source: CredentialSource,
+}
+
+/// The fixed rendering [`ApiKey`]'s `Debug` emits. It names the SOURCE (useful in a
+/// diagnostic) and nothing about the value — not even its length, which is itself a
+/// hint about which credential family it belongs to.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("source", &self.source)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ApiKey {
+    /// Wrap a raw key value with the source that produced it.
+    ///
+    /// `pub(crate)`: only the adapter that performed the resolution may mint one, so
+    /// an out-of-crate caller cannot smuggle a value in and read it back out.
+    pub(crate) fn new(value: impl Into<String>, source: CredentialSource) -> Self {
+        Self {
+            value: value.into(),
+            source,
+        }
+    }
+
+    /// Which location this key came from — readable by anyone, since it is a label.
+    #[must_use]
+    pub fn source(&self) -> CredentialSource {
+        self.source
+    }
+
+    /// Borrow the raw key bytes, for the transport ctor and the redactor's tagged
+    /// secret list.
+    ///
+    /// `pub(crate)` on purpose — this IS the least-privilege control. The
+    /// composition root inside this crate needs the value to build the provider and
+    /// to tag it for redaction; nothing outside the crate ever does, and nothing
+    /// outside the crate can.
+    pub(crate) fn expose(&self) -> &str {
+        &self.value
+    }
+}
+
+/// The value-free credential read for a UI banner (r1.s1.w2 step 6) — which source
+/// answered, or that none did.
+///
+/// This is the seam `r1.s1.w5` renders its no-credential banner from. It carries no
+/// key material at all, so it is safe to send across the Tauri IPC boundary, and it
+/// is computed without performing any LLM request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialStatus {
+    /// The process environment answered.
+    Env,
+    /// `$PULSE_CONFIG_DIR/.env` answered.
+    ConfigDir,
+    /// A working-directory / manifest-directory `.env` answered.
+    CwdDotenv,
+    /// The application data directory's `.env` answered.
+    AppDataDir,
+    /// No usable credential — absent everywhere, or found but REFUSED by the
+    /// permission checks. Both read as "not usable", which is what a banner needs.
+    None,
+}
+
+impl From<CredentialSource> for CredentialStatus {
+    fn from(source: CredentialSource) -> Self {
+        match source {
+            CredentialSource::Env => Self::Env,
+            CredentialSource::ConfigDir => Self::ConfigDir,
+            CredentialSource::CwdDotenv => Self::CwdDotenv,
+            CredentialSource::AppDataDir => Self::AppDataDir,
+        }
+    }
+}
 
 /// Minimum tail length for the `sk-`/`sk_`/`pk-` key families (`OpenAI`, Stripe).
 /// Restored from VS-1.3.1 `redacting_logging::SK_MIN_TAIL_LEN`; without it a
