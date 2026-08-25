@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -192,20 +193,20 @@ fn no_refusal_error_contains_the_value() {
 struct EchoingProvider;
 
 impl LlmProvider for EchoingProvider {
-    async fn chat(
+    fn chat(
         &self,
         _messages: Vec<Message>,
         _tools: &[ToolDefinition],
         _config: &LlmConfig,
-    ) -> Result<LlmResponse, LlmError> {
-        Ok(LlmResponse {
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
+        std::future::ready(Ok(LlmResponse {
             content: Some(format!("your key is {FAKE_KEY}")),
             tool_calls: Vec::new(),
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
             },
-        })
+        }))
     }
 }
 

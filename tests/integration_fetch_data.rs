@@ -68,14 +68,14 @@ fn btc() -> Pair {
 struct FixtureBulk;
 
 impl MonthSource for FixtureBulk {
-    async fn load_month(
+    fn load_month(
         &self,
         _pair: &Pair,
         _tf: Timeframe,
         _year: i32,
         _month: u32,
-    ) -> Result<MonthOutcome, DataError> {
-        Ok(MonthOutcome::Loaded(MonthData {
+    ) -> impl Future<Output = Result<MonthOutcome, DataError>> {
+        std::future::ready(Ok(MonthOutcome::Loaded(MonthData {
             candles: vec![
                 bulk_candle(BULK_OPEN_0),
                 bulk_candle(BULK_OPEN_1),
@@ -85,7 +85,7 @@ impl MonthSource for FixtureBulk {
                 calc_time: BULK_FUNDING_TS,
                 rate: dec("0.00010000"),
             }],
-        }))
+        })))
     }
 }
 
@@ -424,28 +424,28 @@ async fn ac8_multi_tf_partial_failure_exits_non_zero_but_keeps_m15() {
 struct EmptySource;
 
 impl MarketDataSource for EmptySource {
-    async fn fetch_historical(
+    fn fetch_historical(
         &self,
         pair: &Pair,
         tf: Timeframe,
         _start_ms: i64,
         _end_ms: i64,
-    ) -> Result<CandleSeries, DataError> {
-        Ok(CandleSeries {
+    ) -> impl Future<Output = Result<CandleSeries, DataError>> {
+        std::future::ready(Ok(CandleSeries {
             pair: pair.clone(),
             timeframe: tf,
             version: DataVersion::new("empty"),
             candles: Vec::new(),
-        })
+        }))
     }
 
-    async fn fetch_incremental(
+    fn fetch_incremental(
         &self,
         _pair: &Pair,
         _tf: Timeframe,
         _since_ms: i64,
-    ) -> Result<Vec<Candle>, DataError> {
-        Ok(Vec::new())
+    ) -> impl Future<Output = Result<Vec<Candle>, DataError>> {
+        std::future::ready(Ok(Vec::new()))
     }
 }
 
@@ -545,25 +545,26 @@ struct CurrentMonthAbsentBulk {
 }
 
 impl MonthSource for CurrentMonthAbsentBulk {
-    async fn load_month(
+    fn load_month(
         &self,
         _pair: &Pair,
         _tf: Timeframe,
         year: i32,
         month: u32,
-    ) -> Result<MonthOutcome, DataError> {
-        if (year, month) == (self.now_year, self.now_month) {
+    ) -> impl Future<Output = Result<MonthOutcome, DataError>> {
+        std::future::ready(if (year, month) == (self.now_year, self.now_month) {
             // data.binance.vision has no monthly archive for the current month yet.
-            return Ok(MonthOutcome::Absent);
-        }
-        Ok(MonthOutcome::Loaded(MonthData {
-            candles: vec![
-                bulk_candle(BULK_OPEN_0),
-                bulk_candle(BULK_OPEN_1),
-                bulk_candle(BULK_OPEN_2),
-            ],
-            funding: vec![],
-        }))
+            Ok(MonthOutcome::Absent)
+        } else {
+            Ok(MonthOutcome::Loaded(MonthData {
+                candles: vec![
+                    bulk_candle(BULK_OPEN_0),
+                    bulk_candle(BULK_OPEN_1),
+                    bulk_candle(BULK_OPEN_2),
+                ],
+                funding: vec![],
+            }))
+        })
     }
 }
 
