@@ -306,13 +306,13 @@ pub fn llm_credential_status_in(search: &CredentialSearch) -> CredentialStatus {
 /// The production banner read: report which source would answer, from the real
 /// process environment.
 ///
-/// This is the seam `r1.s1.w5` renders its no-credential banner from, and the reason
-/// `w5` depends on this item. `pub(crate)` for the same reason as
-/// [`resolve_llm_api_key`]; `r1.s1.w4`'s Tauri command is its first production
-/// caller, so until that lands the only callers are out-of-crate tests reaching
-/// [`llm_credential_status_in`] — hence the `dead_code` allow, mirroring the
-/// built-but-unwired precedent in `agent::config`.
-#[allow(dead_code)]
+/// This is the seam `r1.s1.w5` renders its no-credential banner from. `pub(crate)` for
+/// the same reason as [`resolve_llm_api_key`]. `r1.s1.w5`'s `credential_status` Tauri
+/// command (`src/tauri/commands.rs`) is its first production caller — wiring that
+/// caller is what makes removing the `dead_code` allow this function used to carry
+/// sound: `deny(warnings)` would not have let it come off before a real caller
+/// existed. Until `w5`, the only callers were out-of-crate tests reaching
+/// [`llm_credential_status_in`] directly.
 pub(crate) fn llm_credential_status() -> CredentialStatus {
     llm_credential_status_in(&CredentialSearch::from_process_env())
 }

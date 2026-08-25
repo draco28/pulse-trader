@@ -37,6 +37,20 @@ export const commands = {
 	 *  `cancelled` in the [`StreamOutcome`], not as an error.
 	 */
 	startDemoStream: (steps: number, channel: Channel<BusEvent>) => typedError<StreamOutcome, BusError>(__TAURI_INVOKE("start_demo_stream", { steps, channel })),
+	/**
+	 *  Report which credential source would answer an LLM call, without exposing the
+	 *  credential itself — the no-credential banner's read.
+	 * 
+	 *  This is `llm_credential_status`'s first production caller (`src/adapters/secrets.rs`
+	 *  r1.s1.w2), which is what makes removing its `#[allow(dead_code)]` sound rather than
+	 *  a bare grep of convenience: `deny(warnings)` would not let the allow come off before
+	 *  a real caller existed.
+	 * 
+	 *  No `Result`: the read has no failure mode (an unresolvable credential reads as
+	 *  [`CredentialStatus::None`], not an error), so wrapping it in one would claim a
+	 *  failure mode this command does not have.
+	 */
+	credentialStatus: () => __TAURI_INVOKE<CredentialStatus>("credential_status"),
 };
 
 /* Types */
@@ -107,6 +121,34 @@ message: string } |
 { kind: "finished"; 
 /**  A closing summary line. */
 message: string };
+
+/**
+ *  The value-free credential read for a UI banner (r1.s1.w2 step 6) — which source
+ *  answered, or that none did.
+ * 
+ *  This is the seam `r1.s1.w5` renders its no-credential banner from. It carries no
+ *  key material at all, so it is safe to send across the Tauri IPC boundary, and it
+ *  is computed without performing any LLM request.
+ * 
+ *  `specta::Type` (r1.s1.w5): this is the one domain type that crosses the Tauri
+ *  boundary directly rather than through a `src/tauri/`-ring wire type — it already IS
+ *  the value-free wire shape the banner needs, so a wrapper struct would add a
+ *  translation step with nothing to translate.
+ */
+export type CredentialStatus = 
+/**  The process environment answered. */
+"env" | 
+/**  `$PULSE_CONFIG_DIR/.env` answered. */
+"config-dir" | 
+/**  A working-directory / manifest-directory `.env` answered. */
+"cwd-dotenv" | 
+/**  The application data directory's `.env` answered. */
+"app-data-dir" | 
+/**
+ *  No usable credential — absent everywhere, or found but REFUSED by the
+ *  permission checks. Both read as "not usable", which is what a banner needs.
+ */
+"none";
 
 /**
  *  A per-invocation run identifier, minted when a streaming command starts.
