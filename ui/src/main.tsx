@@ -4,8 +4,10 @@
 //
 // `tokens.css` is imported before `shared.css`, matching the load order
 // `docs/design/mock/README.md` documents ("Every screen links tokens.css
-// then shared.css first"); `app-shell.css` is this app's own small addition
-// (not from the mock -- see that file's header).
+// then shared.css first"); `app-shell.css` and `content.css` are this app's
+// own additions (not from the mock -- see each file's own header). `content.css`
+// (r1.s1.w6) loads after `shared.css` so its `.content`/`.unbuilt` rules can
+// rely on `shared.css`'s `.layout` grid already being defined.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -14,6 +16,7 @@ import { App } from "./App";
 import "./styles/tokens.css";
 import "./styles/shared.css";
 import "./styles/app-shell.css";
+import "./styles/content.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

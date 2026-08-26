@@ -26,6 +26,8 @@
 import { useEffect, useState } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
 
+import { isNavBuilt } from "../routes";
+
 // ---------------------------------------------------------------------------
 // Atoms (`app-shell.jsx`'s `Dot` / `Pill`)
 // ---------------------------------------------------------------------------
@@ -178,7 +180,7 @@ export function NavIcon({ name }: { name: NavIconName }) {
 // Sidebar (`app-shell.jsx`'s `Sidebar`)
 // ---------------------------------------------------------------------------
 
-interface NavEntry {
+export interface NavEntry {
   readonly id: string;
   readonly label: string;
   readonly icon: NavIconName;
@@ -186,11 +188,12 @@ interface NavEntry {
   readonly tier?: string;
 }
 
-// No `href`/route is wired yet: `ui/src/routes.ts` carries only the placeholder
-// entry (r1.s1.w1). `w3`/`w4` append real routes for `library`/`designer` in round
-// 3; every row below is an inert `#` link until then, matching `app-shell.jsx`'s
-// own `href || "#"` fallback for an item with no destination.
-const NAV_MAIN: readonly NavEntry[] = [
+// r1.s1.w6 wires every row to `"#/" + item.id` (step 5) and derives, per row,
+// whether its destination is built (`isNavBuilt`, G8) -- it does not add a
+// pre-seeded "is this built" flag here. `w3`/`w4` make a row real by
+// appending a `ROUTES` entry with a matching `nav` and an `element`; nothing
+// in this table changes when they do.
+export const NAV_MAIN: readonly NavEntry[] = [
   { id: "library", label: "Strategy Library", icon: "tree" },
   { id: "designer", label: "Strategy Designer", icon: "chat" },
   { id: "backtest", label: "Backtest Lab", icon: "chart" },
@@ -199,10 +202,13 @@ const NAV_MAIN: readonly NavEntry[] = [
   { id: "analytics", label: "Analytics", icon: "graph", tier: "v3" },
 ];
 
-const NAV_BOTTOM: readonly NavEntry[] = [
+export const NAV_BOTTOM: readonly NavEntry[] = [
   { id: "settings", label: "Settings", icon: "gear" },
   { id: "help", label: "Help", icon: "help" },
 ];
+
+/** Every nav row, main + bottom, in display order. */
+export const NAV_ALL: readonly NavEntry[] = [...NAV_MAIN, ...NAV_BOTTOM];
 
 interface SidebarProps {
   /** The nav row id to mark `.is-active`, if any is mounted yet. */
@@ -258,12 +264,20 @@ export function Sidebar({ active }: SidebarProps) {
         {NAV_MAIN.map((item) => (
           <a
             key={item.id}
-            href="#"
+            href={`#/${item.id}`}
             className={`nav-row ${active === item.id ? "is-active" : ""}`}
           >
             <NavIcon name={item.icon} />
             <span className="nav-label">{item.label}</span>
-            {item.tier !== undefined && <span className="nav-soon">{item.tier}</span>}
+            {/* The tier badge and the derived "not built yet" badge share one
+                slot and one vehicle -- `nav-soon` (r1.s1.w6, step 5) -- rather
+                than stacking two badges on a row. A tier is itself a
+                roadmap-truthful "not yet" signal, so it takes priority. */}
+            {item.tier !== undefined ? (
+              <span className="nav-soon">{item.tier}</span>
+            ) : (
+              !isNavBuilt(item.id) && <span className="nav-soon">Soon</span>
+            )}
           </a>
         ))}
       </nav>
@@ -274,11 +288,12 @@ export function Sidebar({ active }: SidebarProps) {
         {NAV_BOTTOM.map((item) => (
           <a
             key={item.id}
-            href="#"
+            href={`#/${item.id}`}
             className={`nav-row ${active === item.id ? "is-active" : ""}`}
           >
             <NavIcon name={item.icon} />
             <span className="nav-label">{item.label}</span>
+            {!isNavBuilt(item.id) && <span className="nav-soon">Soon</span>}
           </a>
         ))}
       </nav>
