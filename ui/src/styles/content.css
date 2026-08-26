@@ -1,0 +1,37 @@
+/* ============================================================
+   PulseTrader — content.css
+   SHELL-OWNED (r1.s1.w6, spec step 6 / audit finding C1). NOT ported from any
+   mock screen sheet -- `check-design-system.sh` forbids porting a per-screen
+   stylesheet, and the content region had zero rules anywhere before this
+   file. These are the middle-track rules every screen needs regardless of
+   which one is mounted: fill, scroll containment, and the padding the type
+   scale expects. A screen's OWN internal layout (toolbar, scroll body, cards)
+   is that screen's own stylesheet, added when it lands (w3/w4).
+   ============================================================ */
+
+.content {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg-window);
+  padding: var(--sp-6);
+}
+
+/* ---- the unbuilt pane (r1.s1.w6, UnbuiltScreen.tsx) ---- */
+.unbuilt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.unbuilt-title {
+  margin: 0;
+  font-size: var(--fs-20);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-1);
+}
+.unbuilt-body {
+  margin: 0;
+  font-size: var(--fs-14);
+  color: var(--text-3);
+}

@@ -19,9 +19,14 @@ check: ui fmt clippy test gates
 
 # --- frontend ---------------------------------------------------------------
 
-# Typecheck and build the frontend bundle Tauri embeds.
+# Typecheck, test, and build the frontend bundle Tauri embeds.
+#
+# `npm run test` (r1.s1.w6, G9) runs `vitest run` -- the non-interactive form.
+# It sits between typecheck and build so a regression fails fast, before the
+# slower production build runs.
 ui: ui-deps
     npm run typecheck
+    npm run test
     npm run build
 
 # Install node modules only when they are missing. `npm ci` (not `npm install`)
@@ -50,23 +55,26 @@ clippy:
 test:
     cargo nextest run
 
-# --- desktop shell gates (r1.s1.w1, r1.s1.w5) -------------------------------
+# --- desktop shell gates (r1.s1.w1, r1.s1.w5, r1.s1.w6) ----------------------
 
-# The five content gates for the shell. Each asserts a property that review
+# The six content gates for the shell. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
 # frontend; the window stays 1440x900 non-resizable with no scale-transform; the
-# committed bindings match a fresh generation; and the ported design system
+# committed bindings match a fresh generation; the ported design system
 # (tokens.css/shared.css, no per-screen sheet, no macos-window.jsx) landed for
-# real (r1.s1.w5, AC-2).
+# real (r1.s1.w5, AC-2); and every nav row navigates with exactly one active at
+# a time (r1.s1.w6, AC-2 -- a backstop over the rendered vitest tests, per
+# audit finding C6).
 
-# Run the five desktop-shell content gates (ADR, capabilities, window, bindings, design system).
+# Run the six desktop-shell content gates (ADR, capabilities, window, bindings, design system, shell navigation).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
     bash scripts/check-window-config.sh
     bash scripts/check-bindings.sh
     bash scripts/check-design-system.sh
+    bash scripts/check-shell-navigation.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's

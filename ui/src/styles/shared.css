@@ -68,6 +68,12 @@ a:hover { color: var(--ai-2); }
 
 /* ---- layout grid ---- */
 .layout { display: grid; grid-template-columns: 240px 1fr 360px; flex: 1; min-height: 0; }
+/* r1.s1.w6: applied whenever the active route has no details pane to show
+   (every route this item can reach, today -- w3 opts the Library route back
+   into the third track when it ports DetailsPane). Collapses the 360px
+   track entirely so the content pane fills ~1200px instead of sitting next
+   to an empty column. */
+.layout.layout-no-details { grid-template-columns: 240px 1fr; }
 
 /* ============================================================
    SIDEBAR
