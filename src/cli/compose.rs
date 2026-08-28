@@ -158,7 +158,7 @@ pub async fn run_compose_with<P, R, S, C>(
     wiring: ComposeWiring<P, R, C>,
     strategy_repo: &S,
     nl_target: &str,
-    on_event: &mut dyn FnMut(ComposerEvent),
+    on_event: &mut (dyn FnMut(ComposerEvent) + Send),
 ) -> anyhow::Result<ComposeCliOutcome>
 where
     P: LlmProvider + Send + Sync,
@@ -299,7 +299,11 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
 /// The compose chat config (backend = Ollama, generous reasoning-headroom
 /// `max_tokens`). MODEL resolves the config override → the [`COMPOSE_MODEL`] const
 /// fallback: `model_override` is the config `[llm].model` when present (FIX A).
-fn compose_config(model_override: Option<&str>) -> LlmConfig {
+///
+/// `pub(crate)` (r1.s1.w4): the Tauri ring's `compose_strategy` command builds
+/// the SAME config the CLI live arm does — one source for the fallback model
+/// and reasoning headroom, so the two surfaces cannot drift on transport knobs.
+pub(crate) fn compose_config(model_override: Option<&str>) -> LlmConfig {
     LlmConfig {
         backend: LlmBackend::Ollama,
         model: model_override.unwrap_or(COMPOSE_MODEL).to_owned(),

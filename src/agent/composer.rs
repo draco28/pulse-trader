@@ -204,7 +204,7 @@ impl<P: LlmProvider> Composer<P> {
     pub async fn compose(
         &self,
         nl_target: &str,
-        on_event: &mut dyn FnMut(ComposerEvent),
+        on_event: &mut (dyn FnMut(ComposerEvent) + Send),
     ) -> Result<ComposeOutcome, ComposerError> {
         let mut messages = self.assemble_context(nl_target);
         let mut builder = StrategyBuilder::new();
@@ -283,7 +283,7 @@ fn process_turn(
     builder: &mut StrategyBuilder,
     messages: &mut Vec<Message>,
     events: &mut Vec<ComposerEvent>,
-    on_event: &mut dyn FnMut(ComposerEvent),
+    on_event: &mut (dyn FnMut(ComposerEvent) + Send),
     response: LlmResponse,
 ) -> TurnOutcome {
     let LlmResponse {
@@ -393,7 +393,7 @@ fn dispatch_tool(builder: &mut StrategyBuilder, call: &ToolCall) -> (String, boo
 /// Stream `event` to the callback and record a copy for the outcome.
 fn emit(
     events: &mut Vec<ComposerEvent>,
-    on_event: &mut dyn FnMut(ComposerEvent),
+    on_event: &mut (dyn FnMut(ComposerEvent) + Send),
     event: ComposerEvent,
 ) {
     on_event(event.clone());

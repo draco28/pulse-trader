@@ -37,3 +37,25 @@ if (typeof window.matchMedia !== "function") {
 afterEach(() => {
   cleanup();
 });
+
+// 3. `@tauri-apps/api/core`'s `Channel` registers its message callback with
+//    `window.__TAURI_INTERNALS__.transformCallback` at CONSTRUCTION — a bridge
+//    that only exists inside a real Tauri webview. A screen that opens a
+//    per-invocation channel (r1.s1.w4's Designer) therefore cannot even
+//    construct one under jsdom without this stub. The registered callback is
+//    never driven from here (tests mock the bindings module, and drive the
+//    channel's `onmessage` directly); the returned id just has to be a unique
+//    number per channel, exactly as in the webview.
+declare global {
+  interface Window {
+    __TAURI_INTERNALS__?: {
+      transformCallback: (callback: (response: unknown) => void, once?: boolean) => number;
+    };
+  }
+}
+
+if (window.__TAURI_INTERNALS__ === undefined) {
+  window.__TAURI_INTERNALS__ = {
+    transformCallback: () => Math.floor(Math.random() * 2 ** 31),
+  };
+}

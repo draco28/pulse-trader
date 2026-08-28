@@ -33,12 +33,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::SecondsFormat;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::error::BusError;
+use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use super::library::{
     LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
@@ -46,13 +48,22 @@ use super::library::{
 };
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{
-    Db, SqliteBacktestRunRepo, SqliteStrategyRepo, default_db_path, open_migrated,
+    Db, SqliteBacktestRunRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path,
+    open_migrated,
 };
-use crate::adapters::secrets::llm_credential_status;
-use crate::domain::CredentialStatus;
-use crate::domain::EngineFingerprint;
-use crate::domain::strategy::{Strategy, StrategyVersion};
-use crate::domain::{BacktestRunRepository, StrategyRepository};
+use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
+use crate::adapters::llm::redacting_logging::Redactor;
+use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
+use crate::agent::ComposerEvent;
+use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
+use crate::cli::compose::{ComposeWiring, compose_config, run_compose_with};
+use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
+use crate::domain::{
+    BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus, DataError, Direction,
+    EngineFingerprint, ExitRule, IndicatorSpec, LlmCallRepository, LlmConfig, LlmError,
+    LlmProvider, LlmResponse, Message, PriceField, StrategyDsl, StrategyRepository, SweepableValue,
+    ToolDefinition, ValueSource,
+};
 
 // ---------------------------------------------------------------------------
 // Clause 4 — the ONE registration point
@@ -81,6 +92,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "start_demo_stream",
     "credential_status",
     "library_overview",
+    "compose_strategy",
 ];
 
 // ---------------------------------------------------------------------------
@@ -133,6 +145,14 @@ impl DesktopState {
     #[must_use]
     pub fn backtest_run_repo(&self) -> SqliteBacktestRunRepo<SystemClock> {
         SqliteBacktestRunRepo::new(self.db.pool().clone())
+    }
+
+    /// An `LlmCall` ledger repository over the shared pool (r1.s1.w4) — the
+    /// same cheap-wrapper-around-the-pool pattern as [`DesktopState::strategy_repo`],
+    /// for the compose run's redacted, credential-labelled audit rows.
+    #[must_use]
+    pub fn llm_call_repo(&self) -> SqliteLlmCallRepo<SystemClock> {
+        SqliteLlmCallRepo::with_deps(self.db.pool().clone(), SystemClock)
     }
 
     /// The owned database handle.
@@ -376,6 +396,431 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// The compose stream (r1.s1.w4) — the real streaming core behind the Designer
+// ---------------------------------------------------------------------------
+
+/// The compact DSL summary a finalized run returns — the finalize summary
+/// card's data, rendered from the fields the persisted version actually
+/// carries (the `w3` "real fields" discipline: render what the DSL carries,
+/// omit what it does not).
+///
+/// Lines, not structures, on purpose: the ring renders the DSL's own values
+/// into mono summary lines and the screen never parses strategy JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeDslSummary {
+    /// The trade side, `"long"` / `"short"` — the DSL's own `Direction` value.
+    pub direction: String,
+    /// The required entry trigger, e.g. `rsi(14) < 30`.
+    pub entry: String,
+    /// The gating conditions conjoined with the entry, one line each.
+    pub filters: Vec<String>,
+    /// The exit rules, one line each (e.g. `stop_loss 5%`, `take_profit 2R`).
+    pub exits: Vec<String>,
+    /// The risk / sizing inputs, one line each.
+    pub risk: Vec<String>,
+}
+
+/// What a finalized compose run reports about the strategy it persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeStrategySummary {
+    /// The persisted strategy's repo-minted id.
+    pub strategy_id: String,
+    /// The strategy's name (the DSL's own `name`).
+    pub strategy_name: String,
+    /// The persisted initial version's repo-minted id.
+    pub version_id: String,
+    /// Who authored the version — the `strategy_version.created_by` label
+    /// (`"composer_llm"` for this run; the pinned serialization strings).
+    pub created_by: String,
+    /// How many `LlmCall`s produced this version (its provenance count).
+    pub llm_call_count: u32,
+    /// The compact DSL summary rendered above.
+    pub dsl: ComposeDslSummary,
+}
+
+/// The outcome of one compose run — [`StreamOutcome`]'s shape (a run id, what
+/// actually crossed, cancellation) extended with the finalize payload.
+///
+/// `strategy` is `None` exactly when the run did not finalize: a cancelled run
+/// (the screen went away) carries no summary because nothing persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeResult {
+    /// The run this outcome describes.
+    pub run_id: RunId,
+    /// How many events actually reached the far end.
+    pub emitted: u32,
+    /// True when the far end went away mid-run (the screen unmounted).
+    pub cancelled: bool,
+    /// The persisted strategy summary — present iff the run finalized.
+    pub strategy: Option<ComposeStrategySummary>,
+}
+
+/// The injectable deps of one compose run: the CLI's [`ComposeWiring`] bundle
+/// plus the strategy repository the finalized version persists through.
+///
+/// The core wraps `wiring.provider` in its cancellation guard before handing
+/// the wiring to [`run_compose_with`], so the live arm and every test double
+/// get identical cancellation behaviour without either knowing about it.
+pub struct ComposeDeps<P, R, S, C> {
+    /// The LLM-side wiring (provider, ledger repo, redactor, prices, clock,
+    /// prompt, credential-source label, chat config) — `run_compose_with`'s input.
+    pub wiring: ComposeWiring<P, R, C>,
+    /// The repository the finalized `StrategyVersion` persists through.
+    pub strategy_repo: S,
+}
+
+/// The refusal message the cancellation guard returns once tripped. A LABEL,
+/// never a payload — it names the condition (the destination channel closed),
+/// not anything about the run's data.
+const COMPOSE_CANCELLED: &str = "compose run cancelled: the destination channel closed";
+
+/// A provider wrapper that ends the run when the far end goes away.
+///
+/// `run_compose_with`'s `on_event` callback returns `()` — it **cannot abort
+/// the compose loop** — so cancellation is delivered at the next seam the loop
+/// must pass through: the provider. When a `send_event` fails the shared latch
+/// trips, every subsequent `chat()` refuses, and the composer ends the run with
+/// a provider error, which the core maps to `cancelled: true` (never a
+/// `BusError`). No orphaned compose runs emitting into nothing.
+struct RefusingProvider<P> {
+    /// The wrapped (live or faked) provider.
+    inner: P,
+    /// Set by the event sink's failure; read before every `chat()`.
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<P> LlmProvider for RefusingProvider<P>
+where
+    P: LlmProvider + Sync,
+{
+    fn chat(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        config: &LlmConfig,
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> + Send {
+        let tripped = Arc::clone(&self.cancelled);
+        let inner = &self.inner;
+        async move {
+            if tripped.load(Ordering::SeqCst) {
+                return Err(LlmError::Provider(COMPOSE_CANCELLED.to_owned()));
+            }
+            inner.chat(messages, tools, config).await
+        }
+    }
+}
+
+/// Render a [`StrategyDsl`] into the summary card's line vocabulary — the DSL's
+/// own values, compactly, with no field invented and none echoed beyond what
+/// the document carries.
+fn summarize_dsl(dsl: &StrategyDsl) -> ComposeDslSummary {
+    ComposeDslSummary {
+        direction: match dsl.direction {
+            Direction::Long => "long".to_owned(),
+            Direction::Short => "short".to_owned(),
+        },
+        entry: render_condition(&dsl.entry),
+        filters: dsl.filters.iter().map(render_condition).collect(),
+        exits: dsl.exits.iter().map(render_exit).collect(),
+        risk: vec![
+            format!(
+                "risk_per_trade {}",
+                render_percent(&dsl.risk.risk_per_trade_pct)
+            ),
+            format!("max_leverage {}x", render_sweepable(&dsl.risk.max_leverage)),
+        ],
+    }
+}
+
+/// The `created_by` label — the same strings `CreatedBy` serializes to (pinned
+/// by `strategy.rs`'s own test), so the card's label and the persisted column
+/// can never disagree.
+fn created_by_label(created_by: CreatedBy) -> String {
+    match created_by {
+        CreatedBy::Human => "human",
+        CreatedBy::ComposerLlm => "composer_llm",
+        CreatedBy::CoachLlm => "coach_llm",
+        CreatedBy::AutoOptimizer => "auto_optimizer",
+        CreatedBy::Migration => "migration",
+    }
+    .to_owned()
+}
+
+/// Render one condition, e.g. `rsi(14) < 30` / `close crosses above ema(200)`.
+fn render_condition(condition: &Condition) -> String {
+    match condition {
+        Condition::Compare { lhs, op, rhs } => format!(
+            "{} {} {}",
+            render_value_source(lhs),
+            render_comparator(*op),
+            render_value_source(rhs)
+        ),
+        Condition::CrossesAbove { lhs, rhs } => {
+            format!(
+                "{} crosses above {}",
+                render_value_source(lhs),
+                render_value_source(rhs)
+            )
+        }
+        Condition::CrossesBelow { lhs, rhs } => {
+            format!(
+                "{} crosses below {}",
+                render_value_source(lhs),
+                render_value_source(rhs)
+            )
+        }
+        Condition::And { conditions } => render_joined(conditions, "and"),
+        Condition::Or { conditions } => render_joined(conditions, "or"),
+        Condition::Not { condition } => format!("not ({})", render_condition(condition)),
+    }
+}
+
+/// Render a conjoined/disjoined condition list, parenthesized per term.
+fn render_joined(conditions: &[Condition], joiner: &str) -> String {
+    conditions
+        .iter()
+        .map(|c| format!("({})", render_condition(c)))
+        .collect::<Vec<_>>()
+        .join(&format!(" {joiner} "))
+}
+
+/// The comparator's source rendering (not its `Debug`).
+fn render_comparator(op: Comparator) -> &'static str {
+    match op {
+        Comparator::Gt => ">",
+        Comparator::Gte => ">=",
+        Comparator::Lt => "<",
+        Comparator::Lte => "<=",
+        Comparator::Eq => "=",
+    }
+}
+
+/// Render one operand, e.g. `rsi(14)`, `close`, `30`.
+fn render_value_source(source: &ValueSource) -> String {
+    match source {
+        ValueSource::Constant { value } => value.normalize().to_string(),
+        ValueSource::Price { field } => match field {
+            PriceField::Open => "open",
+            PriceField::High => "high",
+            PriceField::Low => "low",
+            PriceField::Close => "close",
+            PriceField::Volume => "volume",
+        }
+        .to_owned(),
+        ValueSource::Indicator { spec } => render_indicator(spec),
+    }
+}
+
+/// Render an indicator with its parameters, e.g. `ema(200)`.
+fn render_indicator(spec: &IndicatorSpec) -> String {
+    match spec {
+        IndicatorSpec::Rsi { period } => format!("rsi({})", render_sweepable(period)),
+        IndicatorSpec::Ema { period } => format!("ema({})", render_sweepable(period)),
+        IndicatorSpec::Adx { period } => format!("adx({})", render_sweepable(period)),
+        IndicatorSpec::Macd { fast, slow, signal } => format!(
+            "macd({},{},{})",
+            render_sweepable(fast),
+            render_sweepable(slow),
+            render_sweepable(signal)
+        ),
+    }
+}
+
+/// Render one exit rule, e.g. `stop_loss 5%` / `take_profit 2R`.
+fn render_exit(rule: &ExitRule) -> String {
+    match rule {
+        ExitRule::StopLoss { distance_pct } => {
+            format!("stop_loss {}", render_percent(distance_pct))
+        }
+        ExitRule::TakeProfit { target_r } => format!("take_profit {}R", render_sweepable(target_r)),
+        ExitRule::TrailingStop { trail_pct } => {
+            format!("trailing_stop {}", render_percent(trail_pct))
+        }
+        ExitRule::TimeStop { max_bars } => format!("time_stop {} bars", render_sweepable(max_bars)),
+        ExitRule::SignalExit { condition } => {
+            format!("signal_exit {}", render_condition(condition))
+        }
+    }
+}
+
+/// Render a `Decimal`-fraction sweepable as a percentage (`0.05` → `5%`) — the
+/// DSL stores decimal fractions; the summary speaks the human unit.
+fn render_percent(value: &SweepableValue<Decimal>) -> String {
+    match value {
+        SweepableValue::Fixed(fraction) => {
+            format!("{}%", (*fraction * Decimal::from(100)).normalize())
+        }
+        SweepableValue::Sweep { .. } => "sweep".to_owned(),
+    }
+}
+
+/// Render a sweepable's fixed value, or name the sweep (v1 validation rejects
+/// sweeps before persist; the label keeps rendering total).
+fn render_sweepable<T: std::fmt::Display>(value: &SweepableValue<T>) -> String {
+    match value {
+        SweepableValue::Fixed(v) => v.to_string(),
+        SweepableValue::Sweep { .. } => "sweep".to_owned(),
+    }
+}
+
+/// A cancelled run's outcome: nothing persisted, so no summary.
+fn cancelled_compose(run_id: &RunId, emitted: u32) -> ComposeResult {
+    ComposeResult {
+        run_id: run_id.clone(),
+        emitted,
+        cancelled: true,
+        strategy: None,
+    }
+}
+
+/// Map a genuine (non-cancelled) compose failure onto the bus's one error
+/// shape, recovering the error FAMILY from the anyhow chain's root so the
+/// frontend's code stays meaningful (`llm` vs `composer` vs `data`).
+fn compose_failure(error: anyhow::Error) -> BusError {
+    let root = error.root_cause();
+    let code = if root.downcast_ref::<LlmError>().is_some() {
+        BusErrorCode::Llm
+    } else if root.downcast_ref::<crate::agent::ComposerError>().is_some() {
+        BusErrorCode::Composer
+    } else if root.downcast_ref::<DataError>().is_some() {
+        BusErrorCode::Data
+    } else {
+        BusErrorCode::Internal
+    };
+    BusError::new(code, error.to_string())
+}
+
+/// The transport-free compose core (r1.s1.w4) — `demo_stream_core`'s pinned
+/// shape (a run id, a sink, an outcome, cancellation-by-failed-send) with the
+/// composer's real stream in the body.
+///
+/// Opens the channel with `Started`, then runs [`run_compose_with`] over
+/// `deps`, mapping each [`ComposerEvent`] onto a [`BusEventPayload`] as it
+/// arrives — `ToolCallStarted` / `ToolCallResult` per step, and the composer's
+/// `Finalized` line as the closing `Finished`. A failed send trips the provider
+/// guard (see [`RefusingProvider`]); the run then ends as `cancelled: true`,
+/// never a `BusError`. The LLM credential is already INSIDE `deps.wiring`
+/// (label and redactor alike) — it neither crosses this seam nor appears in any
+/// event.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] only for a genuine failure (config load is the
+/// wrapper's; composer/transport/persist failures arrive here). A dead sink is
+/// cancellation.
+pub async fn compose_strategy_core<P, R, S, C, K>(
+    run_id: &RunId,
+    deps: ComposeDeps<P, R, S, C>,
+    nl_target: &str,
+    sink: &K,
+) -> Result<ComposeResult, BusError>
+where
+    P: LlmProvider + Send + Sync,
+    R: LlmCallRepository + Send + Sync,
+    S: StrategyRepository + Send + Sync,
+    C: Clock + Send + Sync,
+    K: EventSink + Sync + ?Sized,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    // The stream always opens with `Started`. A far end already dead cancels
+    // before the composer is ever invoked — no run, no persist.
+    if sink
+        .send_event(BusEvent::new(run_id, 0, BusEventPayload::Started))
+        .is_err()
+    {
+        return Ok(cancelled_compose(run_id, 0));
+    }
+
+    // Wrap the provider in the cancellation guard so a sink that dies MID-run
+    // ends the compose loop at its next model turn.
+    let ComposeWiring {
+        provider,
+        llm_repo,
+        redactor,
+        prices,
+        clock,
+        prompt,
+        key_source,
+        config,
+    } = deps.wiring;
+    let wiring = ComposeWiring {
+        provider: RefusingProvider {
+            inner: provider,
+            cancelled: Arc::clone(&cancelled),
+        },
+        llm_repo,
+        redactor,
+        prices,
+        clock,
+        prompt,
+        key_source,
+        config,
+    };
+
+    let mut emitted = 1_u32;
+    let mut seq = 1_u32;
+    let events_run_id = run_id.clone();
+    let mut on_event = |event: ComposerEvent| {
+        // Once the far end is gone, stop emitting — the guard ends the run
+        // within one model turn; this keeps the window between airtight too.
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let payload = match event {
+            ComposerEvent::ToolCallStarted {
+                name,
+                arguments_preview,
+            } => BusEventPayload::ToolCallStarted {
+                name,
+                arguments_preview,
+            },
+            ComposerEvent::ToolCallResult { name, outcome } => {
+                BusEventPayload::ToolCallResult { name, outcome }
+            }
+            ComposerEvent::Finalized { version_summary } => BusEventPayload::Finished {
+                message: version_summary,
+            },
+        };
+        if sink
+            .send_event(BusEvent::new(&events_run_id, seq, payload))
+            .is_ok()
+        {
+            emitted += 1;
+        } else {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+        seq += 1;
+    };
+
+    match run_compose_with(wiring, &deps.strategy_repo, nl_target, &mut on_event).await {
+        Ok(outcome) => Ok(ComposeResult {
+            run_id: run_id.clone(),
+            emitted,
+            cancelled: false,
+            strategy: Some(ComposeStrategySummary {
+                strategy_id: outcome.strategy.id.as_str().to_owned(),
+                strategy_name: outcome.strategy.name.clone(),
+                version_id: outcome.version.id.as_str().to_owned(),
+                created_by: created_by_label(outcome.version.created_by),
+                llm_call_count: u32::try_from(outcome.llm_call_ids.len()).unwrap_or(u32::MAX),
+                dsl: summarize_dsl(&outcome.version.dsl),
+            }),
+        }),
+        Err(error) => {
+            if cancelled.load(Ordering::SeqCst) {
+                Ok(cancelled_compose(run_id, emitted))
+            } else {
+                Err(compose_failure(error))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The registered commands. One `async fn` per BUS_COMMANDS entry, same order.
 // ---------------------------------------------------------------------------
 
@@ -471,6 +916,80 @@ pub async fn library_overview(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<LibraryOverview, BusError> {
     library_overview_core(&state).await
+}
+
+// The compose command (r1.s1.w4) — the Designer's one bus entry
+// ---------------------------------------------------------------------------
+
+/// Compose a strategy from a natural-language target, streaming the composer's
+/// tool-call steps over a **per-invocation** channel (grill A2 — the channel is
+/// the correlation) until the run finalizes and a persisted, attributable
+/// `StrategyVersion` exists.
+///
+/// **Nothing but the target crosses the boundary in, and no credential crosses
+/// it in any direction, ever** (ADR-0016, the risk gate's IPC half): the key
+/// resolves INSIDE the ring via [`resolve_llm_api_key`], `key.expose()` reaches
+/// exactly two consumers (the provider constructor and `Redactor::from_config`),
+/// and the credential-source LABEL is captured before either — the live arm's
+/// key discipline (`src/cli/compose.rs`), mirrored.
+///
+/// An unresolvable credential is a [`BusError`] carrying the resolver's own
+/// message — it names every searched location and fails closed (`w2`); the
+/// screen renders it, and `w5`'s banner already states the condition globally.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] on a config-load failure, an unresolvable credential,
+/// or a genuine compose/persist failure. A dropped channel is reported as
+/// `cancelled` in the [`ComposeResult`], not as an error.
+#[tauri::command]
+#[specta::specta]
+pub async fn compose_strategy(
+    state: tauri::State<'_, DesktopState>,
+    nl_target: String,
+    channel: tauri::ipc::Channel<BusEvent>,
+) -> Result<ComposeResult, BusError> {
+    // Config-driven overlays, loaded exactly as the CLI live arm loads them
+    // (ADR-0014): prompt + transport + prices are DATA, each with an embedded
+    // default, so a relocated binary is self-contained.
+    let transport =
+        load_llm_transport().map_err(|e| BusError::internal(format!("load llm transport: {e}")))?;
+    let prices =
+        load_price_table().map_err(|e| BusError::internal(format!("load price table: {e}")))?;
+    let prompt = load_composer_prompt()
+        .map_err(|e| BusError::internal(format!("load composer prompt: {e}")))?;
+
+    // The credential resolves inside the ring — `w2`'s seam. This is the
+    // least-privilege control: the value never appears in an argument, a
+    // return value, or an event, because it never leaves this function.
+    let key = resolve_llm_api_key().map_err(BusError::from)?;
+    // The provenance LABEL, captured before either consumer — all that reaches
+    // the persisted ledger rows (the audit-trail control).
+    let key_source = key.source();
+    // The key's two consumers, and its only two: the redactor (so the persisted
+    // copy is scrubbed) and the provider constructor (the live transport).
+    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
+    let provider = match transport.base_url {
+        Some(base_url) => OpenAiCompatProvider::with_base_url(key.expose().to_owned(), base_url),
+        None => OpenAiCompatProvider::new(key.expose().to_owned()),
+    };
+
+    let deps = ComposeDeps {
+        wiring: ComposeWiring {
+            provider,
+            llm_repo: state.llm_call_repo(),
+            redactor,
+            prices,
+            clock: SystemClock,
+            prompt,
+            key_source: Some(key_source),
+            config: compose_config(transport.model.as_deref()),
+        },
+        strategy_repo: state.strategy_repo(),
+    };
+
+    let run_id = RunId::new();
+    compose_strategy_core(&run_id, deps, &nl_target, &channel).await
 }
 
 #[cfg(test)]

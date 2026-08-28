@@ -8,8 +8,9 @@
 // own additions (not from the mock -- see each file's own header). `content.css`
 // (r1.s1.w6) loads after `shared.css` so its `.content`/`.unbuilt` rules can
 // rely on `shared.css`'s `.layout` grid already being defined. `library.css`
-// (r1.s1.w3) is the Strategy Library's own screen sheet — the third in that
-// load order, after the shell sheets it builds on.
+// (r1.s1.w3) is the Strategy Library's screen sheet and `designer.css`
+// (r1.s1.w4) the Designer's — appended in load order, each after the shell
+// sheets it builds on.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -20,6 +21,7 @@ import "./styles/shared.css";
 import "./styles/app-shell.css";
 import "./styles/content.css";
 import "./styles/library.css";
+import "./styles/designer.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

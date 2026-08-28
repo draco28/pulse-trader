@@ -72,7 +72,41 @@ pub enum BusEventPayload {
         /// Human-readable progress text.
         message: String,
     },
+    /// A composer tool call was dispatched to a builder tool (r1.s1.w4).
+    ///
+    /// Mirrors [`ComposerEvent::ToolCallStarted`](crate::agent::ComposerEvent):
+    /// the payload carries the composer's OWN fields — the tool name and its
+    /// non-secret arguments preview — never invented ones. Mapping the composer's
+    /// stream onto the channel is rendering, not faking.
+    ///
+    /// The variant-level `rename_all` exists because the ENUM-level one renames
+    /// variants only, not their fields — without it `arguments_preview` would
+    /// cross the wire in `snake_case` against the file's `camelCase` convention
+    /// (a nothing-word like `message` never exposed this before multi-word
+    /// fields).
+    #[serde(rename_all = "camelCase")]
+    ToolCallStarted {
+        /// The builder tool the model called (e.g. `add_filter`).
+        name: String,
+        /// A short, non-secret preview of the call arguments.
+        arguments_preview: String,
+    },
+    /// A composer tool call produced an outcome (r1.s1.w4).
+    ///
+    /// Mirrors [`ComposerEvent::ToolCallResult`](crate::agent::ComposerEvent) —
+    /// the `Ok` summary or the serialized correctable `FieldError`s, appended to
+    /// the same step its `ToolCallStarted` opened.
+    #[serde(rename_all = "camelCase")]
+    ToolCallResult {
+        /// The builder tool the model called.
+        name: String,
+        /// The `Ok` summary or the serialized correctable errors.
+        outcome: String,
+    },
     /// The run finished successfully. Always the last event on a channel.
+    ///
+    /// For a compose run (r1.s1.w4) the closing summary is the composer's own
+    /// finalize line — `ComposerEvent::Finalized`'s `version_summary`.
     Finished {
         /// A closing summary line.
         message: String,

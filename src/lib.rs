@@ -434,9 +434,10 @@ pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
 // `mod tauri` -- a `pub` item unused outside its private module is a `dead_code` BUILD
 // error, not a warning (the harvested gotcha).
 pub use crate::tauri::{
-    BUS_COMMANDS, BusError, BusErrorCode, BusEvent, BusEventPayload, DesktopState, DslSummary,
-    EventSink, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RunId,
-    ShellInfo, StreamOutcome, VersionStats, demo_stream_core, export_bindings,
+    BUS_COMMANDS, BusError, BusErrorCode, BusEvent, BusEventPayload, ComposeDeps,
+    ComposeDslSummary, ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EventSink,
+    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RunId, ShellInfo,
+    StreamOutcome, VersionStats, compose_strategy_core, demo_stream_core, export_bindings,
     library_overview_core, run_desktop, shell_info_core,
 };
 
