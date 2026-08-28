@@ -29,7 +29,9 @@ pub(crate) mod error;
 pub(crate) mod events;
 
 pub use commands::{
-    BUS_COMMANDS, DesktopState, ShellInfo, StreamOutcome, demo_stream_core, shell_info_core,
+    BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
+    DesktopState, ShellInfo, StreamOutcome, compose_strategy_core, demo_stream_core,
+    shell_info_core,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -50,6 +52,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::bus_selftest_failure,
         commands::start_demo_stream,
         commands::credential_status,
+        commands::compose_strategy,
     ])
 }
 

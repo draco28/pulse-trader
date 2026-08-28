@@ -28,6 +28,13 @@
 // "not built yet" -- unbuilt-ness is DERIVED from that absence, never a
 // separately-tracked flag (G8; see `isNavBuilt` below).
 import type { ReactNode } from "react";
+// `createElement`, not JSX: this file is the route TABLE (a `.ts` file by
+// contract -- `tests/tauri_bus_contract.rs` reads this exact path), and esbuild
+// parses no JSX in `.ts`. The entry below mounts the screen exactly as an
+// `element: () => <DesignerScreen />` literal would.
+import { createElement } from "react";
+
+import DesignerScreen from "./screens/DesignerScreen";
 
 /** One screen in the shell. */
 export interface Route {
@@ -49,6 +56,12 @@ export const ROUTES: readonly Route[] = [
   {
     path: "/",
     title: "PulseTrader",
+  },
+  {
+    path: "/designer",
+    title: "Strategy Designer",
+    nav: "designer",
+    element: () => createElement(DesignerScreen),
   },
 ];
 

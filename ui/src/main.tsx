@@ -7,7 +7,9 @@
 // then shared.css first"); `app-shell.css` and `content.css` are this app's
 // own additions (not from the mock -- see each file's own header). `content.css`
 // (r1.s1.w6) loads after `shared.css` so its `.content`/`.unbuilt` rules can
-// rely on `shared.css`'s `.layout` grid already being defined.
+// rely on `shared.css`'s `.layout` grid already being defined. `designer.css`
+// (r1.s1.w4) is the Strategy Designer screen's shell-owned sheet, appended on
+// the same one-sheet-per-screen pattern.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -17,6 +19,7 @@ import "./styles/tokens.css";
 import "./styles/shared.css";
 import "./styles/app-shell.css";
 import "./styles/content.css";
+import "./styles/designer.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

@@ -1,0 +1,366 @@
+/* ============================================================
+   PulseTrader — designer.css
+   SHELL-OWNED (r1.s1.w4, spec step 7). NOT a port of the mock's
+   `strategy-designer.css` — `check-design-system.sh` forbids porting any
+   per-screen stylesheet from the mock, so this sheet is authored against
+   `tokens.css`'s custom properties, informed by READING the mock's designer
+   (chat-dominant column, step cards with mono tool names, a summary card of
+   titled DSL blocks) but written for what this screen actually renders.
+   Every value below is a token reference or a size derived from the spacing
+   scale — no mock colour literal is copied.
+   ============================================================ */
+
+/* The screen fills the content track as one chat-dominant column: the
+   conversation scrolls, the composer input sits below it. */
+.designer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  min-height: 100%;
+}
+
+.dsg-scroll {
+  flex: 1;
+  min-height: 0;
+}
+
+.dsg-chat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  max-width: 760px;
+}
+
+/* ---- the empty state (before any target is sent) ---- */
+
+.dsg-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-8) var(--sp-4);
+}
+
+.dsg-empty-title {
+  margin: 0;
+  font-size: var(--fs-17);
+  font-weight: var(--fw-semibold);
+  color: var(--text-2);
+}
+
+.dsg-empty-body {
+  margin: 0;
+  font-size: var(--fs-13);
+  line-height: var(--lh-normal);
+  color: var(--text-3);
+  max-width: 52ch;
+}
+
+/* ---- messages ---- */
+
+.dsg-msg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.dsg-msg-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-11);
+  color: var(--text-4);
+}
+
+.dsg-when {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+}
+
+.dsg-msg-user {
+  align-self: flex-end;
+  max-width: 80%;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-8);
+  background: var(--bg-raised);
+}
+
+.dsg-msg-user .dsg-msg-body {
+  font-size: var(--fs-14);
+  line-height: var(--lh-normal);
+  color: var(--text-1);
+}
+
+.dsg-msg-agent {
+  flex-direction: row;
+  gap: var(--sp-3);
+}
+
+/* The agent's left accent rail — the AI accent, reserved for agent output. */
+.dsg-rail {
+  width: 2px;
+  flex-shrink: 0;
+  border-radius: var(--r-2);
+  background: var(--ai-1);
+}
+
+.dsg-agent-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  flex: 1;
+}
+
+.dsg-agent-name {
+  color: var(--ai-1);
+  font-weight: var(--fw-medium);
+}
+
+/* ---- the step list ---- */
+
+.dsg-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.dsg-steps-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-11);
+  font-family: var(--font-mono);
+  color: var(--text-3);
+}
+
+.dsg-steps-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.dsg-step {
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  background: var(--bg-base);
+}
+
+.dsg-step.is-running {
+  border-color: var(--ai-line);
+}
+
+.dsg-step-marker {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
+  color: var(--bull-1);
+  font-size: var(--fs-11);
+}
+
+.dsg-step.is-running .dsg-step-marker {
+  color: var(--ai-1);
+}
+
+.dsg-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.dsg-step-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.dsg-step-name {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--ai-1);
+}
+
+.dsg-step-preview {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.dsg-step-outcome {
+  font-size: var(--fs-12);
+  line-height: var(--lh-snug);
+  color: var(--text-2);
+}
+
+/* ---- the finalize summary card ---- */
+
+.dsg-ssc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  border: 1px solid var(--ai-line);
+  border-radius: var(--r-8);
+  background: var(--ai-bg);
+  padding: var(--sp-4);
+}
+
+.dsg-ssc-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.dsg-ssc-tag {
+  font-size: var(--fs-11);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--ai-1);
+}
+
+.dsg-ssc-name {
+  font-size: var(--fs-15);
+  font-weight: var(--fw-semibold);
+  color: var(--text-1);
+}
+
+.dsg-ssc-ver {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+
+.dsg-ssc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--sp-3);
+}
+
+.dsg-ssc-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  background: var(--bg-base);
+  padding: var(--sp-3);
+}
+
+.dsg-ssc-block-head {
+  font-size: var(--fs-11);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-3);
+}
+
+.dsg-ssc-block-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.dsg-ssc-block-body code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-1);
+}
+
+.dsg-ssc-foot {
+  display: flex;
+}
+
+.dsg-ssc-meta {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+
+/* ---- errors (a failed or unresolvable-credential run, rendered in-conversation) ---- */
+
+.dsg-error {
+  border: 1px solid var(--bear-line);
+  border-radius: var(--r-6);
+  background: var(--bear-bg);
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  line-height: var(--lh-normal);
+  padding: var(--sp-3);
+}
+
+/* ---- the composer input ---- */
+
+.dsg-input {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-8);
+  background: var(--bg-raised);
+  padding: var(--sp-3);
+}
+
+.dsg-textarea {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  border: 0;
+  outline: none;
+  background: var(--bg-input);
+  color: var(--text-1);
+  font-family: var(--font-ui);
+  font-size: var(--fs-14);
+  line-height: var(--lh-normal);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-6);
+}
+
+.dsg-textarea::placeholder {
+  color: var(--text-4);
+}
+
+.dsg-textarea:focus-visible {
+  outline: 1px solid var(--ai-line);
+}
+
+.dsg-input-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.dsg-hint {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-4);
+}
+
+.dsg-send {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  border: 1px solid var(--ai-line);
+  border-radius: var(--r-6);
+  background: var(--ai-bg);
+  color: var(--ai-1);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  padding: var(--sp-2) var(--sp-4);
+  cursor: pointer;
+}
+
+.dsg-send:hover:not(:disabled) {
+  background: hsl(265 70% 60% / 0.2);
+}
+
+.dsg-send:disabled {
+  color: var(--text-4);
+  border-color: var(--line-1);
+  background: var(--bg-base);
+  cursor: default;
+}

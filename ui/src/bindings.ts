@@ -51,6 +51,30 @@ export const commands = {
 	 *  failure mode this command does not have.
 	 */
 	credentialStatus: () => __TAURI_INVOKE<CredentialStatus>("credential_status"),
+	/**
+	 *  Compose a strategy from a natural-language target, streaming the composer's
+	 *  tool-call steps over a **per-invocation** channel (grill A2 — the channel is
+	 *  the correlation) until the run finalizes and a persisted, attributable
+	 *  `StrategyVersion` exists.
+	 * 
+	 *  **Nothing but the target crosses the boundary in, and no credential crosses
+	 *  it in any direction, ever** (ADR-0016, the risk gate's IPC half): the key
+	 *  resolves INSIDE the ring via [`resolve_llm_api_key`], `key.expose()` reaches
+	 *  exactly two consumers (the provider constructor and `Redactor::from_config`),
+	 *  and the credential-source LABEL is captured before either — the live arm's
+	 *  key discipline (`src/cli/compose.rs`), mirrored.
+	 * 
+	 *  An unresolvable credential is a [`BusError`] carrying the resolver's own
+	 *  message — it names every searched location and fails closed (`w2`); the
+	 *  screen renders it, and `w5`'s banner already states the condition globally.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] on a config-load failure, an unresolvable credential,
+	 *  or a genuine compose/persist failure. A dropped channel is reported as
+	 *  `cancelled` in the [`ComposeResult`], not as an error.
+	 */
+	composeStrategy: (nlTarget: string, channel: Channel<BusEvent>) => typedError<ComposeResult, BusError>(__TAURI_INVOKE("compose_strategy", { nlTarget, channel })),
 };
 
 /* Types */
@@ -117,10 +141,105 @@ export type BusEventPayload =
 { kind: "progress"; 
 /**  Human-readable progress text. */
 message: string } | 
-/**  The run finished successfully. Always the last event on a channel. */
+/**
+ *  A composer tool call was dispatched to a builder tool (r1.s1.w4).
+ * 
+ *  Mirrors [`ComposerEvent::ToolCallStarted`](crate::agent::ComposerEvent):
+ *  the payload carries the composer's OWN fields — the tool name and its
+ *  non-secret arguments preview — never invented ones. Mapping the composer's
+ *  stream onto the channel is rendering, not faking.
+ * 
+ *  The variant-level `rename_all` exists because the ENUM-level one renames
+ *  variants only, not their fields — without it `arguments_preview` would
+ *  cross the wire in `snake_case` against the file's `camelCase` convention
+ *  (a nothing-word like `message` never exposed this before multi-word
+ *  fields).
+ */
+{ kind: "toolCallStarted"; 
+/**  The builder tool the model called (e.g. `add_filter`). */
+name: string; 
+/**  A short, non-secret preview of the call arguments. */
+argumentsPreview: string } | 
+/**
+ *  A composer tool call produced an outcome (r1.s1.w4).
+ * 
+ *  Mirrors [`ComposerEvent::ToolCallResult`](crate::agent::ComposerEvent) —
+ *  the `Ok` summary or the serialized correctable `FieldError`s, appended to
+ *  the same step its `ToolCallStarted` opened.
+ */
+{ kind: "toolCallResult"; 
+/**  The builder tool the model called. */
+name: string; 
+/**  The `Ok` summary or the serialized correctable errors. */
+outcome: string } | 
+/**
+ *  The run finished successfully. Always the last event on a channel.
+ * 
+ *  For a compose run (r1.s1.w4) the closing summary is the composer's own
+ *  finalize line — `ComposerEvent::Finalized`'s `version_summary`.
+ */
 { kind: "finished"; 
 /**  A closing summary line. */
 message: string };
+
+/**
+ *  The compact DSL summary a finalized run returns — the finalize summary
+ *  card's data, rendered from the fields the persisted version actually
+ *  carries (the `w3` "real fields" discipline: render what the DSL carries,
+ *  omit what it does not).
+ * 
+ *  Lines, not structures, on purpose: the ring renders the DSL's own values
+ *  into mono summary lines and the screen never parses strategy JSON.
+ */
+export type ComposeDslSummary = {
+	/**  The trade side, `"long"` / `"short"` — the DSL's own `Direction` value. */
+	direction: string,
+	/**  The required entry trigger, e.g. `rsi(14) < 30`. */
+	entry: string,
+	/**  The gating conditions conjoined with the entry, one line each. */
+	filters: string[],
+	/**  The exit rules, one line each (e.g. `stop_loss 5%`, `take_profit 2R`). */
+	exits: string[],
+	/**  The risk / sizing inputs, one line each. */
+	risk: string[],
+};
+
+/**
+ *  The outcome of one compose run — [`StreamOutcome`]'s shape (a run id, what
+ *  actually crossed, cancellation) extended with the finalize payload.
+ * 
+ *  `strategy` is `None` exactly when the run did not finalize: a cancelled run
+ *  (the screen went away) carries no summary because nothing persisted.
+ */
+export type ComposeResult = {
+	/**  The run this outcome describes. */
+	runId: RunId,
+	/**  How many events actually reached the far end. */
+	emitted: number,
+	/**  True when the far end went away mid-run (the screen unmounted). */
+	cancelled: boolean,
+	/**  The persisted strategy summary — present iff the run finalized. */
+	strategy: ComposeStrategySummary | null,
+};
+
+/**  What a finalized compose run reports about the strategy it persisted. */
+export type ComposeStrategySummary = {
+	/**  The persisted strategy's repo-minted id. */
+	strategyId: string,
+	/**  The strategy's name (the DSL's own `name`). */
+	strategyName: string,
+	/**  The persisted initial version's repo-minted id. */
+	versionId: string,
+	/**
+	 *  Who authored the version — the `strategy_version.created_by` label
+	 *  (`"composer_llm"` for this run; the pinned serialization strings).
+	 */
+	createdBy: string,
+	/**  How many `LlmCall`s produced this version (its provenance count). */
+	llmCallCount: number,
+	/**  The compact DSL summary rendered above. */
+	dsl: ComposeDslSummary,
+};
 
 /**
  *  The value-free credential read for a UI banner (r1.s1.w2 step 6) — which source

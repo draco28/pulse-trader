@@ -47,8 +47,13 @@ describe("resolveRoute (including the no-element path)", () => {
 });
 
 describe("isNavBuilt (the derived unbuilt set)", () => {
-  it("is false for every current nav id -- no screen has landed yet", () => {
-    for (const navId of KNOWN_NAV_IDS) {
+  // r1.s1.w4: the designer row went live (its ROUTES entry carries an
+  // `element`), so the derived set changed with it -- which is G8 working as
+  // designed: unbuilt-ness is derived from the table, never pre-seeded, and
+  // this test tracks whatever the table now says.
+  it("is true for the designer and false for every other nav id", () => {
+    expect(isNavBuilt("designer")).toBe(true);
+    for (const navId of KNOWN_NAV_IDS.filter((id) => id !== "designer")) {
       expect(isNavBuilt(navId)).toBe(false);
     }
   });
