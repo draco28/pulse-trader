@@ -51,6 +51,19 @@ export const commands = {
 	 *  failure mode this command does not have.
 	 */
 	credentialStatus: () => __TAURI_INVOKE<CredentialStatus>("credential_status"),
+	/**
+	 *  The Strategy Library's one read: every strategy, its version tree, per-version
+	 *  stats where a persisted run exists, and each version's recent run catalog.
+	 * 
+	 *  A pure read — the Library writes nothing (ADR-0010); pin/archive/rename each
+	 *  need a write command and are out of this item's budget.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] if any repository read fails — including a corrupt
+	 *  run row surfacing from the fail-closed `latest_run_for_version` (#39).
+	 */
+	libraryOverview: () => typedError<LibraryOverview, BusError>(__TAURI_INVOKE("library_overview")),
 };
 
 /* Types */
@@ -151,6 +164,87 @@ export type CredentialStatus =
 "none";
 
 /**
+ *  A version's DSL rendered to summary lines — exactly the fields
+ *  [`StrategyDsl`] carries, nothing more.
+ */
+export type DslSummary = {
+	/**  The document's name. */
+	name: string,
+	/**  `"long"` or `"short"`. */
+	direction: string,
+	/**  The entry trigger, one line (the DSL's `entry` is a single condition). */
+	entry: string[],
+	/**  The gating filters, one line each. */
+	filters: string[],
+	/**  The exit rules, one line each. */
+	exits: string[],
+	/**  The risk parameters, one line each. */
+	risk: string[],
+};
+
+/**
+ *  The `library_overview` command's whole payload: every strategy, each with its
+ *  version tree.
+ */
+export type LibraryOverview = {
+	/**  Every persisted strategy, in the repository's list order. */
+	strategies: LibraryStrategy[],
+};
+
+/**  One row of a version's run catalog (`list_runs_for_version`'s projection). */
+export type LibraryRunSummary = {
+	/**  The run's id. */
+	id: string,
+	/**  Run timestamp (RFC3339 UTC, from the record). */
+	createdAt: string,
+	/**  Mean P&L per trade, e.g. `"+0.42R"`. */
+	expectancy: string,
+	/**  Completed trades in the run. */
+	trades: number,
+};
+
+/**  One strategy and its `version_tree`-ordered versions. */
+export type LibraryStrategy = {
+	/**  The strategy's id. */
+	id: string,
+	/**  The strategy's name. */
+	name: string,
+	/**  Creation timestamp (RFC3339 UTC, from the record). */
+	createdAt: string,
+	/**  The pinned version's id, if the strategy has one (FR-11 pin). */
+	pinnedVersionId: string | null,
+	/**  All versions, parent-before-child (`version_tree` order). */
+	versions: LibraryVersion[],
+};
+
+/**  One version: tree position, DSL summary, stats-or-em-dash, recent runs. */
+export type LibraryVersion = {
+	/**  The version's id. */
+	id: string,
+	/**  The parent version's id (`None` for a root). */
+	parentId: string | null,
+	/**  Creation timestamp (RFC3339 UTC, from the record). */
+	createdAt: string,
+	/**  The version's DSL, rendered to summary lines. */
+	dsl: DslSummary,
+	/**
+	 *  The latest persisted run's stats, or `None` when no run exists — the
+	 *  screen renders an em dash on `None` (grill A1).
+	 */
+	stats: VersionStats | null,
+	/**
+	 *  The expectancy delta vs the parent's, formatted (e.g. `"+0.12R"`), when
+	 *  BOTH this version and its parent carry a run. `None` otherwise.
+	 */
+	deltaVsParent: string | null,
+	/**
+	 *  This version's run catalog (best-effort — one corrupt row costs its row
+	 *  here, not the screen), newest first.
+	 */
+	recentRuns: LibraryRunSummary[],
+};
+
+/**
  *  A per-invocation run identifier, minted when a streaming command starts.
  * 
  *  Opaque on the wire (`#[serde(transparent)]` over a UUID string) so the frontend
@@ -185,6 +279,19 @@ export type StreamOutcome = {
 	emitted: number,
 	/**  True when the far end went away mid-run (the screen unmounted). */
 	cancelled: boolean,
+};
+
+/**
+ *  The three headline KPIs the screen renders per version, pre-formatted from
+ *  the persisted run's [`SummaryStats`].
+ */
+export type VersionStats = {
+	/**  Mean P&L per trade, e.g. `"+0.42R"`. */
+	expectancy: string,
+	/**  Fraction of winners, e.g. `"48.3%"`. */
+	winRate: string,
+	/**  Completed trades in the run. */
+	trades: number,
 };
 
 /* Tauri Specta runtime */

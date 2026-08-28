@@ -27,12 +27,20 @@
 pub(crate) mod commands;
 pub(crate) mod error;
 pub(crate) mod events;
+// r1.s1.w3: the Strategy Library's ring-owned wire DTOs + pure projections.
+// A separate module so `commands.rs` stays the registration surface while the
+// projection logic lives next to its own unit tests.
+pub(crate) mod library;
 
 pub use commands::{
-    BUS_COMMANDS, DesktopState, ShellInfo, StreamOutcome, demo_stream_core, shell_info_core,
+    BUS_COMMANDS, DesktopState, ShellInfo, StreamOutcome, demo_stream_core, library_overview_core,
+    shell_info_core,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
+pub use library::{
+    DslSummary, LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, VersionStats,
+};
 
 /// Build the `tauri-specta` builder that owns the command registry.
 ///
@@ -50,6 +58,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::bus_selftest_failure,
         commands::start_demo_stream,
         commands::credential_status,
+        commands::library_overview,
     ])
 }
 

@@ -48,11 +48,13 @@ export function App() {
   const navEntry = NAV_ALL.find((item) => item.id === navId);
   const title = route?.title ?? navEntry?.label;
 
-  // No route landed by this item ever declares a details pane -- the third
-  // (360px) `.layout` track has nothing to show. `w3` opts the Library route
-  // back into it when it ports `DetailsPane`; until then the shell always
-  // collapses the track rather than leaving it an empty hole beside the pane.
-  const showDetailsPane = false;
+  // Table-driven (r1.s1.w3, G7): whether the third (360px) `.layout` track
+  // exists is declared by the ROUTE (`details: true`), never by a screen-name
+  // list here. The existing `.layout-no-details` modifier does the rest; the
+  // shell owns the track, the screen owns what fills it — a route with
+  // `details` gets an empty host `<aside>` and its screen portals the pane
+  // content in (see `LibraryScreen.tsx`).
+  const showDetailsPane = route?.details === true;
 
   return (
     <WindowChrome docTitle={title}>
@@ -62,6 +64,7 @@ export function App() {
           <CredentialBanner />
           <RouteContent route={route} />
         </main>
+        {showDetailsPane && <aside className="details" id="details-pane" />}
       </div>
     </WindowChrome>
   );
