@@ -127,6 +127,17 @@ jobs:
       - name: Install toolchain (pinned via rust-toolchain.toml)
         run: rustup show
 
+      # r1.s1 (w1) brought the Tauri desktop ring into the crate, and on Linux the
+      # `tauri` dependency compiles against the GTK/webkit system stack — without
+      # these dev packages `gobject-sys` fails pkg-config ("Package 'gobject-2.0'
+      # … not found") before any test runs. This job compiles the whole crate
+      # (the test links the lib, whose `mod tauri` pulls the dependency in), so
+      # it needs Tauri v2's documented Linux prerequisites.
+      - name: Install Tauri Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
       # Ship-faithful (gate-2): the cross-arch gate runs the profile the .app
       # ships (`--release`), so a release-only auto-vectorization divergence
       # cannot ship unproven. 100x sequential + 100x Rayon, all 200 hashes equal.
