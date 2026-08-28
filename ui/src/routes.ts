@@ -29,6 +29,8 @@
 // separately-tracked flag (G8; see `isNavBuilt` below).
 import type { ReactNode } from "react";
 
+import LibraryScreen from "./screens/LibraryScreen";
+
 /** One screen in the shell. */
 export interface Route {
   /** URL fragment that selects this screen. Unique across the table. */
@@ -43,12 +45,33 @@ export interface Route {
   readonly nav?: string;
   /** The screen to mount. Absent means the destination is not built yet. */
   readonly element?: () => ReactNode;
+  /**
+   * Whether this screen's layout uses the `.layout` grid's third (360px)
+   * details track (r1.s1.w3). Table-driven on purpose: the shell opens the
+   * track purely from this flag — never from a screen-name list in `App.tsx`,
+   * which would be the second table G7 exists to prevent. A route declaring
+   * it must also declare an `element` (asserted by `routes.test.ts`).
+   */
+  readonly details?: boolean;
 }
 
 export const ROUTES: readonly Route[] = [
   {
     path: "/",
     title: "PulseTrader",
+  },
+  // r1.s1.w3: the app's first real screen. Appending this entry upgrades the
+  // default landing by itself (`DEFAULT_NAV_ID` is "library") — `isNavBuilt`
+  // derives true and the nav row's "Soon" badge disappears with no nav-side
+  // edit (G8). `element: LibraryScreen` — the zero-prop screen convention
+  // `UnbuiltScreen.tsx` demonstrates; `details: true` opts the route back into
+  // the third track `w6` collapsed.
+  {
+    path: "/library",
+    title: "Strategy Library",
+    nav: "library",
+    element: LibraryScreen,
+    details: true,
   },
 ];
 

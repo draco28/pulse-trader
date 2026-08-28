@@ -15,6 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./bindings", () => ({
   commands: {
     credentialStatus: vi.fn().mockResolvedValue("none"),
+    // r1.s1.w3: the default landing is now the Library screen, which reads
+    // `libraryOverview` on mount — mocked to an empty payload so these shell
+    // tests keep asserting the shell (the screen's own behaviour lives in
+    // `screens/LibraryScreen.test.tsx`).
+    libraryOverview: vi.fn().mockResolvedValue({ status: "ok", data: { strategies: [] } }),
   },
 }));
 

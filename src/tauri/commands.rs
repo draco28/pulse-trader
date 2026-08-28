@@ -31,18 +31,28 @@
 // the crate-wide pedantic posture is untouched everywhere else.
 #![allow(clippy::needless_pass_by_value, clippy::used_underscore_binding)]
 
+use std::collections::HashMap;
 use std::path::Path;
 
+use chrono::SecondsFormat;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::error::BusError;
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
+use super::library::{
+    LibraryOverview, LibraryStrategy, LibraryVersion, dsl_summary, format_expectancy,
+    recent_run_summary, version_stats,
+};
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{Db, SqliteStrategyRepo, default_db_path, open_migrated};
+use crate::adapters::db::{
+    Db, SqliteBacktestRunRepo, SqliteStrategyRepo, default_db_path, open_migrated,
+};
 use crate::adapters::secrets::llm_credential_status;
 use crate::domain::CredentialStatus;
 use crate::domain::EngineFingerprint;
-use crate::domain::StrategyRepository;
+use crate::domain::strategy::{Strategy, StrategyVersion};
+use crate::domain::{BacktestRunRepository, StrategyRepository};
 
 // ---------------------------------------------------------------------------
 // Clause 4 — the ONE registration point
@@ -70,6 +80,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "bus_selftest_failure",
     "start_demo_stream",
     "credential_status",
+    "library_overview",
 ];
 
 // ---------------------------------------------------------------------------
@@ -114,6 +125,14 @@ impl DesktopState {
     #[must_use]
     pub fn strategy_repo(&self) -> SqliteStrategyRepo<SystemClock> {
         SqliteStrategyRepo::new(self.db.pool().clone())
+    }
+
+    /// A backtest-run repository over the shared pool (r1.s1.w3) — the Library's
+    /// per-version run reads. Same cheap-wrapper pattern as
+    /// [`DesktopState::strategy_repo`]: a cloned pool handle, not a connection.
+    #[must_use]
+    pub fn backtest_run_repo(&self) -> SqliteBacktestRunRepo<SystemClock> {
+        SqliteBacktestRunRepo::new(self.db.pool().clone())
     }
 
     /// The owned database handle.
@@ -161,6 +180,112 @@ pub async fn shell_info_core(state: &DesktopState) -> Result<ShellInfo, BusError
         engine_fingerprint: EngineFingerprint::current().as_str().to_owned(),
         target_triple: EngineFingerprint::target().to_owned(),
         strategy_count: u32::try_from(strategies.len()).unwrap_or(u32::MAX),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The Strategy Library's read (r1.s1.w3, ledger line d2)
+// ---------------------------------------------------------------------------
+
+/// How many of a version's runs the details pane's "Recent backtests" list
+/// carries. The catalog read is best-effort per row; the cap keeps one
+/// long-running version from flooding the pane.
+const RECENT_RUN_LIMIT: usize = 5;
+
+/// The transport-free core of the `library_overview` command — the whole
+/// Strategy Library payload in one read.
+///
+/// Every strategy (archived included — the record exists, and the Library hides
+/// nothing that is persisted), each with its `version_tree`-ordered versions,
+/// each version with its DSL summary, its latest run's stats (`None` when no
+/// run exists — the screen renders an em dash there, grill A1), its expectancy
+/// delta vs the parent when both carry a run, and its recent run catalog.
+///
+/// `latest_run_for_version` is fail-closed by design (#39): one corrupt run row
+/// is a `BusError` naming the row, not a silently missing KPI. The recent-runs
+/// list reads `list_runs_for_version`, the one best-effort read in the port — a
+/// bad row costs its row there, not the screen.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] if any repository read fails.
+pub async fn library_overview_core(state: &DesktopState) -> Result<LibraryOverview, BusError> {
+    let strategies_repo = state.strategy_repo();
+    let runs_repo = state.backtest_run_repo();
+    let strategies = strategies_repo.list_strategies(true).await?;
+
+    let mut wire = Vec::with_capacity(strategies.len());
+    for strategy in &strategies {
+        let versions = strategies_repo.version_tree(&strategy.id).await?;
+        wire.push(library_strategy(strategy, &versions, &runs_repo).await?);
+    }
+    Ok(LibraryOverview { strategies: wire })
+}
+
+/// Project one strategy + its parent-ordered versions into the wire shape.
+///
+/// `version_tree` guarantees parent-before-child, so a single forward pass can
+/// track the expectancies seen so far and compute each child's delta vs its
+/// (already-projected) parent without a second read.
+async fn library_strategy(
+    strategy: &Strategy,
+    versions: &[StrategyVersion],
+    runs: &SqliteBacktestRunRepo<SystemClock>,
+) -> Result<LibraryStrategy, BusError> {
+    let mut expectancies: HashMap<&str, Decimal> = HashMap::new();
+    let mut wire_versions = Vec::with_capacity(versions.len());
+
+    for version in versions {
+        let latest = runs.latest_run_for_version(&version.id).await?;
+        let recent = runs.list_runs_for_version(&version.id).await?;
+        let stats = latest.as_ref().map(|run| version_stats(&run.summary));
+
+        let delta_vs_parent = match (
+            latest.as_ref(),
+            version
+                .parent_version_id
+                .as_ref()
+                .and_then(|parent| expectancies.get(parent.as_str())),
+        ) {
+            (Some(run), Some(parent)) => Some(format_expectancy(run.summary.expectancy - *parent)),
+            _ => None,
+        };
+        if let Some(run) = &latest {
+            expectancies.insert(version.id.as_str(), run.summary.expectancy);
+        }
+
+        wire_versions.push(LibraryVersion {
+            id: version.id.as_str().to_owned(),
+            parent_id: version
+                .parent_version_id
+                .as_ref()
+                .map(|parent| parent.as_str().to_owned()),
+            created_at: version
+                .created_at
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            dsl: dsl_summary(&version.dsl),
+            stats,
+            delta_vs_parent,
+            recent_runs: recent
+                .iter()
+                .rev()
+                .take(RECENT_RUN_LIMIT)
+                .map(recent_run_summary)
+                .collect(),
+        });
+    }
+
+    Ok(LibraryStrategy {
+        id: strategy.id.as_str().to_owned(),
+        name: strategy.name.clone(),
+        created_at: strategy
+            .created_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        pinned_version_id: strategy
+            .pinned_version_id
+            .as_ref()
+            .map(|pinned| pinned.as_str().to_owned()),
+        versions: wire_versions,
     })
 }
 
@@ -324,6 +449,28 @@ pub async fn start_demo_stream(
 #[specta::specta]
 pub async fn credential_status() -> CredentialStatus {
     llm_credential_status()
+}
+
+// ---------------------------------------------------------------------------
+// The Strategy Library's read (r1.s1.w3) — the app's first real screen
+// ---------------------------------------------------------------------------
+
+/// The Strategy Library's one read: every strategy, its version tree, per-version
+/// stats where a persisted run exists, and each version's recent run catalog.
+///
+/// A pure read — the Library writes nothing (ADR-0010); pin/archive/rename each
+/// need a write command and are out of this item's budget.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] if any repository read fails — including a corrupt
+/// run row surfacing from the fail-closed `latest_run_for_version` (#39).
+#[tauri::command]
+#[specta::specta]
+pub async fn library_overview(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<LibraryOverview, BusError> {
+    library_overview_core(&state).await
 }
 
 #[cfg(test)]

@@ -42,14 +42,31 @@ describe("resolveRoute (including the no-element path)", () => {
   });
 
   it("returns undefined for a path with no matching entry at all", () => {
-    expect(resolveRoute("/library")).toBeUndefined();
+    expect(resolveRoute("/not-a-real-destination")).toBeUndefined();
   });
 });
 
 describe("isNavBuilt (the derived unbuilt set)", () => {
-  it("is false for every current nav id -- no screen has landed yet", () => {
-    for (const navId of KNOWN_NAV_IDS) {
-      expect(isNavBuilt(navId)).toBe(false);
+  // r1.s1.w3: the library row went live, so the flat "everything is unbuilt"
+  // assertion w6 authored no longer holds. The derived form below is the
+  // invariant that survives every future append (w4's included): a nav id is
+  // built exactly when its ROUTES entry carries an element.
+  it("is true exactly for nav ids whose ROUTES entry carries an element", () => {
+    expect(isNavBuilt("library")).toBe(true);
+    for (const route of ROUTES) {
+      if (route.nav !== undefined) {
+        expect(isNavBuilt(route.nav)).toBe(route.element !== undefined);
+      }
+    }
+  });
+});
+
+describe("the details track stays table-driven (r1.s1.w3)", () => {
+  it("a route declaring the details track also declares an element", () => {
+    for (const route of ROUTES) {
+      if (route.details === true) {
+        expect(route.element).toBeDefined();
+      }
     }
   });
 });
