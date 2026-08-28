@@ -4,14 +4,15 @@ Date: 2026-08-25T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
-(Authored by `r1.s1.w1`, the first work item that actually builds the shell. It is
-`Proposed` on purpose: ossify's bones protocol mints a decision `Accepted` only once a
-release has exercised it, and at authoring time the shell has been built but not yet
-shipped through a closed release. `r1.s1`'s close flips it to `Accepted`. This ADR
-closes the half of **ADR-0003** that ADR-0015 explicitly refused ownership of, and the
-half of **ADR-0019** that its *Deliberately out of scope* section named and deferred.)
+(Accepted 2026-08-28 at spine `r1.s1`'s close: the shell this ADR decided was built by
+`r1.s1.w1` and exercised end to end by `w2`/`w5`/`w6`/`w3`/`w4` — bundled app, real
+navigation, live streaming compose — with the AC-10 walks driven by hand on the merged tree.
+Authored `Proposed` on purpose by `r1.s1.w1`: ossify's bones protocol mints a decision
+`Accepted` only once a release has exercised it. This ADR closes the half of **ADR-0003**
+that ADR-0015 explicitly refused ownership of, and the half of **ADR-0019** that its
+*Deliberately out of scope* section named and deferred.)
 
 ## Context
 
