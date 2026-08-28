@@ -4,9 +4,9 @@
 // The screen is a conversation: a user bubble per submitted natural-language
 // target, one agent message per compose run whose step list renders the
 // structured events the `compose_strategy` command streams over its
-// per-invocation channel — each tool call appearing the moment its
-// `toolCallStarted` arrives and its outcome appending when the matching
-// `toolCallResult` does (that one-by-one rendering is `d1`'s observable).
+// per-invocation channel. The run's state machine — channel wiring, the
+// event-to-step reduction, the running / finalize / error state — lives in
+// `useComposeRun` (dispatch 2's extraction); this file renders it.
 //
 // What this screen deliberately does NOT do (the r1-honest composition):
 //
@@ -29,131 +29,11 @@
 //     credential surfaces HERE as the run's rendered `BusError` message —
 //     no silent failure.
 
-import { useState } from "react";
-import { Channel } from "@tauri-apps/api/core";
-
-import { commands } from "../bindings";
-import type { BusEvent, ComposeResult } from "../bindings";
-
-/** The finalize payload, minus the null a cancelled run carries. */
-type StrategySummary = NonNullable<ComposeResult["strategy"]>;
-
-/** One streamed composer step: opened by `toolCallStarted`, closed by its result. */
-interface StepState {
-  name: string;
-  preview: string;
-  outcome: string | undefined;
-}
-
-type RunStatus = "streaming" | "finalized" | "cancelled" | "error";
-
-/** One agent message's run state — the step list and how it ended. */
-interface AgentTurn {
-  status: RunStatus;
-  steps: StepState[];
-  summary: StrategySummary | undefined;
-  error: string | undefined;
-}
-
-type Message =
-  | { kind: "user"; when: string; text: string }
-  | { kind: "agent"; when: string; turn: AgentTurn };
-
-/** A short local timestamp for the message metas. */
-function clockLabel(): string {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
+import { useComposeRun } from "../hooks/useComposeRun";
+import type { AgentTurn, StrategySummary } from "../hooks/useComposeRun";
 
 export default function DesignerScreen() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [target, setTarget] = useState("");
-  const [running, setRunning] = useState(false);
-
-  /** Patch the newest agent turn (the run in flight), leaving older runs untouched. */
-  const patchLastTurn = (patch: (turn: AgentTurn) => AgentTurn) => {
-    setMessages((current) => {
-      const last = current[current.length - 1];
-      if (last === undefined || last.kind !== "agent") {
-        return current;
-      }
-      const copy = current.slice();
-      copy[copy.length - 1] = { ...last, turn: patch(last.turn) };
-      return copy;
-    });
-  };
-
-  /** Fold one streamed event into the running turn. */
-  const handleEvent = (event: BusEvent) => {
-    const { payload } = event;
-    if (payload.kind === "toolCallStarted") {
-      patchLastTurn((turn) => ({
-        ...turn,
-        steps: [
-          ...turn.steps,
-          { name: payload.name, preview: payload.argumentsPreview, outcome: undefined },
-        ],
-      }));
-    } else if (payload.kind === "toolCallResult") {
-      patchLastTurn((turn) => ({
-        ...turn,
-        steps: attachOutcome(turn.steps, payload.name, payload.outcome),
-      }));
-    }
-    // `started` / `finished` carry no step-list mutation of their own: the
-    // streaming state belongs to the run as a whole, and the finalize summary
-    // arrives with the command's return value, not on the event channel.
-  };
-
-  const submit = () => {
-    const text = target.trim();
-    if (text === "" || running) {
-      return;
-    }
-    setTarget("");
-    setRunning(true);
-
-    // One channel per invocation (grill A2): it is the whole correlation
-    // between this run's steps and this agent message.
-    const channel = new Channel<BusEvent>();
-    channel.onmessage = handleEvent;
-
-    const when = clockLabel();
-    setMessages((current) => [
-      ...current,
-      { kind: "user", when, text },
-      { kind: "agent", when, turn: { status: "streaming", steps: [], summary: undefined, error: undefined } },
-    ]);
-
-    void commands
-      .composeStrategy(text, channel)
-      .then((result) => {
-        if (result.status === "ok") {
-          patchLastTurn((turn) => ({
-            ...turn,
-            status: result.data.cancelled ? "cancelled" : "finalized",
-            summary: result.data.strategy ?? undefined,
-          }));
-        } else {
-          patchLastTurn((turn) => ({
-            ...turn,
-            status: "error",
-            error: result.error.message,
-          }));
-        }
-      })
-      .catch((error: unknown) => {
-        // A non-serialized failure (an unreachable command, a broken bridge)
-        // still renders — the no-silent-failure rule covers this path too.
-        patchLastTurn((turn) => ({
-          ...turn,
-          status: "error",
-          error: error instanceof Error ? error.message : String(error),
-        }));
-      })
-      .finally(() => {
-        setRunning(false);
-      });
-  };
+  const { messages, target, setTarget, running, submit } = useComposeRun();
 
   return (
     <div className="designer">
@@ -235,23 +115,6 @@ export default function DesignerScreen() {
       </div>
     </div>
   );
-}
-
-/** Append a tool result to the LAST open step of that name (names can repeat). */
-function attachOutcome(steps: StepState[], name: string, outcome: string): StepState[] {
-  let target = -1;
-  for (let i = steps.length - 1; i >= 0; i -= 1) {
-    if (steps[i].name === name && steps[i].outcome === undefined) {
-      target = i;
-      break;
-    }
-  }
-  if (target === -1) {
-    return steps;
-  }
-  const copy = steps.slice();
-  copy[target] = { ...copy[target], outcome };
-  return copy;
 }
 
 /** The step list of one run, with its honest running/completed header. */
