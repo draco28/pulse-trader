@@ -7,8 +7,9 @@
 # malformed or empty ADR-0022 cannot pass.
 #
 # What it asserts:
-#   1. ADR-0022 exists and its `Status` section is exactly `Proposed` (spine close
-#      flips it to `Accepted`, never the implementer).
+#   1. ADR-0022 exists and its `Status` section is exactly `Accepted` (flipped from
+#      `Proposed` at spine r1.s5's close, 2026-08-28 — the flip and this gate's
+#      update were made in the same act, per the bones protocol).
 #   2. Its `Decision` section names `1.98.0`.
 #   3. Its `Consequences` section states the fingerprint moves AND that `compare`
 #      is a WARNING, never an error — the claim this spine exists to get right,
@@ -60,11 +61,13 @@ for heading in "Status" "Context" "Decision" "Consequences" "Alternatives consid
   fi
 done
 
-# --- 3. Status is exactly Proposed -------------------------------------------
+# --- 3. Status is exactly Accepted --------------------------------------------
+# Flipped from `Proposed` at spine r1.s5's close (2026-08-28) — the flip and this
+# gate's update are the same act, per the bones protocol.
 status_body="$(section "$adr_0022" "Status")"
 status_word="$(printf '%s\n' "$status_body" | grep -m1 -E '^[A-Za-z]+' | tr -d '[:space:]')"
-if [[ "$status_word" != "Proposed" ]]; then
-  fail "ADR-0022 Status is '${status_word:-<empty>}', expected exactly 'Proposed' (spine close flips it to Accepted)"
+if [[ "$status_word" != "Accepted" ]]; then
+  fail "ADR-0022 Status is '${status_word:-<empty>}', expected exactly 'Accepted' (flipped at r1.s5's close; only that close may flip it)"
 fi
 
 # --- 4. Decision names 1.98.0 -------------------------------------------------
@@ -130,4 +133,4 @@ if ((${#failures[@]} > 0)); then
   exit 1
 fi
 
-echo "check-adr-0022: OK (ADR-0022 Proposed, decision/consequences/alternatives recorded, ADR-0019 swept)"
+echo "check-adr-0022: OK (ADR-0022 Accepted — flipped at r1.s5's close, decision/consequences/alternatives recorded, ADR-0019 swept)"

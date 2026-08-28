@@ -4,16 +4,17 @@ Date: 2026-08-25T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
-(Authored by `r1.s5.w1`, the work item that makes the move. It is `Proposed` on
-purpose: ossify's bones protocol mints a decision `Accepted` only once a release has
-exercised it, and at authoring time the bump has landed on this work item's branch
-but the release has not yet closed. `r1.s5`'s close flips it to `Accepted`. This ADR
-answers `rust-toolchain.toml`'s own header comment — *"Bump deliberately (records in
-an ADR) when the engine moves"* — and is the ADR `Cargo.toml`'s specta-pin comment
-names: *"the toolchain bump needs its own ADR, because it moves the engine
-fingerprint (NFR-2 byte-reproducibility)."*)
+(Accepted 2026-08-28 at spine `r1.s5`'s close: the bump landed on `r1.s5.w1` and has been
+exercised — the whole test suite, `clippy --all-targets -D warnings` and `cargo deny` run
+green on 1.98.0, and the specta trio it unblocked (`w2`) deleted the
+`post_process_bindings` workaround rather than re-justifying it. Authored `Proposed` on
+purpose by `r1.s5.w1`: ossify's bones protocol mints a decision `Accepted` only once a
+release has exercised it. This ADR answers `rust-toolchain.toml`'s own header comment —
+*"Bump deliberately (records in an ADR) when the engine moves"* — and is the ADR
+`Cargo.toml`'s specta-pin comment names: *"the toolchain bump needs its own ADR, because it
+moves the engine fingerprint (NFR-2 byte-reproducibility)."*)
 
 ## Context
 
