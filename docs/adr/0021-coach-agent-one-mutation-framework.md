@@ -129,8 +129,20 @@ a context-overflow refusal) records a failed session with `llm_call_id` `NULL`.
 
 **6. One provider call per coach turn; every deviation is terminal and typed**
 (grill L3). Zero calls, several calls, malformed tool arguments, an inapplicable
-mutation, a provider timeout, context overflow — each ends the turn and is recorded
-as that session's typed failure. **No composer-style nudge retries.** A coach turn
+mutation, a provider timeout, context overflow, **and a provider transport failure**
+— each ends the turn and is recorded as that session's typed failure.
+
+*(Amended by operator ruling, 2026-08-29, r1.s2.w4.* The seventh kind,
+`TransportFailure`, was argued out of the taxonomy while `w3` was built: an HTTP
+5xx is an infrastructure fault rather than a coaching outcome, and recording it as
+one of the other six would have put a false reason in the audit trail. That
+reasoning held; the conclusion did not. A provider outage still left the ONE coach
+turn that produced no row, and release exit criterion 4 — "a recorded failed turn,
+never silence" — carries no infrastructure exemption. So the taxonomy gained an
+honest variant instead of the turn gaining an exception. Surfaced by `w3`'s own
+report §10 and ruled on before `0005` merged, which is why the schema edit was a
+CHECK widened in place rather than a second migration. The CLI still preserves the
+error at its edge (ADR-0017): recorded AND loud.)* **No composer-style nudge retries.** A coach turn
 is cheap to re-ask by hand, and a silent retry loop against a
 hidden-reasoning model is a cost trap (issue #124). Retry sophistication has to
 earn its way in later from the recorded-failure evidence this design produces.

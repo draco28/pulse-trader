@@ -47,7 +47,7 @@ use crate::agent::config::load_coach_prompt_from;
 use crate::agent::{Coach, LlmCallCapture};
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, Clock, CoachingRepository, CoachingSession,
+    BacktestRunId, BacktestRunRepository, Clock, CoachFailure, CoachingRepository, CoachingSession,
     CoachingSessionId, CredentialSource, LlmBackend, LlmCallRepository, LlmConfig, LlmProvider,
     PriceTable, SessionOutcome, StrategyRepository,
 };
@@ -267,6 +267,21 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
     .await?;
 
     print_outcome(&outcome);
+
+    // r1.s2.w4: a transport fault is now RECORDED (the session row above) AND
+    // LOUD. Routing it into the taxonomy must not quietly turn a provider outage
+    // into a successful `pulse coach` invocation — the row is for the audit trail,
+    // the non-zero exit is for the human and the shell (ADR-0017). The other six
+    // failures are genuine coaching outcomes and exit 0.
+    if let SessionOutcome::Failed {
+        failure: CoachFailure::TransportFailure { detail },
+    } = &outcome.session.outcome
+    {
+        anyhow::bail!(
+            "the coach's provider call failed: {detail} (recorded as coaching session {})",
+            outcome.session.id.as_str()
+        );
+    }
     Ok(())
 }
 

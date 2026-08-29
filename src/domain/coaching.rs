@@ -297,6 +297,29 @@ pub enum CoachFailure {
         /// The measured overflow.
         detail: String,
     },
+    /// The provider call was attempted but produced no usable exchange — an HTTP
+    /// 5xx, a refused connection, a malformed envelope, or a configuration fault
+    /// raised on the call path.
+    ///
+    /// **Added in r1.s2.w4 by operator ruling (2026-08-29).** It was originally
+    /// argued out of the taxonomy on the grounds that an infrastructure fault is
+    /// not a *coaching* outcome, and that recording it as one of the other six
+    /// would put a false reason in the audit trail. Both halves of that were
+    /// right; the conclusion was not. A provider outage still left the one silent
+    /// coach turn, and release exit criterion 4 says "a recorded failed turn,
+    /// never silence" without an infrastructure exemption. So the taxonomy gains
+    /// a variant that is honest about what happened rather than the turn gaining
+    /// an exception. The CLI still surfaces the error too (ADR-0017): recorded AND
+    /// loud, not either-or.
+    ///
+    /// No usable exchange means no usage, no cost and no ledger row, so these
+    /// sessions persist with `llm_call_id` NULL (audit C3).
+    #[error("the coach's provider call failed: {detail}")]
+    TransportFailure {
+        /// The provider error's preserved text, scrubbed — an error body can echo
+        /// the request that produced it.
+        detail: String,
+    },
 }
 
 /// Exactly one outcome per coach turn — a proposal or a typed failure.
