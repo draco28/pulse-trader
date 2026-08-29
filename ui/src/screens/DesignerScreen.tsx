@@ -20,17 +20,19 @@
 //     strategy + its initial version, and the card renders exactly the fields
 //     the outcome carries (name, version id, created-by, LlmCall count, DSL
 //     lines) and omits what it does not.
-//   - No cancel button. Cancellation is wired on the BACKEND: unmounting drops
-//     the channel, the next send fails, and the run stops (a dead cancel
-//     affordance is the broken-link defect at button scale). A genuinely
-//     wired cancel needs channel-side support this round does not build.
+//   - No cancel button. Cancellation is wired to LEAVING, not to a control:
+//     `useComposeRun`'s unmount cleanup calls `compose_cancel(runId)`, which
+//     trips the run's latch in the backend registry so the composer refuses at
+//     its next model turn and persists nothing. A visible cancel button would
+//     need a run-state affordance and a confirmed-stopped state this round does
+//     not build, and a dead one is the broken-link defect at button scale.
 //   - No credential is requested, displayed, or echoed anywhere. The banner
 //     (`w5`) states the no-credential condition globally; an unresolvable
 //     credential surfaces HERE as the run's rendered `BusError` message —
 //     no silent failure.
 
 import { useComposeRun } from "../hooks/useComposeRun";
-import type { AgentTurn, StrategySummary } from "../hooks/useComposeRun";
+import type { AgentTurn, RunStatus, StrategySummary } from "../hooks/useComposeRun";
 
 export default function DesignerScreen() {
   const { messages, target, setTarget, running, submit } = useComposeRun();
@@ -94,6 +96,13 @@ export default function DesignerScreen() {
           value={target}
           onChange={(event) => setTarget(event.target.value)}
           onKeyDown={(event) => {
+            // `isComposing` guards the IME: for Japanese, Chinese and Korean
+            // input the Enter that CONFIRMS a candidate reaches this handler
+            // too, and submitting there would clear the textarea and start a
+            // billable run on half-typed text.
+            if (event.nativeEvent.isComposing) {
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               submit();
@@ -117,11 +126,24 @@ export default function DesignerScreen() {
   );
 }
 
+/** The header marker and word for each terminal status — one per status, no default.
+ *
+ * A two-way `streaming ? … : "✓ completed"` branch rendered "✓ completed" above
+ * the error box for every failed and cancelled run, because both are simply
+ * "not streaming". Each terminal state names itself instead.
+ */
+const TERMINAL_LABEL: Record<Exclude<RunStatus, "streaming">, string> = {
+  finalized: "✓ completed",
+  error: "✕ failed after",
+  cancelled: "⊘ cancelled after",
+};
+
 /** The step list of one run, with its honest running/completed header. */
 function StepList({ turn }: { turn: AgentTurn }) {
   if (turn.steps.length === 0 && turn.status !== "streaming") {
     return null;
   }
+  const calls = `${turn.steps.length} tool ${turn.steps.length === 1 ? "call" : "calls"}`;
   return (
     <div className="dsg-steps">
       <div className="dsg-steps-head">
@@ -131,7 +153,9 @@ function StepList({ turn }: { turn: AgentTurn }) {
             {turn.steps.length === 1 ? "step" : "steps"} so far
           </>
         ) : (
-          <>✓ completed · {turn.steps.length} tool {turn.steps.length === 1 ? "call" : "calls"}</>
+          <>
+            {TERMINAL_LABEL[turn.status]} · {calls}
+          </>
         )}
       </div>
       <div className="dsg-steps-body">

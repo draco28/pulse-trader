@@ -14,10 +14,16 @@ import type { Channel } from "@tauri-apps/api/core";
 import type { BusEvent } from "../bindings";
 
 const composeStrategyMock = vi.fn();
+// The screen's unmount cleanup cancels an in-flight run, so every test that
+// leaves one open reaches this on teardown.
+const composeCancelMock = vi.fn((..._args: unknown[]) =>
+  Promise.resolve({ status: "ok", data: true }),
+);
 
 vi.mock("../bindings", () => ({
   commands: {
     composeStrategy: (...args: unknown[]) => composeStrategyMock(...args),
+    composeCancel: (...args: unknown[]) => composeCancelMock(...args),
   },
 }));
 
@@ -69,6 +75,7 @@ let resolveInvoke: (value: unknown) => void = () => {};
 
 beforeEach(() => {
   composeStrategyMock.mockReset();
+  composeCancelMock.mockClear();
   composeStrategyMock.mockImplementation(
     () =>
       new Promise((resolve) => {
@@ -138,6 +145,15 @@ describe("<DesignerScreen /> streaming compose", () => {
     });
     expect(await screen.findByText(/add_filter/)).toBeTruthy();
 
+    // ...and closes. A run's `seq` is contiguous, so this fixture carries every
+    // beat the backend would actually send: skipping one is now a stream error,
+    // which is the point of `useComposeRun`'s gap check.
+    await act(async () => {
+      channel.onmessage?.(
+        event(4, { kind: "toolCallResult", name: "add_filter", outcome: "filter added" }),
+      );
+    });
+
     // Finished closes the stream; the summary card comes from the RETURN value.
     await act(async () => {
       channel.onmessage?.(event(5, { kind: "finished", message: "finalized: RSI Oversold" }));
@@ -204,6 +220,99 @@ describe("<DesignerScreen /> streaming compose", () => {
     });
     const sendAfter = await screen.findByRole("button", { name: /send/i });
     expect((sendAfter as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("ignores Enter while an IME is composing", () => {
+    render(<DesignerScreen />);
+    const input = screen.getByRole("textbox");
+    fireEvent.change(input, { target: { value: "移動平均" } });
+
+    // The Enter that CONFIRMS an IME candidate reaches this handler too. Acting
+    // on it would clear the textarea and start a billable run on partial text.
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: false, isComposing: true });
+    expect(composeStrategyMock).not.toHaveBeenCalled();
+    expect((input as HTMLTextAreaElement).value).toBe("移動平均");
+
+    // The Enter that follows, once composition has ended, does submit.
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
+    expect(composeStrategyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("names each terminal state rather than calling every ended run completed", async () => {
+    render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, {
+          kind: "toolCallStarted",
+          name: "add_entry_signal",
+          argumentsPreview: "rsi(14) < 30",
+        }),
+      );
+    });
+    expect(screen.getByText(/streaming/)).toBeTruthy();
+
+    // A run that emitted steps and then FAILED used to render "✓ completed"
+    // directly above its own error box, because every non-streaming status took
+    // the success arm of a two-way branch.
+    await act(async () => {
+      resolveInvoke({
+        status: "error",
+        error: { code: "llm", message: "upstream returned 503" },
+      });
+    });
+
+    expect(screen.queryByText(/completed/)).toBeNull();
+    expect(screen.getByText(/failed after/)).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("upstream returned 503");
+  });
+
+  it("names a cancelled run cancelled, not completed", async () => {
+    render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(
+        event(1, {
+          kind: "toolCallStarted",
+          name: "add_entry_signal",
+          argumentsPreview: "rsi(14) < 30",
+        }),
+      );
+    });
+    await act(async () => {
+      resolveInvoke({
+        status: "ok",
+        data: { runId: "run-1", emitted: 2, cancelled: true, strategy: null },
+      });
+    });
+
+    expect(screen.queryByText(/completed/)).toBeNull();
+    expect(screen.getByText(/cancelled after/)).toBeTruthy();
+  });
+
+  it("cancels the backend run when the screen unmounts mid-compose", async () => {
+    const { unmount } = render(<DesignerScreen />);
+    submitTarget("RSI oversold bounce on BTC");
+    const channel = capturedChannel();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+
+    unmount();
+
+    expect(composeCancelMock).toHaveBeenCalledTimes(1);
+    expect(composeCancelMock.mock.calls[0][0]).toBe("run-1");
   });
 });
 
