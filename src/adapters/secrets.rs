@@ -618,21 +618,46 @@ mod tests {
     /// otherwise an exported-but-blank shell variable would silently shadow a
     /// perfectly good `.env` file and fail at the transport instead of at resolution.
     #[test]
-    fn the_production_search_names_only_directories_that_exist() {
-        // `CARGO_MANIFEST_DIR` is baked in at compile time, so in a shipped `.app`
-        // it points at the BUILD machine. `missing_credential_message` lists every
-        // searched location verbatim and that text reaches the Designer, so a
-        // location that cannot exist on the running machine must not be listed:
-        // it sends the user hunting for a directory they cannot create.
+    fn the_production_search_never_names_a_build_machine_path() {
+        // `CARGO_MANIFEST_DIR` is baked in at COMPILE time, so in a shipped `.app`
+        // it names a directory on the machine that built it.
+        // `missing_credential_message` lists every searched location verbatim and
+        // that text reaches the Designer, so naming it would send an end user
+        // hunting for a path they can neither find nor create.
+        //
+        // The assertion is deliberately about THAT path and not "every location
+        // exists": the application-data directory legitimately does not exist yet on
+        // a fresh install, and it MUST still be named — it is precisely where the
+        // user is meant to create the file.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let search = CredentialSearch::from_process_env();
-        for (path, _) in search.file_locations() {
-            let dir = path.parent().expect("a .env path always has a parent");
-            assert!(
-                dir.is_dir(),
-                "the search names {}, which does not exist on this machine",
-                dir.display()
-            );
-        }
+        let named: Vec<_> = search
+            .file_locations()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        let names_manifest_dir = named.iter().any(|path| path.parent() == Some(manifest_dir));
+        assert_eq!(
+            names_manifest_dir,
+            manifest_dir.is_dir(),
+            "the manifest directory must be searched when it exists (a developer \
+             machine) and absent when it does not (a shipped app), but the search \
+             {} it while it {}",
+            if names_manifest_dir { "names" } else { "omits" },
+            if manifest_dir.is_dir() {
+                "exists"
+            } else {
+                "does not exist"
+            },
+        );
+
+        // The app-data location is still named regardless — it is the one place a
+        // user with no credential is actually able to create the file.
+        assert!(
+            !named.is_empty(),
+            "the search must name at least one file location to point the user at"
+        );
     }
 
     #[test]
