@@ -221,10 +221,15 @@ jobs:
       - name: Install toolchain (pinned via rust-toolchain.toml)
         run: rustup show
 
-      - name: Install Node
+      # The version comes from `.nvmrc`, not a literal here, so `nvm use` and
+      # this job read the SAME pin and a green local `just check` means what a
+      # green CI run means. The floor is Node 22: jsdom 30's undici calls
+      # `webidl.util.markAsUncloneable`, which does not exist before it, so the
+      # whole vitest suite dies on import under Node 20.
+      - name: Install Node (pinned via .nvmrc)
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: npm
 
       - name: Install node modules (lockfile-authoritative)
