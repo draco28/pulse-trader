@@ -93,6 +93,19 @@ pub struct LlmCall {
     /// that keeps `LLM_CALL_SCHEMA_VERSION` at 1.
     #[serde(default)]
     pub key_source: Option<CredentialSource>,
+    /// Which version of the agent prompt produced this call — the content hash of
+    /// the **resolved** prompt, whichever of the compiled-in default or the
+    /// `$PULSE_PROMPT_DIR` overlay actually won (r1.s2 audit C2). An overlay edit
+    /// therefore changes the recorded version with no release step, which is what
+    /// makes the prompt overlay auditable rather than invisible.
+    ///
+    /// `None` means no prompt version was recorded: a row written before migration
+    /// `0005`, or a caller that records none — composer rows stay `None`, and
+    /// **computing the hash is `r1.s2.w3`'s**; this item carries the field and the
+    /// column. `#[serde(default)]` for the same backward-compatibility reason
+    /// `key_source` has it, and the same reason `LLM_CALL_SCHEMA_VERSION` stays 1.
+    #[serde(default)]
+    pub prompt_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -131,6 +144,7 @@ mod tests {
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: CreatedBy::ComposerLlm,
             key_source: Some(CredentialSource::ConfigDir),
+            prompt_version: None,
         };
         let json = serde_json::to_string(&call).expect("serialize LlmCall");
         let back: LlmCall = serde_json::from_str(&json).expect("deserialize LlmCall");

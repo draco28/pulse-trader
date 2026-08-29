@@ -27,6 +27,7 @@ use std::future::Future;
 use crate::domain::backtest::SummaryStats;
 use crate::domain::backtest::{BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade};
 use crate::domain::candle::Candle;
+use crate::domain::coaching::{CoachingSession, CoachingSessionId, Disposition};
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
@@ -422,6 +423,95 @@ pub trait LlmCallRepository {
         &self,
         id: &LlmCallId,
     ) -> impl Future<Output = Result<Option<LlmCall>, DataError>> + Send;
+}
+
+/// The coaching session persistence port (r1.s2.w2, ADR-0021 / audit C3).
+///
+/// The `sqlx` adapter
+/// ([`SqliteCoachingRepo`](crate::adapters::db::SqliteCoachingRepo)) implements it
+/// over `pulse.db`; `w3`'s coach turn and `r1.s4`'s rail consume it generically
+/// (`<R: CoachingRepository>`), never as `dyn`. Same `Send`-future style as
+/// [`StrategyRepository`] (audit C3) so a repository call can be `spawn`ed.
+///
+/// **The session row IS the audit trail.** Every turn persists — a proposal or a
+/// typed failure — so "never silence" is a storage guarantee rather than a
+/// convention, and `llm_call_id` is `None` precisely when no provider call was
+/// made.
+///
+/// **This port persists; it does not decide.** The disposition state machine lives
+/// in [`Proposal::transition`](crate::domain::Proposal::transition), and
+/// [`record_disposition`](CoachingRepository::record_disposition) writes the
+/// disposition it is given. The `0005` `CHECK` constraints are the second guard
+/// (no accepted proposal without its child version, and no child version on
+/// anything else); the legality of `rejected → accepted` is the caller's to
+/// enforce through the domain, which is where `r1.s4`'s rail already goes.
+///
+/// **No `validated` anywhere** (audit C4): a stored mutation's applicability is
+/// re-established by [`apply`](crate::domain::apply) at use time, so there is
+/// deliberately no method here that reads or writes such a fact.
+pub trait CoachingRepository {
+    /// Persist one coach turn — the session row, plus its proposal row when the
+    /// turn produced one.
+    ///
+    /// The stored `created_at` is sourced from the adapter's injected `Clock`
+    /// (deterministic under test); every other field is persisted verbatim.
+    /// Returns the persisted [`CoachingSessionId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] if the store fails — including the re-save of a
+    /// session id that already exists, which the primary key and the
+    /// one-proposal-per-session `UNIQUE` refuse rather than silently double.
+    fn save_session(
+        &self,
+        session: &CoachingSession,
+    ) -> impl Future<Output = Result<CoachingSessionId, DataError>> + Send;
+
+    /// Fetch one recorded turn by id (`Ok(None)` if no such row).
+    ///
+    /// **Fail-closed** (mirror [`LlmCallRepository::get_call`]): an unsupported
+    /// stored `schema_version` or a corrupt/un-parseable column is an `Err`, never
+    /// a silent partial — a coaching record that reads back wrong is worse than one
+    /// that refuses to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on an unsupported stored `schema_version`, a
+    /// malformed column, or a store failure.
+    fn get_session(
+        &self,
+        id: &CoachingSessionId,
+    ) -> impl Future<Output = Result<Option<CoachingSession>, DataError>> + Send;
+
+    /// Every recorded turn for one backtest run, oldest first — successes and
+    /// failures alike.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] on a malformed row or a store failure.
+    fn list_sessions_for_run(
+        &self,
+        run_id: &BacktestRunId,
+    ) -> impl Future<Output = Result<Vec<CoachingSession>, DataError>> + Send;
+
+    /// Record a proposal's disposition, keyed by its session id — the accept
+    /// idempotency key (`r1.s4`'s consistency model keys one child version per
+    /// proposal by session id).
+    ///
+    /// Dormant in `r1.s2`: `w2` writes only the `Proposed` state, and `r1.s4`'s
+    /// rail is what drives the rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session has no proposal to disposition
+    /// (an absent session, or a turn that failed), or when the store rejects the
+    /// write — including the `0005` `CHECK` that an accepted proposal must name its
+    /// child version and nothing else may.
+    fn record_disposition(
+        &self,
+        id: &CoachingSessionId,
+        disposition: &Disposition,
+    ) -> impl Future<Output = Result<(), DataError>> + Send;
 }
 
 #[cfg(test)]
@@ -1094,6 +1184,7 @@ mod llm_call_repository_tests {
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: CreatedBy::ComposerLlm,
             key_source: None,
+            prompt_version: None,
         }
     }
 

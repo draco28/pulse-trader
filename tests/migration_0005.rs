@@ -1,0 +1,535 @@
+//! AC-2 — migration `0005_coaching`: the reserved out-of-order number, the
+//! up/down round trip, and the constraints that hold the coaching schema honest
+//! (r1.s2.w2, ADR-0021 / grill L2 / audit C3-C4).
+//!
+//! `0005` is the FIRST REAL EXERCISE of the reserved-number scheme. Release
+//! planning allocated `0005` to `r1.s2` and `0006` to `r1.s3` while `r1.s1`
+//! shipped `0007`, so this migration arrives at a database whose maximum applied
+//! version is already higher than its own. `src/adapters/db/migrate.rs` compares
+//! applied version SETS rather than maxima for exactly this reason (PR #115);
+//! until now that support was proved against a synthetic probe migration, and this
+//! binary proves it against the real one.
+//!
+//! Offline (`SQLX_OFFLINE=true` + the in-process `MIGRATOR`), `TempDir`-isolated —
+//! the suite never touches the real `pulse.db`.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use pulse::{Db, MIGRATOR, undo_to};
+use sqlx::SqlitePool;
+use sqlx::migrate::Migrator;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+/// Every successfully-applied migration version.
+async fn applied_versions(pool: &SqlitePool) -> BTreeSet<i64> {
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = TRUE")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    versions.into_iter().collect()
+}
+
+/// Whether a named object exists in `sqlite_master`.
+async fn object_present(pool: &SqlitePool, kind: &str, name: &str) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2")
+        .bind(kind)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n == 1
+}
+
+/// The column names of `table`, via `pragma_table_info`.
+async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT name FROM pragma_table_info(?1)")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0005_*` — the
+/// "older binary" that shipped `0007` while `0005` was still reserved.
+fn shipped_set_without_0005(dir: &Path) {
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&shipped).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("0005_") {
+            continue;
+        }
+        std::fs::copy(&path, dir.join(&name)).unwrap();
+    }
+}
+
+/// A fresh temp database migrated by the "older" set (everything but `0005`),
+/// returning the guard, the db path, and the open `Db`.
+async fn db_at_0007_without_0005() -> (TempDir, PathBuf, Db) {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("migrations");
+    std::fs::create_dir_all(&dir).unwrap();
+    shipped_set_without_0005(&dir);
+
+    let db_path = tmp.path().join("pulse.db");
+    let older = Migrator::new(dir.as_path()).await.unwrap();
+    let db = Db::with_path(&db_path).await.unwrap();
+    older.run(db.pool()).await.expect("the older set applies");
+
+    let applied = applied_versions(db.pool()).await;
+    assert!(
+        !applied.contains(&5),
+        "the fixture must NOT have 0005 applied: {applied:?}"
+    );
+    assert_eq!(
+        applied.iter().copied().max(),
+        Some(7),
+        "the fixture's maximum applied version is 7, above 0005's own"
+    );
+    (tmp, db_path, db)
+}
+
+/// Insert the FK parents a coaching session needs: a strategy, a version, a run,
+/// and an `llm_call`. Raw SQL rather than the repos — this binary is about the
+/// schema, and the repo round-trip is AC-3's.
+async fn seed_parents(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO strategy (id, name, tags, archived, created_at) \
+         VALUES ('strat-1', 'RSI Oversold', '[]', 0, '2026-08-29T00:00:00.000Z')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed strategy");
+
+    sqlx::query(
+        "INSERT INTO strategy_version \
+         (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, \
+          creating_llm_call_ids, created_at) \
+         VALUES ('ver-1', 'strat-1', '1.0.0', '{}', '{}', 'hash-1', 'human', '[]', \
+                 '2026-08-29T00:00:00.000Z')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed strategy_version");
+
+    // A second version, so an `accepted` disposition has a child to point at.
+    sqlx::query(
+        "INSERT INTO strategy_version \
+         (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, \
+          creating_llm_call_ids, created_at) \
+         VALUES ('ver-2', 'strat-1', '1.0.0', '{}', '{}', 'hash-2', 'coach_llm', '[]', \
+                 '2026-08-29T00:00:01.000Z')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed child strategy_version");
+
+    sqlx::query(
+        "INSERT INTO backtest_run \
+         (id, strategy_version_id, schema_version, created_at, engine_fingerprint, engine_target, \
+          result_content_hash, starting_equity, net_pnl, fees_total, funding_total, slippage_total) \
+         VALUES ('run-1', 'ver-1', '1', '2026-08-29T00:00:00.000Z', 'fp-1', 'test-target', \
+                 'rch-1', '10000', '0', '0', '0', '0')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed backtest_run");
+
+    sqlx::query(
+        "INSERT INTO llm_call \
+         (id, backend, model, prompt_messages, completion, input_tokens, output_tokens, cost, \
+          cost_currency, created_at, created_by, schema_version) \
+         VALUES ('call-1', 'ollama', 'glm-5.3-flash', '[]', NULL, 1, 1, '0', 'CNY', \
+                 '2026-08-29T00:00:00.000Z', 'coach_llm', 1)",
+    )
+    .execute(pool)
+    .await
+    .expect("seed llm_call");
+}
+
+/// Insert a `proposed`-outcome coaching session.
+async fn insert_proposed_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES (?1, 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', 'call-1', 'proposed', \
+                 NULL, NULL, 1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Insert a proposal row, returning the raw SQL outcome so a test can assert a
+/// constraint rejection.
+async fn insert_proposal(
+    pool: &SqlitePool,
+    id: &str,
+    session_id: &str,
+    hypothesis: &str,
+    disposition: &str,
+    child_version_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO coaching_proposals \
+         (id, session_id, mutation, hypothesis, disposition, child_version_id) \
+         VALUES (?1, ?2, '{\"type\":\"set_param\"}', ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(session_id)
+    .bind(hypothesis)
+    .bind(disposition)
+    .bind(child_version_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// 1. The reserved out-of-order number
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0005_applies_to_a_database_already_at_0007() {
+    let (_tmp, _path, db) = db_at_0007_without_0005().await;
+
+    // A row written BEFORE 0005 exists — it must survive the migration and read
+    // back with no prompt version, rather than becoming unreadable (the same
+    // backward-compatibility contract 0007 recorded for `key_source`).
+    seed_parents(db.pool()).await;
+
+    // Now the binary that ships the reserved 0005 opens the same database.
+    MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("the reserved 0005 must apply to a db already holding 0007");
+
+    let applied = applied_versions(db.pool()).await;
+    assert!(
+        applied.contains(&5),
+        "0005 must be applied, not skipped: {applied:?}"
+    );
+    assert_eq!(
+        applied.iter().copied().max(),
+        Some(7),
+        "0005 is recorded at its own version; the maximum does not move"
+    );
+
+    assert!(
+        object_present(db.pool(), "table", "coaching_sessions").await,
+        "coaching_sessions must exist after 0005"
+    );
+    assert!(
+        object_present(db.pool(), "table", "coaching_proposals").await,
+        "coaching_proposals must exist after 0005"
+    );
+    assert!(
+        object_present(db.pool(), "index", "idx_coaching_sessions_run").await,
+        "the run index must exist after 0005"
+    );
+
+    // `llm_call` gained a NULLABLE `prompt_version`, and the pre-existing row
+    // reads back NULL — "no prompt version recorded", not an error.
+    assert!(
+        columns_of(db.pool(), "llm_call")
+            .await
+            .contains(&"prompt_version".to_owned()),
+        "llm_call must carry prompt_version after 0005"
+    );
+    let prompt_version: Option<String> =
+        sqlx::query_scalar("SELECT prompt_version FROM llm_call WHERE id = 'call-1'")
+            .fetch_one(db.pool())
+            .await
+            .expect("read prompt_version");
+    assert!(
+        prompt_version.is_none(),
+        "a row written before 0005 reads back with no prompt version, got {prompt_version:?}"
+    );
+
+    // And the column really is nullable for NEW rows too (composer rows stay NULL).
+    sqlx::query(
+        "INSERT INTO llm_call \
+         (id, backend, model, prompt_messages, completion, input_tokens, output_tokens, cost, \
+          cost_currency, created_at, created_by, schema_version) \
+         VALUES ('call-2', 'ollama', 'glm-5.3-flash', '[]', NULL, 1, 1, '0', 'CNY', \
+                 '2026-08-29T00:00:02.000Z', 'composer_llm', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("a composer row needs no prompt_version");
+}
+
+// ---------------------------------------------------------------------------
+// 2. Up / down round trip
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_0005_up_down_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
+
+    // Up.
+    MIGRATOR.run(db.pool()).await.expect("run embedded set");
+    assert!(object_present(db.pool(), "table", "coaching_sessions").await);
+    assert!(object_present(db.pool(), "table", "coaching_proposals").await);
+    assert!(
+        columns_of(db.pool(), "llm_call")
+            .await
+            .contains(&"prompt_version".to_owned())
+    );
+
+    // Down to 0004 — reverts 0007 and then 0005 (descending order).
+    undo_to(db.pool(), 4).await.expect("undo to 4");
+    assert!(
+        !object_present(db.pool(), "table", "coaching_sessions").await,
+        "coaching_sessions is gone after the undo"
+    );
+    assert!(
+        !object_present(db.pool(), "table", "coaching_proposals").await,
+        "coaching_proposals is gone after the undo"
+    );
+    assert!(
+        !object_present(db.pool(), "index", "idx_coaching_sessions_run").await,
+        "the run index is gone after the undo"
+    );
+    assert!(
+        !columns_of(db.pool(), "llm_call")
+            .await
+            .contains(&"prompt_version".to_owned()),
+        "prompt_version is gone after the undo"
+    );
+
+    // Re-run: everything comes back.
+    MIGRATOR.run(db.pool()).await.expect("re-run embedded set");
+    assert!(object_present(db.pool(), "table", "coaching_sessions").await);
+    assert!(object_present(db.pool(), "table", "coaching_proposals").await);
+    assert!(
+        columns_of(db.pool(), "llm_call")
+            .await
+            .contains(&"prompt_version".to_owned())
+    );
+    assert!(applied_versions(db.pool()).await.contains(&5));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Audit C4 — no persisted validity, anywhere
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_coaching_schema_stores_no_validity() {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
+    MIGRATOR.run(db.pool()).await.unwrap();
+
+    // A mutation's validity is established by `apply()` at use time and is never a
+    // stored property (ADR-0021 decision 3). A column that caches the answer is the
+    // specific mistake this asserts against.
+    for table in ["coaching_sessions", "coaching_proposals"] {
+        for column in columns_of(db.pool(), table).await {
+            assert!(
+                !column.to_lowercase().contains("valid"),
+                "{table}.{column} looks like persisted validity, which audit C4 forbids"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. The constraints
+// ---------------------------------------------------------------------------
+
+/// A migrated temp db with the FK parents seeded.
+async fn seeded_db() -> (TempDir, Db) {
+    let tmp = TempDir::new().unwrap();
+    let db = Db::with_path(&tmp.path().join("pulse.db")).await.unwrap();
+    MIGRATOR.run(db.pool()).await.unwrap();
+    seed_parents(db.pool()).await;
+    (tmp, db)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_most_one_proposal_per_session() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    insert_proposal(
+        db.pool(),
+        "prop-1",
+        "sess-1",
+        "a slower RSI",
+        "proposed",
+        None,
+    )
+    .await
+    .expect("the first proposal is accepted");
+
+    let second = insert_proposal(
+        db.pool(),
+        "prop-2",
+        "sess-1",
+        "a second opinion",
+        "proposed",
+        None,
+    )
+    .await;
+    assert!(
+        second.is_err(),
+        "a session may carry at most one proposal — the accept idempotency key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_disposition_vocabulary_is_enforced() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    let bogus = insert_proposal(db.pool(), "prop-1", "sess-1", "why", "abandoned", None).await;
+    assert!(
+        bogus.is_err(),
+        "a disposition outside the enumerated set must be rejected"
+    );
+
+    for disposition in ["proposed", "rejected", "modified"] {
+        let (_tmp, db) = seeded_db().await;
+        insert_proposed_session(db.pool(), "sess-1")
+            .await
+            .expect("seed session");
+        insert_proposal(db.pool(), "prop-1", "sess-1", "why", disposition, None)
+            .await
+            .unwrap_or_else(|e| panic!("`{disposition}` must be accepted: {e}"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_version_exists_exactly_when_accepted() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    // Accepted WITHOUT a child version: no state where an accepted proposal lacks
+    // its child (r1.s4's consistency model).
+    let orphan_accept =
+        insert_proposal(db.pool(), "prop-1", "sess-1", "why", "accepted", None).await;
+    assert!(
+        orphan_accept.is_err(),
+        "an accepted proposal must name its child version"
+    );
+
+    // A child version on a proposal that was NOT accepted.
+    let stray_child = insert_proposal(
+        db.pool(),
+        "prop-1",
+        "sess-1",
+        "why",
+        "rejected",
+        Some("ver-2"),
+    )
+    .await;
+    assert!(
+        stray_child.is_err(),
+        "only an accepted proposal may name a child version"
+    );
+
+    // The legal pairing (dormant until r1.s4, exercised here).
+    insert_proposal(
+        db.pool(),
+        "prop-1",
+        "sess-1",
+        "why",
+        "accepted",
+        Some("ver-2"),
+    )
+    .await
+    .expect("accepted + child version is the legal pairing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hypothesis_may_not_be_blank_at_the_sql_layer() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    for blank in ["", "   "] {
+        let outcome = insert_proposal(db.pool(), "prop-1", "sess-1", blank, "proposed", None).await;
+        assert!(
+            outcome.is_err(),
+            "a blank hypothesis ({blank:?}) must be rejected by the schema too"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_session_carries_its_reason_and_a_proposed_one_does_not() {
+    let (_tmp, db) = seeded_db().await;
+
+    // `failed` with no reason — the never-silence guarantee at the SQL layer.
+    let silent_failure = sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-x', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 NULL, NULL, 1)",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        silent_failure.is_err(),
+        "a failed session with no recorded reason is exactly the silence this forbids"
+    );
+
+    // `proposed` carrying a failure reason — the other half of the iff.
+    let confused = sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-y', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', 'call-1', 'proposed', \
+                 'zero_calls', '{}', 1)",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        confused.is_err(),
+        "a proposed session must not also carry a failure reason"
+    );
+
+    // An unknown failure kind is not a state.
+    let bogus_kind = sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-z', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 'the_model_was_grumpy', '{}', 1)",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        bogus_kind.is_err(),
+        "a failure kind outside the L3 taxonomy must be rejected"
+    );
+
+    // A pre-call failure records NULL llm_call_id (audit C3) and is legal.
+    sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-ok', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 'context_overflow', '{\"type\":\"context_overflow\"}', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("a pre-call failure with no llm_call row is the audit-C3 shape");
+}
