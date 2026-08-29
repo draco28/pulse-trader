@@ -365,8 +365,8 @@ pub use domain::LlmCallRepository;
 
 // VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
 // the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).
-// `OpenAiCompatProvider` (generalized from 1.03's `GlmProvider`, pointed at Ollama
-// Cloud) is the anti-corruption layer implementing the `LlmProvider` port over the
+// `OpenAiCompatProvider` (generalized from 1.03's `GlmProvider`, pointed at z.ai's
+// coding endpoint) is the anti-corruption layer implementing the `LlmProvider` port over the
 // `PulseHive` OpenAI-compatible transport (the ONLY `PulseHive`-importing module —
 // AC-9); `glm_api_key` sources the API key from the login Keychain (READ path only).
 // REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public adapter

@@ -33,9 +33,12 @@ model = "glm-5.3"
 # Per-model nominal prices, per 1,000,000 tokens, in `currency`.
 # glm-5.3 is the SHIPPED main model (Z.AI coding endpoint, OpenAI-compat,
 # tool-capable) — walked end-to-end against this endpoint on 2026-08-28.
-# glm-5.2 (Ollama Cloud) and gpt-oss:120b are retained as nominal alternates for
-# operators who still point `[llm]` at that endpoint; gpt-oss:120b returned
-# reproducible HTTP 500s under multi-turn tool-calling at VS-1.3.2 slice-close.
+# glm-5.2 and gpt-oss:120b are retained as nominal alternates ONLY so an operator
+# still pointing `[llm]` at Ollama Cloud keeps a priced row. That subscription was
+# dropped on 2026-08-29 and ollama.com now answers HTTP 402 for this project, so
+# neither alternate is a working configuration — they are here for pricing
+# continuity, not as an offer. gpt-oss:120b additionally returned reproducible
+# HTTP 500s under multi-turn tool-calling at VS-1.3.2 slice-close.
 [models."glm-5.3"]
 input_per_mtok = "1.40"
 output_per_mtok = "4.40"

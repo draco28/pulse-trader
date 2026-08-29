@@ -55,9 +55,12 @@ use crate::domain::{
 /// model; mirrors the `openai_compat.rs` `OLLAMA_MODEL_ID` default + the shipped
 /// price-table key so `cost` resolves).
 ///
-/// Note `llm-check` is const-pinned end to end: unlike `compose` it does NOT read
-/// the config `[llm]` table, so a `$PULSE_CONFIG_DIR` endpoint/model override does
-/// not reach this verb. Pre-existing, and out of scope for the default flip.
+/// Note `llm-check` is TRANSPORT const-pinned but PRICES config-driven: unlike
+/// `compose` it does not read the `[llm]` table, so a `$PULSE_CONFIG_DIR`
+/// endpoint/model override does not reach this verb — yet the same override file's
+/// `[models]` rows DO back its cost (`load_price_table` in `run_llm_check`). A
+/// stale overlay therefore prices this model from a table that may not name it.
+/// Pre-existing, and out of scope for the default flip.
 const DEMO_MODEL: &str = "glm-5.3";
 
 /// A conservative sampling temperature for the demo round-trip (wire-level `f32`,

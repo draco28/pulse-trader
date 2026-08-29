@@ -193,8 +193,15 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmBackend {
-    /// Ollama Cloud (`gpt-oss:120b`), reached via `PulseHive`'s OpenAI-compatible
-    /// transport in the 2.01 adapter (the VS-1.3.2 provider pivot from GLM).
+    /// The single v1 backend, reached via `PulseHive`'s OpenAI-compatible transport
+    /// in the 2.01 adapter.
+    ///
+    /// The name is a LEGACY LABEL, not a claim about the endpoint. It was minted for
+    /// Ollama Cloud at the VS-1.3.2 provider pivot; since the 2026-08-29 default flip
+    /// (ADR-0023) the traffic it tags is z.ai. The variant was deliberately left
+    /// alone because it is persisted verbatim on every `llm_call` row — renaming it
+    /// is a migration, not a rename. Retained naming debt, tracked with the
+    /// `OLLAMA_API_KEY` env var and the `OLLAMA_*` transport consts.
     Ollama,
 }
 

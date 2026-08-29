@@ -46,9 +46,12 @@ use crate::domain::{
 /// config override (slice-close FIX A).
 ///
 /// The `OLLAMA_` prefix on this and the sibling consts is RETAINED naming debt,
-/// deliberately not renamed with the default flip so it stays one tracked item
-/// alongside the `OLLAMA_API_KEY` credential env var (which the resolver chain
-/// still reads first) — the names say Ollama, the values are Z.AI.
+/// deliberately not renamed with the default flip so it stays ONE tracked item.
+/// Three things still say Ollama while the traffic is z.ai: these consts, the
+/// `OLLAMA_API_KEY` credential env var (which the resolver chain still reads
+/// first), and [`LlmBackend::Ollama`](crate::domain::LlmBackend::Ollama), the
+/// label persisted on every `llm_call` row — that third one is a migration, not a
+/// rename, which is why the set moves together or not at all (ADR-0023).
 ///
 /// `PulseHive`'s `chat_completions_url()` trims a trailing `/` and appends
 /// `/chat/completions`, yielding

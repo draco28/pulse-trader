@@ -5,10 +5,12 @@
 //! provider (no network, MASTER-SPEC §9.4) + a literal test key + a tempfile-`Db`
 //! [`SqliteLlmCallRepo`] over a migrated scratch db (no Keychain), then asserts an
 //! [`LlmCall`] is persisted with the prompt **redacted** and tokens/cost/currency
-//! **populated**. This is the slice's `auto` demo criterion: "a GLM 5.2 call
+//! **populated**. This is the slice's `auto` demo criterion: "a GLM call
 //! round-trips through `PulseHive` and logs an `LlmCall` … redaction strips the
 //! secret", proven over a fake provider (the live `PulseHive` call is the `user:`
-//! demo).
+//! demo). VS-1.3.1 wrote that criterion as "a GLM 5.2 call"; the assertions below
+//! follow `DEMO_MODEL`, which is `glm-5.3` since the 2026-08-29 default flip
+//! (ADR-0023).
 //!
 //! **Single shared clock (1.04 deferral).** ONE [`FakeClock`] is injected into
 //! BOTH the repo AND (via the core) the redacting decorator, so `created_at` is
