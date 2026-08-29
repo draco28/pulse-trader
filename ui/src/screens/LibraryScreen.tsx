@@ -386,12 +386,13 @@ function VersionNode({
   const delta = version.deltaVsParent;
   const down = delta !== null && delta.startsWith("-");
   return (
-    <div
+    <button
+      type="button"
       className={`vnode${selected ? " is-selected" : ""}`}
       style={style}
       onClick={onClick}
-      role="button"
       aria-label={`Version ${label}`}
+      aria-pressed={selected}
     >
       <div className="vnode-head">
         <span className="vnode-name">{label}</span>
@@ -410,7 +411,7 @@ function VersionNode({
       <div className="vnode-kpis mono">
         <Kpis stats={version.stats} />
       </div>
-    </div>
+    </button>
   );
 }
 

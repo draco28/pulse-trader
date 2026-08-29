@@ -183,6 +183,13 @@
   pointer-events: none;
 }
 .vnode {
+  /* `<button>` UA resets: .vnode already owns background/border/padding/cursor
+     below, so only the properties a <button> tag adds on top of those — font,
+     text color and text alignment — need resetting here to keep the node
+     visually identical to the old <div>. */
+  font: inherit;
+  color: inherit;
+  text-align: left;
   background: var(--bg-raised);
   border: 1px solid var(--line-1);
   border-radius: 7px;

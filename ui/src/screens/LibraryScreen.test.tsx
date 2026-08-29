@@ -175,6 +175,67 @@ describe("LibraryScreen (seeded payload)", () => {
   });
 });
 
+describe("LibraryScreen (VersionNode keyboard accessibility — PR finding 1)", () => {
+  it("renders a version node as a real <button>, reachable by its own accessible name", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+
+    const node = screen.getByRole("button", { name: "Version v2" });
+    expect(node.tagName).toBe("BUTTON");
+  });
+
+  it("is keyboard-focusable — the bug this regresses: a <div role=\"button\"> with no tabIndex cannot receive focus, so a keyboard-only user could never reach it", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    node.focus();
+    expect(document.activeElement).toBe(node);
+  });
+
+  it("activating a focused node fills the details pane", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    // jsdom does not synthesize a real browser's native "Enter/Space on a
+    // focused <button> dispatches click" default action, and
+    // @testing-library/user-event (which patches that in) is not a
+    // dependency of this project. This drives the same two steps a keyboard
+    // user's Enter/Space press produces in a real browser — focus, then the
+    // click a native <button> fires for it — which is exactly the behaviour
+    // the fix relies on the browser for, rather than a hand-rolled key
+    // handler.
+    node.focus();
+    expect(document.activeElement).toBe(node);
+    fireEvent.click(node);
+
+    const pane = document.getElementById("details-pane");
+    expect(pane).not.toBeNull();
+    const inPane = within(pane as HTMLElement);
+    expect(await inPane.findByText("v2")).toBeTruthy();
+    expect(inPane.getByText("rsi(14) < 30")).toBeTruthy();
+  });
+
+  it("exposes selection via aria-pressed, not only the CSS class", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    expect(node.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(node);
+    expect(node.getAttribute("aria-pressed")).toBe("true");
+  });
+});
+
 describe("the library route entry (the real ROUTES table)", () => {
   it("mounts the screen through RouteContent", async () => {
     const route = resolveRoute("/library");

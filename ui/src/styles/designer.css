@@ -11,17 +11,21 @@
    ============================================================ */
 
 /* The screen fills the content track as one chat-dominant column: the
-   conversation scrolls, the composer input sits below it. */
+   conversation scrolls, the composer input sits below it — `.designer` is
+   pinned to the track's own height so `.dsg-scroll` is the thing that
+   overflows, not `.content`. */
 .designer {
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .dsg-scroll {
   flex: 1;
   min-height: 0;
+  overflow-y: auto;
 }
 
 .dsg-chat {
