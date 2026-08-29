@@ -61,8 +61,10 @@ const OLLAMA_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 /// The default model id — the `OpenAIConfig` fallback carried by the provider. The
 /// per-request model actually flows from [`LlmConfig::model`] (the composition root
 /// resolves it: config `[llm].model` → const), so this is only the transport-level
-/// default. `glm-5.3` is the shipped main model (Z.AI coding endpoint,
-/// OpenAI-compat, tool-capable), walked end-to-end on 2026-08-28.
+/// default. `glm-5.3` is the DEVELOPMENT-CYCLE default (Z.AI coding endpoint,
+/// OpenAI-compat, tool-capable), walked end-to-end on 2026-08-28 — the current
+/// default pending evaluation, not a final model selection, and not what a
+/// distributed build inherits (ADR-0023).
 const OLLAMA_MODEL_ID: &str = "glm-5.3";
 
 /// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
@@ -276,7 +278,7 @@ mod tests {
     fn provider_constructs_with_pinned_ollama_config() {
         // Smoke test: the adapter builds against the pinned default config with NO
         // network. The consts are the shipped endpoint + default model id (README
-        // C2/C8); `glm-5.3` on Z.AI's coding endpoint is the shipped main model.
+        // C2/C8); `glm-5.3` on Z.AI's coding endpoint is the dev-cycle default.
         let _provider = OpenAiCompatProvider::new("test-key");
         // FIX A: the config `[llm].base_url` override ctor also builds (NO network).
         let _override = OpenAiCompatProvider::with_base_url("test-key", "https://example.test/v1");

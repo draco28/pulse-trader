@@ -72,8 +72,9 @@ use super::llm::CapturingRepo;
 /// The FALLBACK model id the composer drives when the config `[llm].model` is
 /// absent (README C2/C8). A model-id STRING (not a price literal) — AC-11 greps
 /// `src/cli/` only for price VALUE field names. `glm-5.3` on Z.AI's coding endpoint
-/// is the shipped main model (OpenAI-compat, tool-capable), walked end-to-end on
-/// 2026-08-28. The live model is config-driven per ADR-0013
+/// is the DEVELOPMENT-CYCLE default (OpenAI-compat, tool-capable), walked
+/// end-to-end on 2026-08-28 — current default pending evaluation, not a final
+/// model selection, and not what a distributed build inherits (ADR-0023). The live model is config-driven per ADR-0013
 /// (`config/prices.toml` `[llm].model`); this const is only the documented fallback
 /// (slice-close FIX A).
 const COMPOSE_MODEL: &str = "glm-5.3";

@@ -8,12 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Default LLM provider is now z.ai `glm-5.3` over the coding endpoint**
+- **Development-cycle LLM default is now z.ai `glm-5.3` over the coding endpoint**
   (`https://api.z.ai/api/coding/paas/v4`), replacing Ollama Cloud
   (`https://ollama.com/v1`, `glm-5.2`). The Ollama Cloud subscription is dropped and
-  that endpoint now answers HTTP 402, so the previous default was not runnable. See
-  [ADR-0023](docs/adr/0023-default-llm-provider-zai-glm-5-3.md), which also records
-  the licensing tradeoff and the constraint it places on distribution.
+  that endpoint now answers HTTP 402, so the previous default was not runnable. This
+  is the default for the pre-distribution phase; a distributed build will select its
+  provider through the config seam instead (candidates: z.ai's per-token API, or
+  Ollama serving GLM). GLM is the model family either way, and the `glm-5.3` /
+  `glm-5.3-flash` variant choice is still open. See
+  [ADR-0023](docs/adr/0023-development-llm-default-zai-glm-coding-endpoint.md).
 
   **Upgrade note — an existing install will NOT pick this up on its own.** Three
   pieces of local state survive the update and each fails differently:

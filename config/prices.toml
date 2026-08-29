@@ -31,8 +31,12 @@ base_url = "https://api.z.ai/api/coding/paas/v4"
 model = "glm-5.3"
 
 # Per-model nominal prices, per 1,000,000 tokens, in `currency`.
-# glm-5.3 is the SHIPPED main model (Z.AI coding endpoint, OpenAI-compat,
-# tool-capable) — walked end-to-end against this endpoint on 2026-08-28.
+# glm-5.3 is the DEVELOPMENT-CYCLE default (Z.AI coding endpoint, OpenAI-compat,
+# tool-capable) — walked end-to-end against this endpoint on 2026-08-28. It is the
+# current default pending evaluation, NOT a final selection: the glm-5.3 vs
+# glm-5.3-flash question is open, and a distributed build does not inherit this
+# endpoint at all (ADR-0023 — provider becomes configurable at deployment; GLM stays
+# the model family either way).
 # glm-5.2 and gpt-oss:120b are retained as nominal alternates ONLY so an operator
 # still pointing `[llm]` at Ollama Cloud keeps a priced row. That subscription was
 # dropped on 2026-08-29 and ollama.com now answers HTTP 402 for this project, so
