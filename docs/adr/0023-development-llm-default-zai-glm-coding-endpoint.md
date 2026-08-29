@@ -137,8 +137,18 @@ settled, and it holds across every provider candidate below. **The variant is no
 settled.** `glm-5.3` is the current default *pending evaluation*, not a selection:
 `glm-5.3` versus `glm-5.3-flash` is an open experiment (cost and latency against
 composer quality on real strategy targets), and this ADR deliberately leaves it open.
-Changing variant is a one-line `[llm].model` edit plus a price row; nothing else in
-this decision depends on which one wins.
+Nothing else in this decision depends on which one wins.
+
+Switching variant is **not** a one-line edit today, and it is worth being exact
+about why, because an earlier draft of this ADR said it was. The `[llm].model` edit
+plus a `[models."…"]` price row covers `pulse compose` and the Tauri compose command,
+which read the config. It does **not** cover `pulse llm-check`, which takes its model
+from the `DEMO_MODEL` const, nor the `OLLAMA_MODEL_ID` / `COMPOSE_MODEL` fallbacks
+that apply whenever the config table is absent — so a config-only switch leaves those
+three paths on the old variant, silently. Five sites have to agree. That duplication
+is registered on the ossify feature map with the provider seam ("Configurable LLM
+provider selection"), and collapsing it — one load feeding every consumer — is part
+of that work, not of this flip.
 
 **Deployment: the provider becomes configurable, and this default does not carry
 over.** A distributed build selects its provider through the configuration seam

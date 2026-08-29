@@ -10,8 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Development-cycle LLM default is now z.ai `glm-5.3` over the coding endpoint**
   (`https://api.z.ai/api/coding/paas/v4`), replacing Ollama Cloud
-  (`https://ollama.com/v1`, `glm-5.2`). The Ollama Cloud subscription is dropped and
-  that endpoint now answers HTTP 402, so the previous default was not runnable. This
+  (`https://ollama.com/v1`, `glm-5.2`). The Ollama Cloud subscription is dropped, and
+  that endpoint answers **HTTP 402 for the operator's account** — an account-state
+  observation, not a claim about the service, though the practical effect is the same
+  here: the previous default was not runnable by anyone building this repo. This
   is the default for the pre-distribution phase; a distributed build will select its
   provider through the config seam instead (candidates: z.ai's per-token API, or
   Ollama serving GLM). GLM is the model family either way, and the `glm-5.3` /
@@ -25,9 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
      on-disk file whenever one exists (`$PULSE_CONFIG_DIR/prices.toml`, or the
      app-support config dir), and only falls back to the shipped table when none is
      found. An overlay written before this release still names `ollama.com` and
-     `glm-5.2`, so `pulse compose` keeps dialling the retired endpoint and fails
-     with **HTTP 402**. Fix: delete the overlay to inherit the new default, or edit
-     its `[llm]` table to the values above.
+     `glm-5.2`, so `pulse compose` keeps dialling the retired endpoint — failing
+     with **HTTP 402** on an account whose Ollama Cloud subscription has lapsed, or
+     with a `glm-5.2` model error on one that has not. Fix: delete the overlay to
+     inherit the new default, or edit its `[llm]` table to the values above.
   2. **A stale overlay also breaks `pulse llm-check`, with a misleading message.**
      That verb takes its endpoint and model from compiled-in constants (which moved
      with this release) but its prices from the same overlay file — so an overlay

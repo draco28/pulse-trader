@@ -77,29 +77,33 @@ through VS-1.3.3 (coach) as well. Re-open only if the coach's cross-session memo
 (a `pulsehive-db`-substrate feature) is judged worth the active-use cost at coach-design
 time (aligns with MASTER-SPEC's v2+ PulseDB coach-memory staging).
 
-**Concrete v1 backend (provider pivot, 2026-07-10)** — *superseded by
-[ADR-0023](0023-development-llm-default-zai-glm-coding-endpoint.md) (2026-08-29). This
-paragraph, and only this paragraph, is out of date: the **development-cycle** default
-is now z.ai GLM over the very coding endpoint it rejects below, the Ollama Cloud
-subscription is dropped, and `https://ollama.com/v1` answers HTTP 402. ADR-0023
-restates the licensing tradeoff weighed here and accepts it consciously for the
-pre-distribution phase only — a distributed build does not inherit it, and picks its
-provider through the config seam (z.ai's per-token API, or Ollama serving GLM). GLM is
-the model family either way; the variant stays open. Everything else in this ADR — the
-thin tools-carrying port, the deferral of `HiveMind`/`Lens`/`pulsehive-db` — still
-holds.*
+**Concrete v1 backend (provider pivot, 2026-07-10) — SUPERSEDED, HISTORICAL.**
 
-The first backend behind this port
-is **Ollama Cloud** (`https://ollama.com/v1`, OpenAI-compatible, `gpt-oss:120b`), consumed
-via `pulsehive_openai::OpenAICompatibleProvider` — NOT the GLM/Z.AI coding-plan endpoint
-(that endpoint is licensed for personal coding-agent use only; Ollama Cloud is a
-subscription API for programmatic use). A live spike verified clean `/v1` tool-calling on
-`gpt-oss:120b` and the full premium catalog. The VS-1.3.1 `GlmProvider` is generalized to a
-config-driven `OpenAiCompatProvider`; `LlmBackend::Glm` → `LlmBackend::Ollama`; the base URL +
-model are config-driven from `config/prices.toml`'s `[llm]` table (each with a `const` fallback),
-realized at slice-close (FIX A). This does not change the thin-transport premise (ADR-0012) — only
-the concrete base-URL/model/key. A native PulseHive `OllamaProvider` is a filed non-blocking
-enhancement (`pulseai-labs/PulseHive#35`).
+> *Superseded by [ADR-0023](0023-development-llm-default-zai-glm-coding-endpoint.md)
+> (2026-08-29). **Everything in the indented block below is a record of what was
+> decided on 2026-07-10, not a statement of the current backend.** In particular its
+> rejection of the GLM/Z.AI coding endpoint no longer describes what PulseTrader does:
+> that endpoint is now the development-cycle default. ADR-0023 keeps the licensing
+> concern the block raises, agrees the usage sits outside the plan's terms, and
+> records the operator's conscious acceptance of that risk for the pre-distribution
+> phase — a distributed build must not inherit it, and picks its provider through the
+> config seam (z.ai's per-token API, or Ollama serving GLM). GLM is the model family
+> either way; the variant stays open. Read ADR-0023 for the live decision.*
+>
+> *The rest of this ADR — the thin tools-carrying port, the deferral of
+> `HiveMind`/`Lens`/`pulsehive-db` — is NOT superseded and still holds.*
+
+> The first backend behind this port
+> is **Ollama Cloud** (`https://ollama.com/v1`, OpenAI-compatible, `gpt-oss:120b`), consumed
+> via `pulsehive_openai::OpenAICompatibleProvider` — NOT the GLM/Z.AI coding-plan endpoint
+> (that endpoint is licensed for personal coding-agent use only; Ollama Cloud is a
+> subscription API for programmatic use). A live spike verified clean `/v1` tool-calling on
+> `gpt-oss:120b` and the full premium catalog. The VS-1.3.1 `GlmProvider` is generalized to a
+> config-driven `OpenAiCompatProvider`; `LlmBackend::Glm` → `LlmBackend::Ollama`; the base URL +
+> model are config-driven from `config/prices.toml`'s `[llm]` table (each with a `const` fallback),
+> realized at slice-close (FIX A). This does not change the thin-transport premise (ADR-0012) — only
+> the concrete base-URL/model/key. A native PulseHive `OllamaProvider` is a filed non-blocking
+> enhancement (`pulseai-labs/PulseHive#35`).
 
 ## Consequences
 
