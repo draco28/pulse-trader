@@ -22,9 +22,20 @@
 //      scope, and rendering it would present a fabrication as real. This item ships
 //      the frame, not fake state; a later item wires each of those to a real read
 //      when the feature behind it actually exists.
+//
+// One thing the mock's traffic lights never needed that this file now does: they are
+// wired to real Tauri window APIs (`getCurrentWindow().close()` / `.minimize()`),
+// because `decorations: false` makes this titlebar the window's only chrome -- inert
+// lights would leave the window both unclosable and unmovable (the `.titlebar` and
+// `.title-block` carry `data-tauri-drag-region` for the same reason). The zoom light
+// is rendered `disabled` instead of wired: `tauri.conf.json` sets `resizable: false`,
+// so maximizing a fixed 1440x900 canvas is the same contradiction
+// `check-window-config.sh` already polices for `fullscreen`/`maximized`.
 
 import { useEffect, useState } from "react";
 import type { HTMLAttributes, ReactNode } from "react";
+
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { isNavBuilt } from "../routes";
 
@@ -215,6 +226,13 @@ interface SidebarProps {
   active?: string;
 }
 
+/** Navigate to the Strategy Designer -- shared by the "New strategy" button's
+ * click and its `⌘N` shortcut so the two can never drift apart. Module-level
+ * (not a closure) since it depends on nothing from `Sidebar`'s props or state. */
+function goToDesigner() {
+  window.location.hash = "#/designer";
+}
+
 /**
  * The ported sidebar: brand mark, the "New strategy" affordance, and the nav list.
  *
@@ -225,6 +243,20 @@ interface SidebarProps {
  * file's header comment.
  */
 export function Sidebar({ active }: SidebarProps) {
+  // The `⌘N` hint next to "New strategy" below only means something if the
+  // shortcut is actually bound -- this is that binding (`/designer` is a real
+  // route as of `r1.s1.w4`).
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey && event.key === "n") {
+        event.preventDefault();
+        goToDesigner();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -255,7 +287,7 @@ export function Sidebar({ active }: SidebarProps) {
         </div>
       </div>
 
-      <button type="button" className="new-btn">
+      <button type="button" className="new-btn" onClick={goToDesigner}>
         <span>＋</span> New strategy
         <span className="kbd-mini">⌘N</span>
       </button>
@@ -409,13 +441,43 @@ export function WindowChrome({ docTitle, children }: WindowChromeProps) {
   const { mode, theme, cycle } = useTheme();
   return (
     <div className="window" data-theme={theme}>
-      <div className="titlebar">
+      <div className="titlebar" data-tauri-drag-region>
         <div className="traffic">
-          <span style={{ background: "#ff5f57" }} />
-          <span style={{ background: "#febc2e" }} />
-          <span style={{ background: "#28c840" }} />
+          <button
+            type="button"
+            style={{ background: "#ff5f57" }}
+            aria-label="Close window"
+            onClick={() => {
+              getCurrentWindow()
+                .close()
+                .catch(() => {
+                  // A rejection here means the window API itself is unreachable
+                  // (e.g. no Tauri runtime in a non-Tauri preview) -- nothing else
+                  // to do about it from a click handler.
+                });
+            }}
+          />
+          <button
+            type="button"
+            style={{ background: "#febc2e" }}
+            aria-label="Minimize window"
+            onClick={() => {
+              getCurrentWindow()
+                .minimize()
+                .catch(() => {
+                  // Same reasoning as the close button above.
+                });
+            }}
+          />
+          <button
+            type="button"
+            style={{ background: "#28c840" }}
+            aria-label="Zoom (this window is a fixed size)"
+            title="This window is a fixed 1440×900 size — zoom is disabled"
+            disabled
+          />
         </div>
-        <div className="title-block">
+        <div className="title-block" data-tauri-drag-region>
           <span className="title-app">PulseTrader</span>
           {docTitle !== undefined && (
             <>
@@ -433,19 +495,6 @@ export function WindowChrome({ docTitle, children }: WindowChromeProps) {
             onClick={cycle}
           >
             <ThemeIcon mode={mode} />
-          </button>
-          <button type="button" className="icon-btn" title="Layout">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-            >
-              <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
-              <line x1="6" y1="2.5" x2="6" y2="13.5" />
-            </svg>
           </button>
         </div>
       </div>

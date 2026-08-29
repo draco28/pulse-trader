@@ -18,6 +18,24 @@ body {
   overflow: hidden;
 }
 
+/* ---- traffic-light window controls -------------------------------------
+   `shared.css`'s `.traffic span` rule (width/height/border-radius) still
+   sizes these -- they are real `<button>`s now (r1.s1 PR review: the
+   app-drawn titlebar under `decorations: false` is the window's only chrome,
+   so close/minimize must actually work), which means resetting the browser's
+   default button chrome on top of that shared sizing. */
+.traffic button {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.traffic button:disabled {
+  cursor: default;
+}
+
 /* ---- the no-credential banner (grill G4/A7) ------------------------------
    Not a per-screen stylesheet -- there is no screen here to style, only the
    frame's own first-run notice. Built from tokens.css's existing warn
