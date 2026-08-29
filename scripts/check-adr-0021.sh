@@ -10,9 +10,9 @@
 #   1. ADR-0021 exists at docs/adr/0021-coach-agent-one-mutation-framework.md and
 #      is not a stub.
 #   2. It carries the MADR-lite section set the 0001-0023 series uses.
-#   3. Its `Status` section is exactly `Proposed` — authored `Proposed` as this
-#      spine's first deliverable (the class-declaration rung-3 rule), flipped to
-#      `Accepted` at r1.s2's close. The flip and this gate's update are made in the
+#   3. Its `Status` section is exactly `Accepted` — authored `Proposed` as this
+#      spine's first deliverable (the class-declaration rung-3 rule) and flipped at
+#      r1.s2's close (2026-08-29). The flip and this gate's update were made in the
 #      same act, per the bones protocol (check-adr-0020.sh set that precedent).
 #   4. Its `Decision` section names the SIX decided points the spine owes, so that
 #      w2 and w3 implement a decided design rather than re-deciding one:
@@ -24,7 +24,11 @@
 #        (e) the bounded CoachContext projection (grill L4 as amended by audit C1),
 #        (f) mutation validity is established at use-time by apply() and is never
 #            persisted (audit C4),
-#      plus (g) the C6 path-grammar reuse of validate.rs's dotted/indexed locators.
+#      plus (g) the C6 path-grammar reuse of validate.rs's dotted/indexed locators,
+#      and (h) the SEVENTH failure kind, `TransportFailure` (r1.s2.w4, operator
+#      ruling 2026-08-29). (h) is asserted because the amendment reverses an earlier
+#      decision recorded in w3's report; without a gate on it, a later edit could
+#      quietly restore the taxonomy to six and reopen the one silent coach turn.
 #   5. The number 0021 is occupied by exactly ONE file — the reserved number was
 #      held for this decision and nothing else may take it.
 #
@@ -68,11 +72,13 @@ for heading in "Status" "Context" "Decision" "Consequences" "Alternatives consid
   fi
 done
 
-# --- 3. Status is exactly Proposed --------------------------------------------
+# --- 3. Status is exactly Accepted --------------------------------------------
+# Flipped from `Proposed` at spine r1.s2's close (2026-08-29) — the flip and this
+# assertion were made in the same act, per the bones protocol.
 status_body="$(section "$adr_0021" "Status")"
 status_word="$(printf '%s\n' "$status_body" | grep -m1 -E '^[A-Za-z]+' | tr -d '[:space:]')"
-if [[ "$status_word" != "Proposed" ]]; then
-  fail "ADR-0021 Status is '${status_word:-<empty>}', expected exactly 'Proposed' (r1.s2's close is the only thing that may flip it to Accepted, and it updates this gate in the same act)"
+if [[ "$status_word" != "Accepted" ]]; then
+  fail "ADR-0021 Status is '${status_word:-<empty>}', expected exactly 'Accepted' (flipped at r1.s2's close; only that close may flip it)"
 fi
 
 # --- 4. Decision names the six decided points + the C6 grammar reuse ----------
@@ -94,6 +100,12 @@ decision_requires=(
   "(e) the bounded CoachContext projection (L4/C1):CoachContext"
   "(f) use-time validity, never persisted (C4):use-time"
   "(g) the C6 reuse of validate.rs's locator grammar:validate\.rs"
+  # (h) r1.s2.w4's amendment. Gated because it REVERSES an earlier decision (w3
+  # argued a transport fault out of the taxonomy); an ungated amendment could be
+  # dropped by a later edit, restoring the taxonomy to six and reopening the one
+  # coach turn that produced no record.
+  "(h) the seventh failure kind, TransportFailure (w4):TransportFailure"
+  "(h) the transport-failure amendment's provenance (w4):operator ruling"
 )
 for pair in "${decision_requires[@]}"; do
   label="${pair%%:*}"; needle="${pair#*:}"
@@ -115,4 +127,4 @@ if ((${#failures[@]} > 0)); then
   exit 1
 fi
 
-echo "check-adr-0021: OK (ADR-0021 Proposed — six decided points + the C6 grammar reuse recorded, number 0021 uniquely occupied)"
+echo "check-adr-0021: OK (ADR-0021 Accepted — flipped at r1.s2's close; six decided points + the C6 grammar reuse + w4's seventh failure kind recorded, number 0021 uniquely occupied)"

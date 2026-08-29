@@ -4,17 +4,20 @@ Date: 2026-08-29T00:00:00Z
 
 ## Status
 
-Proposed
+Accepted
 
-(Authored as spine `r1.s2`'s first deliverable — the class-declaration rung-3 rule
-for a spine that owes a bone ADR. It is flipped to `Accepted` at `r1.s2`'s close,
-and `scripts/check-adr-0021.sh` — which asserts `Proposed` today — is updated in
-that same act, per the bones protocol `ADR-0020` set.
+(Authored `Proposed` as spine `r1.s2`'s first deliverable — the class-declaration
+rung-3 rule for a spine that owes a bone ADR — and **flipped to `Accepted` at
+`r1.s2`'s close, 2026-08-29**. `scripts/check-adr-0021.sh` was updated in the same
+act, per the bones protocol `ADR-0020` set: it asserts `Accepted` now, and it also
+asserts the seventh failure kind, so the `w4` amendment in decision 6 cannot be
+dropped without reddening the gate.
 
-`r1.s2.w1` implements the mutation half of this decision. `w2` (coaching domain +
-migration `0005`) and `w3` (the coach turn) implement against the rest of it, which
-is why the whole spine's architecture is decided here rather than one work item at
-a time.)
+Accepted on implementation, not intent — every decision here is built and covered.
+`r1.s2.w1` implemented the mutation half; `w2` the coaching domain and migration
+`0005`; `w3` the coach turn end to end; `w4` the seventh failure kind. That is why
+the whole spine's architecture was decided here rather than one work item at a
+time, and why this flip needs no fresh argument.)
 
 ## Context
 
