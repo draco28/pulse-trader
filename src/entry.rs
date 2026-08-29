@@ -140,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_non_utf8_argument_counts_as_user_intent() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;

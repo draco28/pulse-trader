@@ -40,8 +40,15 @@ fi
 # `ui/src/bindings.ts` must be the generator's raw output: nothing in build
 # scripts or build.rs may rewrite it after export (the failure mode the deleted
 # function existed for). A legitimate regeneration invocation is fine; a
-# sed/patch/transform of the file is not.
-if grep -rnE "bindings\.ts.*(sed|perl|patch|post_process|transform)" "$repo_root/build.rs" "$repo_root/src" "$repo_root/scripts" >/dev/null 2>&1; then
+# sed/patch/transform of the file is not. Matched in BOTH token orders --
+# `bindings.ts ... sed` and `sed ... bindings.ts` -- since a real reintroduction
+# is just as likely to put the transform verb first (e.g. `sed -i '...'
+# ui/src/bindings.ts`). This script's own basename is excluded from the scan:
+# its match target below necessarily contains both `bindings.ts` and the verb
+# words as string literals, which would otherwise make the gate match itself.
+if grep -rnE --exclude="$(basename "${BASH_SOURCE[0]}")" \
+  "(bindings\.ts.*(sed|perl|patch|post_process|transform)|(sed|perl|patch|post_process|transform).*bindings\.ts)" \
+  "$repo_root/build.rs" "$repo_root/src" "$repo_root/scripts" >/dev/null 2>&1; then
   failures+=("a post-write transform of ui/src/bindings.ts reappears in build scripts -- bindings must be the raw generator output")
 fi
 

@@ -102,6 +102,7 @@ fn main() {
     // resolved rustc / target are picked up on every build invocation anyway.
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src/domain/dsl/schema_version_const.rs");
+    println!("cargo:rerun-if-env-changed=PULSE_ALLOW_PLACEHOLDER_DIST");
 
     // r1.s1.w1 (ADR-0020): the desktop half. Order matters -- the dist directory must
     // exist before `tauri_build::build()` reads the config that points at it.
@@ -121,12 +122,34 @@ fn main() {
 /// It writes ONLY when the file is absent, so it never clobbers a real Vite build. The
 /// placeholder it writes is deliberately inert: `just check` runs the real `npm run
 /// build`, which overwrites it. `ui/dist` is gitignored, so this never dirties the tree.
+///
+/// **The release rule.** `cargo build --release` does NOT go through Tauri's
+/// `beforeBuildCommand` (that only runs for `tauri build` / `npm run bundle`), so without a
+/// guard this same fallback would silently write the placeholder into a `--release` build
+/// too -- and `tauri::generate_context!` would then happily embed it, shipping a binary
+/// whose UI is the literal string "Placeholder asset written by build.rs." So when the real
+/// `index.html` is absent AND Cargo reports `PROFILE=release`, this panics instead of
+/// writing the stub, unless `PULSE_ALLOW_PLACEHOLDER_DIST=1` is set (for a Rust-only release
+/// build -- e.g. a CI determinism job -- that is never distributed). Debug/test builds are
+/// unaffected: they keep writing the placeholder exactly as before.
 fn ensure_frontend_dist(manifest_dir: &Path) {
     let dist = manifest_dir.join("ui").join("dist");
     let index = dist.join("index.html");
     if index.exists() {
         return;
     }
+    let is_release = env::var("PROFILE").as_deref() == Ok("release");
+    let placeholder_allowed = env::var("PULSE_ALLOW_PLACEHOLDER_DIST").as_deref() == Ok("1");
+    assert!(
+        !is_release || placeholder_allowed,
+        "ui/dist/index.html is missing and this is a --release build: refusing to embed \
+         the placeholder frontend into a release binary.\n\
+         Fix by either:\n\
+         \x20 1. Building the real frontend first: run `npm run build` (or `just bundle` / \
+         `npm run bundle`, which runs it automatically via Tauri's beforeBuildCommand), or\n\
+         \x20 2. Setting PULSE_ALLOW_PLACEHOLDER_DIST=1 if this is a Rust-only release \
+         build that will never be distributed (e.g. a CI determinism job)."
+    );
     std::fs::create_dir_all(&dist)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist.display()));
     std::fs::write(
