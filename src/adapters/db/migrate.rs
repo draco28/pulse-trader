@@ -74,7 +74,9 @@ pub enum MigrationOutcome {
 /// fails (the original db is restored from the backup first; the backup is
 /// retained for forensics), OR if the db is **ahead** of the embedded set — it has
 /// applied a migration this binary does not ship, at ANY version, so a db newer than
-/// the binary must NOT be migrated *or* opened; refuse to start (MASTER-SPEC §7.4).
+/// the binary must NOT be migrated *or* opened; refuse to start (MASTER-SPEC §7.4),
+/// OR if an applied migration's stored checksum no longer matches this binary's
+/// embedded file (the db holds a different version of a migration it has "applied").
 /// Returns [`DataError::Db`] if the pool cannot be opened.
 pub async fn run_migrations_with_backup(db_path: &Path) -> Result<MigrationOutcome, DataError> {
     run_migrations_with_backup_using(db_path, &MIGRATOR).await
@@ -127,6 +129,16 @@ async fn run_migrations_with_backup_using(
              than the binary"
         )));
     }
+
+    // CONTENT, not just coverage. `sqlx` stores each migration's checksum and
+    // refuses to run when an already-applied file has changed underneath it — but
+    // only when the migrator RUNS. The early return below skips the migrator
+    // entirely, so a db whose applied `0005` predates an in-place edit to
+    // `0005_coaching.up.sql` would report `AlreadyCurrent` and keep the OLD schema
+    // (the six-kind failure_kind CHECK, say) while the binary believes the new one
+    // is live. Validating here makes the mismatch loud on BOTH branches, and covers
+    // `r1.s3`'s reserved `0006` the same way.
+    validate_applied_checksums(pool, migrator, &applied).await?;
 
     let missing: Vec<i64> = embedded.difference(&applied).copied().collect();
     if missing.is_empty() {
@@ -282,6 +294,65 @@ async fn applied_versions(pool: &SqlitePool) -> Result<BTreeSet<i64>, DataError>
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
     Ok(versions.into_iter().collect())
+}
+
+/// Assert every APPLIED migration still matches the embedded file's checksum.
+///
+/// `sqlx` performs this check inside [`Migrator::run`]; this is the same property
+/// asserted where the protocol can act on it — before the `AlreadyCurrent` early
+/// return, which never reaches `run`. A db carrying stale content for a version
+/// this binary ships is not "current": it is a silent schema divergence, the exact
+/// failure the set-based coverage check was written to prevent, one level down.
+///
+/// Versions applied but NOT embedded are skipped here — the ahead-state guard has
+/// already refused those, and re-reporting them as checksum mismatches would bury
+/// the clearer message.
+///
+/// # Errors
+/// [`DataError::Migration`] listing every version whose stored checksum differs
+/// from the embedded file's; [`DataError::Db`] if the table cannot be read.
+async fn validate_applied_checksums(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    applied: &BTreeSet<i64>,
+) -> Result<(), DataError> {
+    if applied.is_empty() {
+        return Ok(());
+    }
+
+    let stored: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+
+    let mut mismatched = Vec::new();
+    for (version, checksum) in stored {
+        let Some(embedded) = migrator
+            .iter()
+            .find(|m| m.migration_type.is_up_migration() && m.version == version)
+        else {
+            continue;
+        };
+        if embedded.checksum.as_ref() != checksum.as_slice() {
+            mismatched.push(version);
+        }
+    }
+
+    if !mismatched.is_empty() {
+        let names = mismatched
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DataError::Migration(format!(
+            "db has applied migration(s) [{names}] whose content no longer matches this \
+             binary's embedded file: the schema on disk is not the schema this binary \
+             expects; refusing to open"
+        )));
+    }
+    Ok(())
 }
 
 /// Every version among the migrator's *up* migrations (the `iter()` yields both
@@ -603,6 +674,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_applied_migration_is_refused_rather_than_reported_current() {
+        // PR #128 finding 3. Coverage says "every embedded version is applied";
+        // CONTENT says "and it is the version this binary ships". Only the second
+        // catches a db that applied `0005` before an in-place edit to it — the
+        // reserved-number scheme's other half, and the case the AlreadyCurrent early
+        // return skips entirely because it never reaches sqlx's own check.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pulse.db");
+        let db = Db::with_path(&path).await.expect("open db");
+        MIGRATOR
+            .run(db.pool())
+            .await
+            .expect("bring up to embedded max");
+
+        // The db now holds `0005` as it is TODAY. Rewrite its stored checksum to
+        // stand for a db that applied yesterday's `0005`.
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 5")
+            .execute(db.pool())
+            .await
+            .expect("stale the applied checksum");
+        drop(db);
+
+        let outcome = run_migrations_with_backup(&path).await;
+
+        match outcome {
+            Err(DataError::Migration(message)) => {
+                assert!(
+                    message.contains('5'),
+                    "the refusal must name the diverged migration: {message}"
+                );
+            }
+            other => panic!(
+                "a db holding stale content for an applied migration must be refused, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            count_backups(tmp.path()),
+            0,
+            "the refusal happens before any backup is paid for"
+        );
+    }
+
+    #[tokio::test]
     async fn migration_forced_failure_restores_and_refuses_to_start() {
         // AC-13 (FR-4): a deliberately-broken migration source (test-scoped, NOT in
         // the committed migrations/ dir) → restore-on-failure + REFUSE TO START.
@@ -617,15 +731,18 @@ mod tests {
             undo_to(db.pool(), 1).await.expect("undo to 1");
         }
 
-        // Build a broken runtime migrator: a temp migrations dir with a valid
-        // 0001 (matching the embedded checksum is unnecessary — we point the
-        // protocol at THIS migrator) + a syntactically broken 0002.
+        // Build a broken runtime migrator: a temp migrations dir with an already-
+        // applied 0001 + a syntactically broken 0002.
+        //
+        // 0001's CONTENT is copied from the committed file rather than stubbed:
+        // the protocol validates the checksum of every APPLIED version against the
+        // migrator it was handed, so a stub 0001 would be refused as a stale
+        // migration before the broken 0002 ever ran — and this test is about the
+        // restore path, not about that guard.
         let mig_dir = TempDir::new().expect("migrations tempdir");
-        std::fs::write(
-            mig_dir.path().join("0001_init.up.sql"),
-            "CREATE TABLE IF NOT EXISTS _noop_marker (id INTEGER);",
-        )
-        .unwrap();
+        let real_0001 = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/0001_init.up.sql");
+        std::fs::copy(&real_0001, mig_dir.path().join("0001_init.up.sql"))
+            .expect("copy the committed 0001 so its checksum matches the applied row");
         std::fs::write(
             mig_dir.path().join("0002_broken.up.sql"),
             "THIS IS NOT VALID SQL ;;;",

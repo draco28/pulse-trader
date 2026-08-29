@@ -181,6 +181,53 @@ fn a_proposal() -> Proposal {
     }
 }
 
+/// One instance of EVERY [`CoachFailure`] variant.
+///
+/// The trailing match is exhaustive with no `_` arm, so an eighth failure kind
+/// stops this file compiling until it is added to the list above it. A bare
+/// `vec![...]` cannot hold that line — it silently covered six of seven until
+/// `TransportFailure` was caught in review.
+fn every_failure_variant() -> Vec<CoachFailure> {
+    let all = vec![
+        CoachFailure::ZeroCalls,
+        CoachFailure::SeveralCalls {
+            count: 3,
+            propose_mutation_count: 2,
+        },
+        CoachFailure::MalformedArguments {
+            detail: "`path` was not a string".to_owned(),
+        },
+        CoachFailure::InapplicableMutation {
+            mutation: set_period("entry.lhs.indicator.rsi.period", 0),
+            error: a_real_mutation_error(),
+        },
+        CoachFailure::ProviderTimeout { elapsed_ms: 30_000 },
+        CoachFailure::ContextOverflow {
+            detail: "42kB of DSL against a 32kB window".to_owned(),
+        },
+        CoachFailure::TransportFailure {
+            detail: "HTTP 503 from upstream".to_owned(),
+        },
+    ];
+
+    let mut tags: Vec<&'static str> = all
+        .iter()
+        .map(|f| match f {
+            CoachFailure::ZeroCalls => "zero_calls",
+            CoachFailure::SeveralCalls { .. } => "several_calls",
+            CoachFailure::MalformedArguments { .. } => "malformed_arguments",
+            CoachFailure::InapplicableMutation { .. } => "inapplicable_mutation",
+            CoachFailure::ProviderTimeout { .. } => "provider_timeout",
+            CoachFailure::ContextOverflow { .. } => "context_overflow",
+            CoachFailure::TransportFailure { .. } => "transport_failure",
+        })
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    assert_eq!(tags.len(), all.len(), "one instance per variant: {tags:?}");
+    all
+}
+
 // ---------------------------------------------------------------------------
 // 1. A proposal session round-trips, typed
 // ---------------------------------------------------------------------------
@@ -241,28 +288,23 @@ async fn a_proposal_session_round_trips_with_its_typed_mutation() {
 async fn every_failure_variant_round_trips() {
     let (repo, _pool, _tmp) = repo().await;
 
-    let failures = vec![
-        CoachFailure::ZeroCalls,
-        CoachFailure::SeveralCalls { count: 3 },
-        CoachFailure::MalformedArguments {
-            detail: "`path` was not a string".to_owned(),
-        },
-        CoachFailure::InapplicableMutation {
-            mutation: set_period("entry.lhs.indicator.rsi.period", 0),
-            error: a_real_mutation_error(),
-        },
-        CoachFailure::ProviderTimeout { elapsed_ms: 30_000 },
-        CoachFailure::ContextOverflow {
-            detail: "42kB of DSL against a 32kB window".to_owned(),
-        },
-    ];
+    let failures = every_failure_variant();
+    assert_eq!(failures.len(), 7, "every failure kind must round-trip");
 
     for (i, failure) in failures.into_iter().enumerate() {
         let id = format!("sess-fail-{i}");
-        // A pre-call failure records no ledger row; the rest name their call.
+        // Which failures leave a ledger row, by EXHAUSTIVE match (no `_` arm): a
+        // pre-call refusal never reached the provider, and a transport fault
+        // produced no usable exchange to bill, so both record `llm_call_id` NULL
+        // (audit C3). An eighth variant has to answer this question before this
+        // file compiles.
         let call = match &failure {
-            CoachFailure::ContextOverflow { .. } => None,
-            _ => Some("call-1"),
+            CoachFailure::ContextOverflow { .. } | CoachFailure::TransportFailure { .. } => None,
+            CoachFailure::ZeroCalls
+            | CoachFailure::SeveralCalls { .. }
+            | CoachFailure::MalformedArguments { .. }
+            | CoachFailure::InapplicableMutation { .. }
+            | CoachFailure::ProviderTimeout { .. } => Some("call-1"),
         };
         let saved = session(
             &id,
@@ -403,9 +445,9 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
     .expect("save");
 
     // A non-accepting disposition leaves the child version NULL.
-    repo.record_disposition(&id, &Disposition::Modified)
+    repo.record_disposition(&id, &Disposition::Rejected)
         .await
-        .expect("record modified");
+        .expect("record rejected");
     let child: Option<String> =
         sqlx::query_scalar("SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1")
             .bind("sess-1")
@@ -419,12 +461,24 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
     let got = repo.get_session(&id).await.expect("get").expect("present");
     match &got.outcome {
         SessionOutcome::Proposed { proposal } => {
-            assert_eq!(proposal.disposition, Disposition::Modified);
+            assert_eq!(proposal.disposition, Disposition::Rejected);
         }
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
     }
 
-    // Accepting persists the child version.
+    // Accepting persists the child version — from a FRESH proposal, because
+    // `Rejected` is terminal (see the transition tests below).
+    let id = CoachingSessionId::new("sess-2");
+    repo.save_session(&session(
+        "sess-2",
+        "run-1",
+        SessionOutcome::Proposed {
+            proposal: a_proposal(),
+        },
+        Some("call-1"),
+    ))
+    .await
+    .expect("save");
     repo.record_disposition(
         &id,
         &Disposition::Accepted {
@@ -466,6 +520,166 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
         .await
         .is_err(),
         "a failed turn has no proposal to disposition"
+    );
+}
+
+/// Seed one `proposed` session and return its id.
+async fn a_proposed_session(repo: &SqliteCoachingRepo<FakeClock>, id: &str) -> CoachingSessionId {
+    repo.save_session(&session(
+        id,
+        "run-1",
+        SessionOutcome::Proposed {
+            proposal: a_proposal(),
+        },
+        Some("call-1"),
+    ))
+    .await
+    .expect("save");
+    CoachingSessionId::new(id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_proposal_cannot_be_re_dispositioned() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    repo.record_disposition(
+        &id,
+        &Disposition::Accepted {
+            child_version_id: VersionId::new("ver-2"),
+        },
+    )
+    .await
+    .expect("accept an open proposal");
+
+    // `Accepted` is terminal (`Proposal::transition`). An unconditional UPDATE
+    // would re-point this row at a second child version and report success — the
+    // exact thing the session-id accept key exists to prevent.
+    let second_child = repo
+        .record_disposition(
+            &id,
+            &Disposition::Accepted {
+                child_version_id: VersionId::new("ver-3"),
+            },
+        )
+        .await;
+    assert!(
+        second_child.is_err(),
+        "an accepted proposal must not gain a second child version"
+    );
+    assert!(
+        repo.record_disposition(&id, &Disposition::Rejected)
+            .await
+            .is_err(),
+        "an accepted proposal must not be re-recorded as rejected"
+    );
+
+    // The row is untouched by the refused writes.
+    let child: Option<String> =
+        sqlx::query_scalar("SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1")
+            .bind("sess-1")
+            .fetch_one(&pool)
+            .await
+            .expect("read child_version_id");
+    assert_eq!(
+        child.as_deref(),
+        Some("ver-2"),
+        "the refused writes changed nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replaying_the_same_accept_is_a_no_op() {
+    let (repo, _pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+    let accept = Disposition::Accepted {
+        child_version_id: VersionId::new("ver-2"),
+    };
+
+    repo.record_disposition(&id, &accept)
+        .await
+        .expect("the accept");
+    // The session id IS the accept idempotency key: a retry of the SAME accept has
+    // to succeed, or a client that lost the response can never safely retry.
+    repo.record_disposition(&id, &accept)
+        .await
+        .expect("replaying the identical accept is idempotent");
+
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => assert_eq!(proposal.disposition, accept),
+        SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modified_and_proposed_are_refused_as_targets() {
+    let (repo, _pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    // A modify is an EDIT: it replaces the proposal's stored mutation. Recording
+    // the state alone would leave a row that says "edited" while carrying the
+    // un-edited mutation, so this operation refuses it rather than half-writing it.
+    assert!(
+        repo.record_disposition(&id, &Disposition::Modified)
+            .await
+            .is_err(),
+        "a `modified` disposition must be written with the edited mutation, not alone"
+    );
+    // Nothing returns to the initial state.
+    assert!(
+        repo.record_disposition(&id, &Disposition::Proposed)
+            .await
+            .is_err(),
+        "nothing returns to `proposed`"
+    );
+
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => {
+            assert_eq!(
+                proposal.disposition,
+                Disposition::Proposed,
+                "the refused writes left the proposal open"
+            );
+        }
+        SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_kind_that_disagrees_with_its_detail_is_refused_on_read() {
+    let (repo, pool, _tmp) = repo().await;
+    repo.save_session(&session(
+        "sess-1",
+        "run-1",
+        SessionOutcome::Failed {
+            failure: CoachFailure::ZeroCalls,
+        },
+        Some("call-1"),
+    ))
+    .await
+    .expect("save a failed turn");
+
+    // `failure_kind` is the QUERYABLE column — an audit scan for every
+    // `provider_timeout` reads it, not the JSON. A row whose tag disagrees with its
+    // detail would answer that scan wrongly, which is worse than answering with an
+    // error.
+    sqlx::query(
+        "UPDATE coaching_sessions SET failure_kind = 'provider_timeout' WHERE id = 'sess-1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("desync the kind from the detail");
+
+    let err = repo
+        .get_session(&CoachingSessionId::new("sess-1"))
+        .await
+        .expect_err("a disagreeing failure_kind must fail closed");
+    let message = err.to_string();
+    assert!(
+        message.contains("provider_timeout") && message.contains("zero_calls"),
+        "the error must name both sides of the disagreement: {message}"
     );
 }
 

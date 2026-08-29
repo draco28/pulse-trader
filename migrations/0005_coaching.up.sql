@@ -97,7 +97,14 @@ CREATE TABLE coaching_proposals (
   -- A stated hypothesis is part of the capability sentence; an empty string is
   -- silence wearing a proposal's clothes. `Hypothesis` enforces this in the domain
   -- and the column enforces it against anything that writes around the domain.
-  CHECK (length(trim(hypothesis)) > 0),
+  --
+  -- The trim CHAR-SET is explicit because SQLite's one-argument `trim()` strips
+  -- SPACES ONLY. A hypothesis of a single tab or newline would pass `trim(x)` and
+  -- then be refused by `Hypothesis::new` (Rust's `str::trim` is whitespace-wide) at
+  -- READ time — so the row would insert and `list_sessions_for_run` would
+  -- fail-close on it forever after. The set is ASCII HT/LF/VT/FF/CR/space, the
+  -- whitespace a stored hypothesis can realistically carry.
+  CHECK (length(trim(hypothesis, char(9, 10, 11, 12, 13, 32))) > 0),
 
   -- `r1.s4`'s consistency model: no accepted proposal without its child version,
   -- and no child version on a proposal that was not accepted.

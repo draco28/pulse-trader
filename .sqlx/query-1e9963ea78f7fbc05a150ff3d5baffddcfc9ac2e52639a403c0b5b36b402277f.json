@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                 id                  AS \"id!: String\",\n                 backtest_run_id     AS \"backtest_run_id!: String\",\n                 strategy_version_id AS \"strategy_version_id!: String\",\n                 created_at          AS \"created_at!: String\",\n                 llm_call_id         AS \"llm_call_id?: String\",\n                 outcome             AS \"outcome!: String\",\n                 failure_detail      AS \"failure_detail?: String\",\n                 schema_version      AS \"schema_version!: i64\"\n               FROM coaching_sessions WHERE id = ?1",
+  "query": "SELECT\n                 id                  AS \"id!: String\",\n                 backtest_run_id     AS \"backtest_run_id!: String\",\n                 strategy_version_id AS \"strategy_version_id!: String\",\n                 created_at          AS \"created_at!: String\",\n                 llm_call_id         AS \"llm_call_id?: String\",\n                 outcome             AS \"outcome!: String\",\n                 failure_kind        AS \"failure_kind?: String\",\n                 failure_detail      AS \"failure_detail?: String\",\n                 schema_version      AS \"schema_version!: i64\"\n               FROM coaching_sessions WHERE id = ?1",
   "describe": {
     "columns": [
       {
@@ -34,13 +34,18 @@
         "type_info": "Text"
       },
       {
-        "name": "failure_detail?: String",
+        "name": "failure_kind?: String",
         "ordinal": 6,
         "type_info": "Text"
       },
       {
-        "name": "schema_version!: i64",
+        "name": "failure_detail?: String",
         "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "schema_version!: i64",
+        "ordinal": 8,
         "type_info": "Integer"
       }
     ],
@@ -55,8 +60,9 @@
       true,
       false,
       true,
+      true,
       false
     ]
   },
-  "hash": "4ad26ee24b63b8be31881d443d4795df2ad86cb9a8835cb98db04a9796489f39"
+  "hash": "1e9963ea78f7fbc05a150ff3d5baffddcfc9ac2e52639a403c0b5b36b402277f"
 }

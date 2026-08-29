@@ -251,6 +251,7 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
                  created_at          AS "created_at!: String",
                  llm_call_id         AS "llm_call_id?: String",
                  outcome             AS "outcome!: String",
+                 failure_kind        AS "failure_kind?: String",
                  failure_detail      AS "failure_detail?: String",
                  schema_version      AS "schema_version!: i64"
                FROM coaching_sessions WHERE id = ?1"#,
@@ -288,8 +289,29 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
                         r.id
                     ))
                 })?;
+                let stored_kind = r.failure_kind.ok_or_else(|| {
+                    DataError::Db(format!(
+                        "coaching_sessions `{}` records a failure with no failure_kind",
+                        r.id
+                    ))
+                })?;
                 let failure: CoachFailure =
                     parse_json("coaching_sessions.failure_detail", &detail)?;
+                // `failure_kind` and `failure_detail` are written from the SAME
+                // value, so a row where they disagree was written around this
+                // adapter — and it is the QUERYABLE column that disagrees. A
+                // `failure_kind` index scan for `provider_timeout` that returns a
+                // row whose detail is a `zero_calls` is worse than an error: it is
+                // a wrong answer to an audit question. Fail closed, the posture the
+                // rest of this file already takes.
+                let decoded_kind = failure_kind(&failure);
+                if stored_kind != decoded_kind {
+                    return Err(DataError::Db(format!(
+                        "coaching_sessions `{}`: failure_kind `{stored_kind}` disagrees with \
+                         the recorded failure_detail (`{decoded_kind}`)",
+                        r.id
+                    )));
+                }
                 SessionOutcome::Failed { failure }
             }
             other => {
@@ -349,30 +371,114 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         disposition: &Disposition,
     ) -> Result<(), DataError> {
         let id_str = id.as_str();
+
+        // The two targets this operation cannot honestly write.
+        //
+        // `Proposed`: nothing returns to the initial state — the same rule
+        // `Proposal::transition` enforces, which the store must not be able to
+        // contradict.
+        //
+        // `Modified`: a modify is an EDIT. `r1.s4`'s rail replaces the proposal's
+        // stored `mutation` with the trader's version, and this operation writes
+        // the disposition columns only — so recording `modified` here would move
+        // the state while leaving the ORIGINAL mutation in the row: a proposal that
+        // says it was edited and carries the un-edited value, with no way to tell
+        // from the row which it is. Refused rather than half-written; the operation
+        // that writes both in one statement belongs to the rail that has the edited
+        // mutation to write.
+        match disposition {
+            Disposition::Proposed => {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id_str}`: nothing returns to `proposed`"
+                )));
+            }
+            Disposition::Modified => {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id_str}`: a `modified` disposition must be written \
+                     together with the edited mutation, not by itself"
+                )));
+            }
+            Disposition::Accepted { .. } | Disposition::Rejected => {}
+        }
+
         let tag = disposition_tag(disposition);
         let child_version_id = disposition
             .child_version_id()
             .map(|v| v.as_str().to_owned());
 
+        // One transaction: the conditional write and the read that interprets a
+        // no-op must see the same row, or a concurrent accept turns "already
+        // settled the same way" into "settled differently" between the two.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // CONDITIONAL on the current state, not a blind UPDATE. `Proposed` and
+        // `Modified` are the two states a proposal may leave; `Accepted` and
+        // `Rejected` are terminal (`Proposal::transition`). Without the predicate
+        // this statement will happily re-point an accepted proposal at a second
+        // child version — the exact thing the session-id idempotency key exists to
+        // prevent — and report success.
         let affected = sqlx::query!(
             "UPDATE coaching_proposals SET disposition = ?1, child_version_id = ?2 \
-             WHERE session_id = ?3",
+             WHERE session_id = ?3 AND disposition IN ('proposed', 'modified')",
             tag,
             child_version_id,
             id_str,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| DataError::Db(e.to_string()))?
         .rows_affected();
 
-        if affected == 0 {
+        if affected == 1 {
+            tx.commit()
+                .await
+                .map_err(|e| DataError::Db(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Nothing moved. Either there is no proposal to disposition, or it is
+        // already settled — and only one of those is benign.
+        let existing = sqlx::query!(
+            r#"SELECT
+                 disposition      AS "disposition!: String",
+                 child_version_id AS "child_version_id?: String"
+               FROM coaching_proposals WHERE session_id = ?1"#,
+            id_str,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let Some(row) = existing else {
             return Err(DataError::Db(format!(
                 "no proposal to disposition for coaching session `{id_str}` \
                  (absent session, or a turn that failed)"
             )));
+        };
+        let current = parse_disposition(&row.disposition, row.child_version_id)?;
+
+        // IDEMPOTENT, and only for the identical write. Replaying an accept must be
+        // a no-op — that is what makes the session id an accept idempotency key —
+        // but an accept naming a DIFFERENT child version is a second child for one
+        // proposal, which is what the key exists to refuse. `Disposition`'s
+        // equality compares the payload, so the two cases separate themselves.
+        if &current == disposition {
+            tx.commit()
+                .await
+                .map_err(|e| DataError::Db(e.to_string()))?;
+            return Ok(());
         }
-        Ok(())
+
+        Err(DataError::Db(format!(
+            "coaching session `{id_str}`: the proposal is `{}` and may not be recorded as \
+             `{}`",
+            current.kind(),
+            disposition.kind()
+        )))
     }
 }
 

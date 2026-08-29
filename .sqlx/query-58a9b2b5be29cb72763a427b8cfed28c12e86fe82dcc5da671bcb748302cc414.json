@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 disposition      AS \"disposition!: String\",\n                 child_version_id AS \"child_version_id?: String\"\n               FROM coaching_proposals WHERE session_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "disposition!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "child_version_id?: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "58a9b2b5be29cb72763a427b8cfed28c12e86fe82dcc5da671bcb748302cc414"
+}

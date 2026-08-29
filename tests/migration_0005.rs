@@ -463,7 +463,12 @@ async fn a_hypothesis_may_not_be_blank_at_the_sql_layer() {
         .await
         .expect("seed session");
 
-    for blank in ["", "   "] {
+    // SQLite's one-argument `trim()` strips SPACES ONLY, so the tab / newline /
+    // carriage-return cases are the ones a naive CHECK lets through — and they are
+    // the ones that hurt: the row inserts, and then `Hypothesis::new` (Rust's
+    // whitespace-wide `str::trim`) refuses it at READ time, so the session is
+    // written once and unreadable forever after.
+    for blank in ["", "   ", "\t", "\n", "\r\n", " \t\n ", "\u{b}\u{c}"] {
         let outcome = insert_proposal(db.pool(), "prop-1", "sess-1", blank, "proposed", None).await;
         assert!(
             outcome.is_err(),
