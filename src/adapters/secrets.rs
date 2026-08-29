@@ -398,9 +398,26 @@ const GROUP_AND_WORLD_BITS: u32 = 0o077;
 /// one: it would validate the wrong inode instead of the one actually read.
 fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>, LlmError> {
     use std::io::Read as _;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt};
 
-    let mut file = match std::fs::File::open(path) {
+    // `O_NONBLOCK` is what keeps this open from being a liveness hazard, and it is
+    // needed precisely BECAUSE the checks now run on the handle rather than on the
+    // path. Opening a FIFO for reading blocks until a writer appears, so a named
+    // pipe left at a searched location — an overlay directory is operator-controlled
+    // — would hang here forever, before `is_file()` ever got the chance to reject it
+    // as a miss. That hang would reach the UI: `llm_credential_status` walks this
+    // same chain and the banner calls it on paint. With the flag the open returns
+    // immediately and the fstat below rejects the pipe as the ordinary miss it is.
+    // On a regular file the flag is a no-op — regular files are always ready — so
+    // the read below is unaffected.
+    //
+    // `O_CLOEXEC` keeps the descriptor out of any child process: a credential handle
+    // has no business being inherited.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
         Ok(file) => file,
         // A genuine absence is the ordinary miss the fall-through exists for.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

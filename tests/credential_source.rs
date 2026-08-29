@@ -828,3 +828,55 @@ async fn a_pre_migration_row_without_a_key_source_still_reads_back() {
          an error"
     );
 }
+
+/// A FIFO at a searched location is an ordinary miss, not a hang.
+///
+/// The resolver validates the OPEN HANDLE rather than the path (the fix for a
+/// check-then-read race), which moved the open BEFORE `is_file()` can reject a
+/// non-regular file. Opening a FIFO for reading blocks until a writer appears, so
+/// without `O_NONBLOCK` a named pipe left at an operator-controlled overlay
+/// location would hang the resolver forever — and `llm_credential_status_in` walks
+/// this same chain from the credential banner's paint, so it would hang the UI,
+/// producing neither an error nor a miss.
+///
+/// The test completing at all is the assertion.
+#[test]
+fn a_fifo_at_a_searched_location_is_a_miss_rather_than_a_hang() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let config_dir = tempfile::tempdir().expect("config tempdir");
+    let fallback_dir = tempfile::tempdir().expect("fallback tempdir");
+
+    let fifo = config_dir.path().join(".env");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path has no NUL");
+    // SAFETY: `mkfifo` takes a NUL-terminated path and a mode. The path stays owned
+    // by the `CString` for the whole call, and the mode is a plain constant.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(
+        made,
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // A real credential sits at a LOWER-priority location, so a correct run finds it
+    // and a hang is unambiguous.
+    write_dotenv(fallback_dir.path(), FAKE_KEY);
+
+    let search = CredentialSearch::empty()
+        .with_config_dir(Some(config_dir.path().to_path_buf()))
+        .with_app_data_dir(Some(fallback_dir.path().to_path_buf()));
+
+    let key = resolve_llm_api_key_in(&search).expect("a FIFO must not stall the resolution");
+    assert_eq!(
+        key.source(),
+        CredentialSource::AppDataDir,
+        "a named pipe is a miss, so resolution falls through to the real credential"
+    );
+
+    // The banner's read walks the same chain and must not hang either.
+    assert_eq!(
+        llm_credential_status_in(&search),
+        CredentialStatus::AppDataDir
+    );
+}

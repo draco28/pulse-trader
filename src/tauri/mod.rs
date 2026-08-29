@@ -123,8 +123,14 @@ pub fn run_desktop() -> anyhow::Result<()> {
     tauri::Builder::default()
         .invoke_handler(builder.invoke_handler())
         .manage(state)
-        // Keep the tokio runtime alive for the app's lifetime: commands are async and
-        // spawn onto it. Dropping it here would abort every in-flight command.
+        // Keep the tokio runtime alive for the app's lifetime — and NOT for the
+        // reason it looks like. Tauri 2 runs async commands on `tauri::async_runtime`,
+        // not on this one; a `tokio::Runtime` only becomes the command executor if
+        // `tauri::async_runtime::set` is called, which nothing here does. What makes
+        // this load-bearing is the `SqlitePool`: it was created inside
+        // `runtime.block_on(DesktopState::open_default())` above and is bound to THIS
+        // runtime, so dropping it would take the pool's connections with it mid-session.
+        // Do not remove this on the reasoning that commands do not run on it.
         .manage(runtime)
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("run the desktop shell: {e}"))
