@@ -70,10 +70,10 @@ test:
 # (r1.s5.w1, AC-2); and the specta/tauri-specta generator workaround
 # (`post_process_bindings`, a post-write transform of `bindings.ts`, or a
 # re-pin to the pre-bump rc.21/rc.22 versions) has not come back (r1.s5, d5);
-# and ADR-0021 records the six coach decisions r1.s2's later work items implement
-# against, still `Proposed` (r1.s2.w1, AC-1). NOTE, on the check-adr-0020.sh
-# precedent: r1.s2's close flips ADR-0021 to `Accepted`, and it must update
-# check-adr-0021.sh's Status assertion in the SAME act or this gate reds.
+# and ADR-0021 records the coach decisions r1.s2's work items implement against,
+# now `Accepted` (authored `Proposed` at r1.s2.w1 per AC-1, flipped at r1.s2's
+# close on 2026-08-29 with check-adr-0021.sh's Status assertion updated in the SAME
+# act -- the check-adr-0020.sh precedent). Only that close may flip it.
 
 # Run the nine content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround, ADR-0021).
 gates:

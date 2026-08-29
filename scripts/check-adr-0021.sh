@@ -75,8 +75,14 @@ done
 # --- 3. Status is exactly Accepted --------------------------------------------
 # Flipped from `Proposed` at spine r1.s2's close (2026-08-29) — the flip and this
 # assertion were made in the same act, per the bones protocol.
+#
+# The comparison is on the WHOLE first non-empty line, trimmed — not a prefix. A
+# `grep -m1 -E '^[A-Za-z]+'` match plus a prefix test would accept
+# `Accepted-in-principle`, `Accepted (pending X)`, or `Acceptedish`, which is the
+# one thing a status gate must not do.
 status_body="$(section "$adr_0021" "Status")"
-status_word="$(printf '%s\n' "$status_body" | grep -m1 -E '^[A-Za-z]+' | tr -d '[:space:]')"
+status_line="$(printf '%s\n' "$status_body" | grep -m1 -E '[^[:space:]]' || true)"
+status_word="$(printf '%s' "$status_line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
 if [[ "$status_word" != "Accepted" ]]; then
   fail "ADR-0021 Status is '${status_word:-<empty>}', expected exactly 'Accepted' (flipped at r1.s2's close; only that close may flip it)"
 fi
@@ -86,6 +92,12 @@ decision_body="$(section "$adr_0021" "Decision")"
 if [[ -z "$decision_body" ]]; then
   fail "ADR-0021 has an empty '## Decision' section"
 fi
+
+# Needles are matched against a WHITESPACE-FLATTENED copy. `grep` is line-based and
+# this is prose: a decision reading "and is never\npersisted" states the property a
+# line-anchored needle would report as missing, which would make the gate fail on
+# reflow rather than on content.
+decision_flat="$(printf '%s\n' "$decision_body" | tr '\n' ' ' | tr -s '[:space:]' ' ')"
 
 # Each entry is "<label>:<extended regex>". The regexes assert the CONCEPT is
 # recorded, not one exact phrasing -- the check-adr-0020.sh discipline.
@@ -98,8 +110,14 @@ decision_requires=(
   "(d) one provider call per coach turn (L3):one (provider )?call"
   "(d) terminal typed failures, never silence (L3):terminal"
   "(e) the bounded CoachContext projection (L4/C1):CoachContext"
+  # C4 is a NEGATIVE decision -- "there is no validated column" -- so the needle
+  # has to catch the denial, not just the phrase `use-time`, which a record could
+  # carry while still describing a stored validity flag.
   "(f) use-time validity, never persisted (C4):use-time"
+  "(f) validity is never persisted (C4):never (persisted|stored|a stored)"
+  # C6 asks for REUSE of validate.rs's locator grammar, not a mention of the file.
   "(g) the C6 reuse of validate.rs's locator grammar:validate\.rs"
+  "(g) the C6 locator grammar is REUSED, not re-invented:(reus|same).{0,40}(locator|grammar|path)|(locator|grammar|path).{0,40}reus"
   # (h) r1.s2.w4's amendment. Gated because it REVERSES an earlier decision (w3
   # argued a transport fault out of the taxonomy); an ungated amendment could be
   # dropped by a later edit, restoring the taxonomy to six and reopening the one
@@ -109,7 +127,7 @@ decision_requires=(
 )
 for pair in "${decision_requires[@]}"; do
   label="${pair%%:*}"; needle="${pair#*:}"
-  if ! printf '%s\n' "$decision_body" | grep -qiE -- "$needle"; then
+  if ! printf '%s\n' "$decision_flat" | grep -qiE -- "$needle"; then
     fail "ADR-0021 '## Decision' does not record $label"
   fi
 done
