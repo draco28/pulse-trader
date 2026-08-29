@@ -35,11 +35,11 @@ use serde::{Deserialize, Serialize};
 /// label on an [`LlmCall`](crate::domain::LlmCall) (r1.s1.w2 step 7, the audit-trail
 /// control).
 ///
-/// The serde tags (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir`) are the
-/// literal strings stored in `llm_call.key_source`, so a call's provenance is
-/// reconstructible from the ledger alone. It is a LABEL, never the value: the whole
-/// point of the audit trail is that it can be read by someone who must not learn
-/// the key.
+/// The serde tags (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir` /
+/// `keychain`) are the literal strings stored in `llm_call.key_source`, so a
+/// call's provenance is reconstructible from the ledger alone. It is a LABEL,
+/// never the value: the whole point of the audit trail is that it can be read by
+/// someone who must not learn the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialSource {
@@ -51,6 +51,9 @@ pub enum CredentialSource {
     CwdDotenv,
     /// A `.env` in the application data directory, beside `pulse.db`.
     AppDataDir,
+    /// The macOS login Keychain — the `pulse setup-keys` seed path, READ-only here
+    /// (see [`glm_api_key`](crate::adapters::secrets::glm_api_key)).
+    Keychain,
 }
 
 /// A resolved LLM API key plus the [`CredentialSource`] that answered.
@@ -143,6 +146,20 @@ impl From<CredentialSource> for CredentialStatus {
             CredentialSource::ConfigDir => Self::ConfigDir,
             CredentialSource::CwdDotenv => Self::CwdDotenv,
             CredentialSource::AppDataDir => Self::AppDataDir,
+            // `llm_credential_status_in` (the only caller that feeds this
+            // conversion) walks exclusively the `resolve_llm_api_key_in`
+            // precedence chain — env / config-dir / cwd-dotenv / app-data-dir —
+            // and never consults the Keychain (see that function's doc comment);
+            // `glm_api_key`'s Keychain read is a wholly separate path that never
+            // flows through here. So no `ApiKey` reaching this conversion in
+            // production can carry `Keychain` today. This arm exists only to keep
+            // the match exhaustive as `CredentialSource` grows — deliberately NOT
+            // adding a `CredentialStatus::Keychain` variant for it, since
+            // `CredentialStatus` is specta-exported to the Tauri/UI boundary and
+            // growing it is a UI-surface change outside this fix's scope. `None`
+            // is the conservative reading ("not usable" by this narrower
+            // diagnostic) if this arm is ever reached by a future caller.
+            CredentialSource::Keychain => Self::None,
         }
     }
 }

@@ -20,7 +20,13 @@
 //! as a ctor arg — the key
 //! never lives in a committed config file, an env var baked into the binary, or
 //! plaintext on disk (NFR-5). A **missing** entry returns a clear
-//! [`LlmError::Config`] pointing at `pulse setup-keys`, NEVER a panic.
+//! [`LlmError::Config`] pointing at `pulse setup-keys`, NEVER a panic. Like the
+//! resolver below, it returns an opaque [`ApiKey`](crate::domain::ApiKey) tagged
+//! [`CredentialSource::Keychain`](crate::domain::CredentialSource::Keychain) —
+//! the audit-trail control, so a `pulse llm-check` ledger row records where its
+//! key came from too (r1.s1.w2, closing a gap the Keychain path used to leave
+//! open: it returned a bare `String` and no `LlmCall` this composition root wrote
+//! ever recorded provenance).
 //!
 //! READ path ONLY — the `set_password` / verify half (`pulse setup-keys`) is
 //! VS-1.3.4. Pinned to `keyring` 3.x, whose `Entry::new` + `get_password` bind
@@ -68,13 +74,20 @@ const GLM_API_KEY_ACCOUNT: &str = "glm_api_key";
 
 /// Read the GLM API key from the macOS Keychain (FR-1 / NFR-5).
 ///
+/// Returns an opaque [`ApiKey`] tagged [`CredentialSource::Keychain`] (r1.s1.w2
+/// step 7, the audit-trail control) rather than a bare `String` — so a caller
+/// stamps the ledger with the SAME provenance label this function used to mint the
+/// value, via [`ApiKey::source()`], instead of a second, separately-hardcoded
+/// literal that could drift out of step with it.
+///
 /// # Errors
 ///
 /// Returns [`LlmError::Config`] when the Keychain entry is absent or the platform
 /// store cannot be reached (e.g. the key was never seeded) — with a message
 /// pointing the operator at `pulse setup-keys`. Never panics.
-pub fn glm_api_key() -> Result<String, LlmError> {
+pub fn glm_api_key() -> Result<ApiKey, LlmError> {
     read_secret(KEYCHAIN_SERVICE, GLM_API_KEY_ACCOUNT)
+        .map(|value| ApiKey::new(value, CredentialSource::Keychain))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,23 +341,47 @@ const GROUP_AND_WORLD_BITS: u32 = 0o077;
 /// Validate one candidate credential file fail-closed, then read
 /// `OLLAMA_API_KEY` out of it.
 ///
-/// `Ok(None)` means "this location does not answer" — the file is absent, or it is
-/// present but carries no `OLLAMA_API_KEY` line. Both are ordinary misses that fall
-/// through to the next location.
+/// `Ok(None)` means "this location does not answer" — the file genuinely does not
+/// exist (`metadata` fails with [`std::io::ErrorKind::NotFound`]), or it exists but
+/// carries no `OLLAMA_API_KEY` line, or it is a directory rather than a file. All
+/// three are ordinary misses that fall through to the next location.
 ///
-/// `Err` means the file was found and **REFUSED**. A refusal aborts the whole
-/// resolution rather than falling through to the next location: silently downgrading
-/// to a lower-priority credential would leave the operator with a working `pulse`
-/// and an exposed key file they were never told about. That is the "never read,
-/// never silently downgraded" half of the least-privilege control.
+/// `Err` means the file was found and **REFUSED** — including when its metadata
+/// could not even be determined (`EACCES` on a parent directory, `EIO`, `ELOOP`,
+/// `ENOTDIR`, …). A metadata failure that is NOT `NotFound` is deliberately treated
+/// as a refusal rather than an ordinary miss: `Ok(None)` there would silently
+/// downgrade to a lower-priority credential, which is exactly the "the file is
+/// absent" lie this function exists to never tell. A refusal aborts the whole
+/// resolution rather than falling through to the next location: silently
+/// downgrading to a lower-priority credential would leave the operator with a
+/// working `pulse` and an exposed key file they were never told about. That is the
+/// "never read, never silently downgraded" half of the least-privilege control.
 ///
 /// The value is never read before the checks pass, so no refusal message can contain
 /// it — the file's bytes have not been touched at that point.
 fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>, LlmError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(None);
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        // A genuine absence is the ordinary miss the fall-through exists for.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Every OTHER metadata failure (an inaccessible parent directory, an I/O
+        // error, a symlink loop, ...) is NOT the same as "this location does not
+        // answer" — silently falling through would hide the exposed/broken
+        // location from the operator entirely. Refuse instead, in the same voice
+        // as the two checks below: name the path, say plainly what was wrong, say
+        // the file was never read, and give a "Fix:" clause.
+        Err(error) => {
+            return Err(LlmError::Config(format!(
+                "refusing to fall through past the credential file {}: its metadata could \
+                 not be read ({error}) — a credential location that errors is not the same \
+                 as one that is absent, and silently using a lower-priority key would hide \
+                 it. Fix: make {} readable, or remove it.",
+                path.display(),
+                path.display(),
+            )));
+        }
     };
     if !metadata.is_file() {
         return Ok(None);
@@ -401,6 +438,10 @@ fn missing_credential_message(search: &CredentialSearch) -> String {
             CredentialSource::ConfigDir => "${PULSE_CONFIG_DIR}",
             CredentialSource::CwdDotenv => "the working / manifest directory",
             CredentialSource::AppDataDir => "the application data directory",
+            // `file_locations()` never emits a `Keychain` pair (the Keychain is not
+            // one of its file locations), same as it never emits `Env` — this arm
+            // exists only for match exhaustiveness, mirroring the `Env` arm above.
+            CredentialSource::Keychain => "the macOS Keychain",
         };
         // `write!` into the String rather than `push_str(&format!(..))`: one
         // allocation instead of two, and what `clippy::format_push_string` asks for.

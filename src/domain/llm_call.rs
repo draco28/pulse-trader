@@ -84,7 +84,8 @@ pub struct LlmCall {
     /// audit-trail control, so a call's provenance is reconstructible from the
     /// ledger alone.
     ///
-    /// A LABEL (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir`), never the key
+    /// A LABEL (`env` / `config-dir` / `cwd-dotenv` / `app-data-dir` / `keychain`),
+    /// never the key
     /// or any fragment of it. `None` means the provenance was not recorded: either a
     /// row written before migration `0007`, or a caller that supplied none.
     /// `#[serde(default)]` so a pre-`0007` serialized row still deserializes instead

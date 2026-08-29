@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pulse::{
     CredentialSearch, CredentialSource, CredentialStatus, FakeClock, LlmBackend, LlmCallId,
@@ -268,6 +268,95 @@ fn file_owner_uid(path: &Path) -> u32 {
         .uid()
 }
 
+// ---- Codex P2 (src/adapters/secrets.rs read_credential_file): a metadata error --
+// ---- must abort resolution, not silently fall through to a lower-priority key ---
+
+/// Regression guard for the fix: a location whose `.env` genuinely does not exist
+/// (`std::fs::metadata` fails with `NotFound`) is still an ORDINARY miss and must
+/// keep falling through to the next location — the fix narrows which errors abort
+/// resolution, it must not turn every miss into a refusal.
+#[test]
+fn a_missing_credential_file_still_falls_through_to_the_next_location() {
+    let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
+    let fallback_dir = tempfile::tempdir().expect("fallback tempdir");
+    write_dotenv(fallback_dir.path(), "sk-FALLTHROUGH1234abcd5678efgh9012ijk");
+
+    // `empty_config_dir` exists but holds no `.env` at all, so `metadata()` on the
+    // candidate path fails with `NotFound` — the ordinary-miss case.
+    let search = CredentialSearch::empty()
+        .with_config_dir(Some(empty_config_dir.path().to_path_buf()))
+        .with_app_data_dir(Some(fallback_dir.path().to_path_buf()));
+
+    assert_eq!(
+        resolve_llm_api_key_in(&search)
+            .expect("a NotFound location must fall through, not abort resolution")
+            .source(),
+        CredentialSource::AppDataDir,
+        "the absent config-dir `.env` must not shadow the answering fallback"
+    );
+}
+
+/// A `RAII` guard that restores a directory's permissions on drop, so a failed
+/// assertion (or an early return) still leaves the `TempDir` cleanable — an
+/// unrestored `0o000` directory cannot be deleted by its own `Drop`.
+struct RestorePerms(PathBuf);
+
+impl Drop for RestorePerms {
+    fn drop(&mut self) {
+        chmod(&self.0, 0o700);
+    }
+}
+
+/// Codex P2: `read_credential_file` used to swallow EVERY `std::fs::metadata`
+/// failure as `Ok(None)` — an ordinary miss — which silently downgraded to a
+/// lower-priority credential on `EACCES`/`EIO`/`ELOOP`/`ENOTDIR`, exactly the
+/// "never silently downgraded" property the function's own doc comment promises.
+/// This proves the fix: a metadata error that is NOT `NotFound` aborts the whole
+/// resolution with `LlmError::Config`, naming the path and no credential material,
+/// rather than falling through to the readable fallback underneath it.
+///
+/// Produced portably (macOS + Linux) by chmod-ing the PARENT directory to `0o000`:
+/// with no search permission on that directory, `std::fs::metadata` on a path
+/// inside it fails with `PermissionDenied`, regardless of whether the file itself
+/// exists.
+#[test]
+fn a_metadata_error_other_than_not_found_aborts_rather_than_downgrades() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let locked_dir = parent.path().join("locked");
+    std::fs::create_dir(&locked_dir).expect("create the subdirectory to lock");
+    let candidate = locked_dir.join(".env");
+
+    let fallback_dir = tempfile::tempdir().expect("fallback tempdir");
+    write_dotenv(fallback_dir.path(), "sk-SHOULDNOTWIN1234abcd5678efgh9012ij");
+
+    chmod(&locked_dir, 0o000);
+    // Restored on drop (including on an assertion panic) so the outer `TempDir`s
+    // can actually be removed at the end of the test.
+    let _restore = RestorePerms(locked_dir.clone());
+
+    let search = CredentialSearch::empty()
+        .with_config_dir(Some(locked_dir.clone()))
+        .with_app_data_dir(Some(fallback_dir.path().to_path_buf()));
+
+    let err = resolve_llm_api_key_in(&search).expect_err(
+        "a metadata error other than NotFound must abort resolution, never downgrade \
+         to the readable fallback underneath it",
+    );
+    assert!(
+        matches!(&err, LlmError::Config(_)),
+        "must be a Config error, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(&candidate.display().to_string()),
+        "the refusal names the offending path; got: {message}"
+    );
+    assert!(
+        !message.contains("SHOULDNOTWIN"),
+        "the refusal must contain no credential material; got: {message}"
+    );
+}
+
 // ---- AC-7: the audit trail — the ledger records the LABEL, never the value ------
 
 /// A provider double that answers once with a known token usage, so the REAL
@@ -401,6 +490,88 @@ async fn llm_call_records_key_source_label_not_value() {
         .expect("get_call")
         .expect("row present");
     assert_eq!(call.key_source, Some(CredentialSource::ConfigDir));
+}
+
+// ---- Codex P1 (src/domain/secret.rs CredentialSource): the macOS Keychain is ----
+// ---- now a representable, auditable credential source --------------------------
+
+/// `CredentialSource::Keychain`'s serde tag is exactly `keychain` (matching its
+/// four siblings' kebab-case tags) and round-trips through `serde_json` — this is
+/// the literal string `llm_call.key_source` stores for a `pulse llm-check` row.
+#[test]
+fn keychain_source_serializes_to_the_kebab_case_tag_and_round_trips() {
+    let json = serde_json::to_string(&CredentialSource::Keychain).expect("serialize Keychain");
+    assert_eq!(json, "\"keychain\"");
+    let back: CredentialSource = serde_json::from_str(&json).expect("deserialize Keychain");
+    assert_eq!(back, CredentialSource::Keychain);
+}
+
+/// Codex P1: every `llm_call` row `pulse llm-check` writes used to record
+/// `key_source = NULL` — indistinguishable from a legacy pre-migration row, on a
+/// table that is trigger-immutable (`llm_call_no_update`/`llm_call_no_delete`), so
+/// those rows could never be repaired. `llm-check`'s ONLY credential source is the
+/// macOS Keychain (`glm_api_key`, never the file/env precedence chain
+/// `resolve_llm_api_key_in` walks), so this drives the exact seam its composition
+/// root (`run_llm_check_core` in `src/cli/llm.rs`) uses —
+/// `RedactingLoggingProvider::with_key_source(Some(CredentialSource::Keychain))` —
+/// over a FAKE provider + a tempfile-`Db` repo: never a live provider, never the
+/// network, never the real Keychain (MASTER-SPEC §9.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_call_records_keychain_key_source_label() {
+    let tmp = tempfile::tempdir().expect("db tempdir");
+    let db = pulse::Db::with_path(&tmp.path().join("pulse.db"))
+        .await
+        .expect("open db");
+    pulse::MIGRATOR
+        .run(db.pool())
+        .await
+        .expect("run migrations");
+
+    let clock = FakeClock::at(1_700_000_100_000);
+    let repo = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
+    let provider = RedactingLoggingProvider::new(
+        FakeProvider,
+        repo,
+        clock,
+        Redactor::from_config(vec![FAKE_KEY.to_owned()]),
+        test_prices(),
+    )
+    .with_key_source(Some(CredentialSource::Keychain));
+
+    let no_tools: &[ToolDefinition] = &[];
+    provider
+        .chat(
+            vec![Message::user("size a BTC scalp")],
+            no_tools,
+            &chat_config(),
+        )
+        .await
+        .expect("the decorated call succeeds");
+
+    // The raw column carries the label, as text.
+    let stored: Vec<Option<String>> = sqlx::query_scalar("SELECT key_source FROM llm_call")
+        .fetch_all(db.pool())
+        .await
+        .expect("read key_source column");
+    assert_eq!(
+        stored,
+        vec![Some("keychain".to_owned())],
+        "the ledger records the keychain provenance label"
+    );
+
+    // The typed read-back agrees, so provenance is reconstructible through the
+    // domain type and not only by raw SQL.
+    let id: String = sqlx::query_scalar("SELECT id FROM llm_call")
+        .fetch_one(db.pool())
+        .await
+        .expect("read the row id");
+    let repo = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
+    let call = repo
+        .get_call(&LlmCallId::new(id))
+        .await
+        .expect("get_call")
+        .expect("row present");
+    assert_eq!(call.key_source, Some(CredentialSource::Keychain));
 }
 
 // ---- AC-8: the error is a diagnosis, not a shrug --------------------------------
