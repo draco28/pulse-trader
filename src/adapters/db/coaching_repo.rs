@@ -106,6 +106,7 @@ fn failure_kind(failure: &CoachFailure) -> &'static str {
         CoachFailure::InapplicableMutation { .. } => "inapplicable_mutation",
         CoachFailure::ProviderTimeout { .. } => "provider_timeout",
         CoachFailure::ContextOverflow { .. } => "context_overflow",
+        CoachFailure::TransportFailure { .. } => "transport_failure",
     }
 }
 

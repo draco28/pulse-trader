@@ -69,7 +69,13 @@ CREATE TABLE coaching_sessions (
     'malformed_arguments',
     'inapplicable_mutation',
     'provider_timeout',
-    'context_overflow'
+    'context_overflow',
+    -- r1.s2.w4 (operator ruling 2026-08-29): a provider transport fault is a
+    -- recorded outcome too. Added by editing 0005 IN PLACE rather than shipping a
+    -- second migration, because 0005 has never left this spine branch — ADR-0018's
+    -- forward-only rule binds migrations that have been applied somewhere, and this
+    -- one has not.
+    'transport_failure'
   ))
 );
 

@@ -203,7 +203,21 @@ impl<P: LlmProvider> Coach<P> {
                     .record(sessions, session_id, run, version, call_id, failure)
                     .await;
             }
-            Ok(Err(source)) => return Err(CoachTurnError::Provider(source)),
+            Ok(Err(source)) => {
+                // r1.s2.w4: a transport fault is a RECORDED outcome, not an early
+                // return. The error text is scrubbed on the way in — an error body
+                // can echo the request that produced it, the same road hazard
+                // `classify()` handles for tool arguments.
+                let failure = CoachFailure::TransportFailure {
+                    detail: self.redactor.redact(&source.to_string()),
+                };
+                let recorded = self
+                    .record(sessions, session_id, run, version, None, failure)
+                    .await?;
+                // Recorded AND loud: the CLI still preserves the provider error at
+                // the edge (ADR-0017); the session is what makes it non-silent.
+                return Ok(recorded);
+            }
             Ok(Ok(response)) => response,
         };
         let call_id = self.captured_since(start);

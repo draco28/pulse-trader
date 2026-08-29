@@ -533,3 +533,58 @@ async fn a_failed_session_carries_its_reason_and_a_proposed_one_does_not() {
     .await
     .expect("a pre-call failure with no llm_call row is the audit-C3 shape");
 }
+
+// ---------------------------------------------------------------------------
+// r1.s2.w4 — the widened failure-kind vocabulary
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_failure_kind_check_admits_transport_failure_and_still_rejects_the_unknown() {
+    let (_tmp, db) = seeded_db().await;
+
+    // The seventh kind (operator ruling 2026-08-29): a provider transport fault is
+    // a recorded outcome, so the schema has to admit it. `llm_call_id` is NULL —
+    // no usable exchange means no priced ledger row (audit C3).
+    sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-transport', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 'transport_failure', '{\"type\":\"transport_failure\"}', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("the widened CHECK must admit `transport_failure`");
+
+    // Widening the enum must not have turned it into a free-text column: an
+    // unknown kind is still not a state.
+    let bogus = sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-bogus', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 'the_wifi_was_down', '{}', 1)",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        bogus.is_err(),
+        "a kind outside the taxonomy must still be rejected"
+    );
+
+    // And the seventh kind obeys the same never-silence iff as the other six: a
+    // `failed` row must carry BOTH its kind and its detail.
+    let silent = sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES ('sess-silent', 'run-1', 'ver-1', '2026-08-29T00:00:00.000Z', NULL, 'failed', \
+                 'transport_failure', NULL, 1)",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(
+        silent.is_err(),
+        "a transport failure with no recorded reason is still silence"
+    );
+}

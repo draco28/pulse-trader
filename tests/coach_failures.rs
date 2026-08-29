@@ -40,6 +40,8 @@ struct ScriptedProvider {
     scripts: Mutex<VecDeque<LlmResponse>>,
     calls: Arc<AtomicUsize>,
     delay: Option<Duration>,
+    /// When set, the call fails at the transport layer instead of answering.
+    fails_with: Option<LlmError>,
 }
 
 impl ScriptedProvider {
@@ -50,6 +52,7 @@ impl ScriptedProvider {
                 scripts: Mutex::new(responses.into()),
                 calls: Arc::clone(&calls),
                 delay: None,
+                fails_with: None,
             },
             calls,
         )
@@ -58,6 +61,15 @@ impl ScriptedProvider {
     fn stalling(delay: Duration) -> (Self, Arc<AtomicUsize>) {
         let (mut provider, calls) = Self::new(vec![]);
         provider.delay = Some(delay);
+        (provider, calls)
+    }
+
+    /// A provider that fails at the transport layer — an HTTP 5xx, a refused
+    /// connection, a malformed envelope. The call happens; no usable response
+    /// comes back.
+    fn failing(error: LlmError) -> (Self, Arc<AtomicUsize>) {
+        let (mut provider, calls) = Self::new(vec![]);
+        provider.fails_with = Some(error);
         (provider, calls)
     }
 }
@@ -72,6 +84,9 @@ impl LlmProvider for ScriptedProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some(error) = &self.fails_with {
+            return Err(error.clone());
         }
         Ok(self
             .scripts
@@ -180,6 +195,26 @@ async fn turn_with(
     turn_timeout: Option<Duration>,
     max_dsl_bytes: Option<usize>,
 ) -> CoachCliOutcome {
+    turn_with_redactor(
+        db,
+        run_id,
+        provider,
+        turn_timeout,
+        max_dsl_bytes,
+        Redactor::default(),
+    )
+    .await
+}
+
+/// The same, with an explicit redactor — the transport case tags a canary into it.
+async fn turn_with_redactor(
+    db: &Db,
+    run_id: &BacktestRunId,
+    provider: ScriptedProvider,
+    turn_timeout: Option<Duration>,
+    max_dsl_bytes: Option<usize>,
+    redactor: Redactor,
+) -> CoachCliOutcome {
     let clock = FakeClock::at(1_700_000_000_000);
     let ids = Arc::new(Mutex::new(Vec::new()));
     let wiring = CoachWiring {
@@ -188,7 +223,7 @@ async fn turn_with(
             SqliteLlmCallRepo::with_deps(db.pool().clone(), clock),
             Arc::clone(&ids),
         ),
-        redactor: Redactor::default(),
+        redactor,
         prices: test_prices(),
         clock,
         key_source: None,
@@ -442,5 +477,81 @@ async fn an_unknown_tool_is_recorded_rather_than_ignored() {
         ),
         other => panic!("expected MalformedArguments, got {other:?}"),
     }
+    assert_persisted(&db, &outcome).await;
+}
+
+// ---------------------------------------------------------------------------
+// The seventh variant (r1.s2.w4, operator ruling 2026-08-29)
+// ---------------------------------------------------------------------------
+
+/// A canary that the provider's own error text echoes back — an error body can
+/// quote the request that produced it, so this road needs the same
+/// scrub-before-record discipline `classify()` applies to tool arguments.
+const TRANSPORT_CANARY: &str = "sk-canary-TRANSPORT-4b3a2c1d9e8f7061";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_failure_is_recorded_rather_than_returned() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, calls) = ScriptedProvider::failing(LlmError::Provider(format!(
+        "HTTP 503 from upstream while sending key {TRANSPORT_CANARY}"
+    )));
+
+    let outcome = turn_with_redactor(
+        &db,
+        &run_id,
+        provider,
+        None,
+        None,
+        Redactor::from_config(vec![TRANSPORT_CANARY.to_owned()]),
+    )
+    .await;
+
+    // The hole this item closes: before w4 this path returned an error and left
+    // NO row behind, so a provider outage was the one silent coach turn.
+    match failure_of(&outcome) {
+        CoachFailure::TransportFailure { detail } => {
+            assert!(
+                detail.contains("503"),
+                "the provider's own error text is preserved: {detail}"
+            );
+            assert!(
+                !detail.contains(TRANSPORT_CANARY),
+                "the preserved error text must be scrubbed: {detail}"
+            );
+        }
+        other => panic!("expected TransportFailure, got {other:?}"),
+    }
+
+    // One call was attempted, and it is not retried (grill L3).
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
+
+    // No usable exchange happened, so there is no priced ledger row to name
+    // (audit C3).
+    assert!(
+        outcome.session.llm_call_id.is_none(),
+        "a transport fault yields no LlmCall row"
+    );
+
+    assert_persisted(&db, &outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_error_is_recorded_on_the_same_road() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, _calls) = ScriptedProvider::failing(LlmError::Config(
+        "unknown model `glm-9.9` in the price table".to_owned(),
+    ));
+
+    let outcome = turn_with(&db, &run_id, provider, None, None).await;
+
+    match failure_of(&outcome) {
+        CoachFailure::TransportFailure { detail } => assert!(
+            detail.contains("config"),
+            "the recorded reason keeps the error's own wording, so a config fault \
+             is not mistaken for an outage: {detail}"
+        ),
+        other => panic!("expected TransportFailure, got {other:?}"),
+    }
+    assert!(outcome.session.llm_call_id.is_none());
     assert_persisted(&db, &outcome).await;
 }
