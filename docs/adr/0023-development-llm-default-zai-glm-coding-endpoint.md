@@ -89,8 +89,20 @@ writing, in the order that matters:
 - **Distribution is a different and harder line**, and nothing above softens it. A
   distributed build multiplies this from one operator's own risk into shipping a
   product that runs on a plan whose terms forbid exactly that. Which is why
-  distribution does not inherit this default: the deployment provider is a separate,
-  already-scheduled choice, and the per-token exit below is what it exists for.
+  distribution **must not** inherit this default: the deployment provider is a
+  separate, already-scheduled choice, and the per-token exit below is what it exists
+  for.
+- **"Must not" is a requirement, not a guarantee the code currently makes.** Stated
+  precisely because the distinction is easy to lose: nothing today *prevents* a
+  packaged build from using this endpoint. `read_prices_text` falls back to the
+  compiled-in `PRICES_DEFAULT` — built from this repo's `config/prices.toml` — when
+  no on-disk file exists, and `OpenAiCompatProvider::new` carries the same endpoint
+  as its own `const`. A clean distributed install with no config would therefore
+  reach the coding endpoint. That is acceptable only because there is no distributed
+  install: PulseTrader has never been packaged for anyone. Building the enforcement
+  — requiring an explicit deployment endpoint, or failing closed rather than
+  defaulting — is part of the deployment work this ADR schedules, and is a
+  prerequisite for the first packaged build, not a follow-up to it.
 
 An earlier revision of this ADR argued the exposure "does not exist while there is
 exactly one user and that user is the plan holder." That was wrong on the terms as

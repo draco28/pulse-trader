@@ -50,8 +50,10 @@ use crate::domain::{
 /// Three things still say Ollama while the traffic is z.ai: these consts, the
 /// `OLLAMA_API_KEY` credential env var (which the resolver chain still reads
 /// first), and [`LlmBackend::Ollama`](crate::domain::LlmBackend::Ollama), the
-/// label persisted on every `llm_call` row — that third one is a migration, not a
-/// rename, which is why the set moves together or not at all (ADR-0023).
+/// label persisted on every `llm_call` row. RENAMING that third one is a migration
+/// rather than a rename, which is why the set moves together; ADDING an accurate
+/// `Zai` variant beside it is not, and is the cheaper half — see the variant's own
+/// doc comment (ADR-0023).
 ///
 /// `PulseHive`'s `chat_completions_url()` trims a trailing `/` and appends
 /// `/chat/completions`, yielding

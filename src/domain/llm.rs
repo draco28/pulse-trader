@@ -198,10 +198,18 @@ pub enum LlmBackend {
     ///
     /// The name is a LEGACY LABEL, not a claim about the endpoint. It was minted for
     /// Ollama Cloud at the VS-1.3.2 provider pivot; since the 2026-08-29 default flip
-    /// (ADR-0023) the traffic it tags is z.ai. The variant was deliberately left
-    /// alone because it is persisted verbatim on every `llm_call` row — renaming it
-    /// is a migration, not a rename. Retained naming debt, tracked with the
-    /// `OLLAMA_API_KEY` env var and the `OLLAMA_*` transport consts.
+    /// (ADR-0023) the traffic it tags is z.ai, so **new rows record the wrong
+    /// provider** — a real provenance defect, not a cosmetic one, and permanent
+    /// because `llm_call` is append-only.
+    ///
+    /// Two different changes get conflated here, so both are stated. RENAMING this
+    /// variant is a migration: the tag is persisted verbatim, and old rows would stop
+    /// deserializing. ADDING a `Zai` variant is NOT — `llm_call.backend` is
+    /// unconstrained `TEXT` (`migrations/0004_llm_call.up.sql`), old rows keep
+    /// deserializing as `Ollama`, and only new rows would carry the accurate tag.
+    /// The additive fix is therefore cheap and was deferred as a scope call on the
+    /// default flip, not because it is blocked. Tracked with the `OLLAMA_API_KEY`
+    /// env var and the `OLLAMA_*` transport consts.
     Ollama,
 }
 

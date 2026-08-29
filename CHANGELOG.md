@@ -34,11 +34,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
      with no `[models."glm-5.3"]` row fails with **`no price for model glm-5.3`**,
      which is a config-staleness error wearing a pricing error's name. Fix: add the
      row, or delete the overlay.
-  3. **The stored credential is still the Ollama one.** `OLLAMA_API_KEY` (env or
-     `.env`) and the macOS Keychain entry `glm_api_key` both still hold the retired
-     key, which will return **401** against z.ai. Rotate both to a z.ai key. The
-     variable and Keychain account keep their Ollama-era names on purpose — see
-     ADR-0023 on why that rename waits.
+  3. **The stored credentials are still the Ollama ones**, and only one of them can
+     actually be rotated today.
+     - `pulse compose` reads `OLLAMA_API_KEY` (environment, or a `.env` in the
+       search order at the top of `.env.example`). Put a z.ai key there and compose
+       works. The variable keeps its Ollama-era name on purpose — see ADR-0023.
+     - `pulse llm-check` reads **only** the macOS data-protection Keychain account
+       `glm_api_key`, which still holds the retired key and will return **401**.
+       There is currently **no supported way to rotate it**: that Keychain path is
+       read-only in this crate, `pulse setup-keys` does not exist yet, and
+       `security add-generic-password` writes the *login* keychain, which `keyring`
+       cannot see. So `llm-check` is expected to fail after this change until a
+       credential writer lands. Use `pulse compose` to exercise the provider in the
+       meantime. Tracked, not fixed here.
 
 ### Security
 
