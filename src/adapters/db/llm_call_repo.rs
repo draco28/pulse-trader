@@ -5,7 +5,8 @@
 //! confined to `adapters::db`, mirror `backtest_run_repo.rs:1-6`); the committed
 //! `.sqlx/` offline cache is keyed to the macros in this file (regenerate with
 //! `cargo sqlx prepare` under sqlx-cli `=0.8.6` — #41: a floating install pulls
-//! 0.9.0 and fails on the pinned rustc 1.92).
+//! whatever sqlx-cli is newest, which can drift out of sync with the pinned
+//! `sqlx` crate and desync the cache).
 //!
 //! **Typed projection, never a blob.** `save_call` writes EXPLICIT columns per
 //! README C6 + the `schema_version` tag; read-back is independent of serde

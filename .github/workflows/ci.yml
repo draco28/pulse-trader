@@ -57,9 +57,10 @@ jobs:
       - name: Install sqlx-cli (pinned to the project sqlx version)
         # Pin to the version Cargo.toml exact-pins (`sqlx =0.8.6`): the committed
         # `.sqlx` cache is keyed to that version, and an unpinned `cargo install`
-        # picks the latest sqlx-cli (0.9.0 needs rustc 1.94 > our pinned 1.92, so
-        # the install fails outright). `--locked` keeps sqlx-cli's own transitive
-        # deps from churning CI for reasons unrelated to the PR.
+        # would pick up whatever sqlx-cli is newest, which can drift out of sync
+        # with the pinned `sqlx` crate and produce a cache mismatch unrelated to
+        # the PR. `--locked` keeps sqlx-cli's own transitive deps from churning CI
+        # for the same reason.
         run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
       - name: Create + migrate throwaway DB
         run: |
@@ -118,6 +119,12 @@ jobs:
       contents: read
     env:
       SQLX_OFFLINE: "true"
+      # This job runs `--release` for ship-faithful codegen (see above) but has no
+      # Node/frontend toolchain, so `ui/dist/index.html` never exists here.
+      # `build.rs`'s `ensure_frontend_dist` panics on a missing dist in a release
+      # profile unless this is set — legitimately, since the binary this job
+      # produces is a throwaway test binary, never a distributed artifact.
+      PULSE_ALLOW_PLACEHOLDER_DIST: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -188,3 +195,77 @@ jobs:
           echo "x86_64: $(cat x86_64/determinism-hash.txt)"
           echo "arm64:  $(cat arm64/determinism-hash.txt)"
           cmp x86_64/determinism-hash.txt arm64/determinism-hash.txt
+
+  # Review-finding fix (Codex P2 justfile:18 + CodeRabbit justfile:78 +
+  # CodeRabbit scripts/check-adr-0022.sh:12): the `check` job above never ran
+  # `just check` and never touched the frontend, so `ui/`'s typecheck, vitest
+  # suite, and production build, plus ALL EIGHT of the desktop shell's content
+  # gates (`just gates`), passed or failed on NOBODY -- combined with build.rs's
+  # release-only placeholder-dist guard, a required-green CI could ship a broken
+  # or stale frontend underneath a passing Rust build. This job is that missing
+  # verification, run directly (see the note below on why not `just check`).
+  frontend-and-gates:
+    name: frontend + gates
+    runs-on: macos-latest
+    # `check-bindings.sh` drives `cargo run --example export-bindings`, which
+    # compiles the crate -- mirror the `check` job's offline guard so a stray
+    # DATABASE_URL/.env can't override the committed `.sqlx` cache here either.
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install node modules (lockfile-authoritative)
+        run: npm ci
+
+      # Explicit steps, not `just check`: `just check` also re-runs `fmt`,
+      # `clippy`, and `test` (nextest), which the `check` job above already
+      # covers -- duplicating them here would just burn CI minutes on Rust work
+      # this job isn't the gate for. This runs only the part of `just check`
+      # that is ACTUALLY missing: the frontend triad and the eight shell gates
+      # (`just ui`'s three steps, then `just gates`'s eight scripts, spelled out
+      # to match `just gates`'s own committed order).
+      - name: Typecheck (frontend)
+        run: npm run typecheck
+
+      - name: Test (frontend, vitest run)
+        run: npm run test
+
+      - name: Build (frontend, production bundle)
+        run: npm run build
+
+      - name: Gate -- ADR-0020 content
+        run: bash scripts/check-adr-0020.sh
+
+      - name: Gate -- capabilities
+        run: bash scripts/check-capabilities.sh
+
+      - name: Gate -- window config
+        run: bash scripts/check-window-config.sh
+
+      - name: Gate -- bindings freshness
+        run: bash scripts/check-bindings.sh
+
+      - name: Gate -- design system
+        run: bash scripts/check-design-system.sh
+
+      - name: Gate -- shell navigation
+        run: bash scripts/check-shell-navigation.sh
+
+      - name: Gate -- ADR-0022 content
+        run: bash scripts/check-adr-0022.sh
+
+      - name: Gate -- no specta workaround
+        run: bash scripts/check-no-specta-workaround.sh

@@ -4,7 +4,7 @@
 # Aggregate gate: frontend, then Rust, then the desktop shell's check scripts.
 #
 # r1.s1.w1 (grill A4) grew this from `fmt clippy test` so that ONE command still
-# gates EVERYTHING now that the repo has a second language and four shell gates.
+# gates EVERYTHING now that the repo has a second language and eight shell gates.
 # The alternative -- a Rust gate plus a separate frontend gate someone has to
 # remember -- is how a TypeScript regression reaches `main` while `just check` is
 # green.
@@ -14,7 +14,7 @@
 # the Rust targets means clippy and the tests compile against the REAL bundle
 # rather than build.rs's placeholder.
 
-# The aggregate gate: frontend + Rust + the desktop shell's four check scripts.
+# The aggregate gate: frontend + Rust + the desktop shell's eight check scripts.
 check: ui fmt clippy test gates
 
 # --- frontend ---------------------------------------------------------------
@@ -55,19 +55,23 @@ clippy:
 test:
     cargo nextest run
 
-# --- desktop shell gates (r1.s1.w1, r1.s1.w5, r1.s1.w6) ----------------------
+# --- desktop shell gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2) --
 
-# The six content gates for the shell. Each asserts a property that review
+# The eight content gates for the shell. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
 # frontend; the window stays 1440x900 non-resizable with no scale-transform; the
 # committed bindings match a fresh generation; the ported design system
 # (tokens.css/shared.css, no per-screen sheet, no macos-window.jsx) landed for
-# real (r1.s1.w5, AC-2); and every nav row navigates with exactly one active at
+# real (r1.s1.w5, AC-2); every nav row navigates with exactly one active at
 # a time (r1.s1.w6, AC-2 -- a backstop over the rendered vitest tests, per
-# audit finding C6).
+# audit finding C6); ADR-0022's Status/Decision/Consequences/Alternatives
+# content is intact and the ADR-0019 class sweep it requires has landed
+# (r1.s5.w1, AC-2); and the specta/tauri-specta generator workaround
+# (`post_process_bindings`, a post-write transform of `bindings.ts`, or a
+# re-pin to the pre-bump rc.21/rc.22 versions) has not come back (r1.s5, d5).
 
-# Run the six desktop-shell content gates (ADR, capabilities, window, bindings, design system, shell navigation).
+# Run the eight desktop-shell content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
@@ -75,6 +79,8 @@ gates:
     bash scripts/check-bindings.sh
     bash scripts/check-design-system.sh
     bash scripts/check-shell-navigation.sh
+    bash scripts/check-adr-0022.sh
+    bash scripts/check-no-specta-workaround.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's

@@ -2,7 +2,7 @@
 name = "pulse"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.98.0"
 description = "PulseTrader core engine — domain types, ports, and adapters"
 license = "proprietary"
 publish = false
@@ -94,11 +94,16 @@ libc = "0.2"
 # ---------------------------------------------------------------------------
 # r1.s1.w1 (ADR-0020) — the desktop shell.
 #
-# ADR-0011 (dual-license surface) note: every crate added here resolves inside
-# `deny.toml`'s permissive-only global allow-list (MIT / Apache-2.0 / BSD / ISC /
-# Unicode-3.0 / Zlib / MPL-via-named-exception). NOTHING here is copyleft, so the
-# commercial self-grant is untouched and no new named exception was needed.
-# `cargo deny check licenses` is the gate that holds this true over time.
+# ADR-0011 (dual-license surface) note: no NEW DIRECT dependency added here is
+# copyleft — every direct crate resolves inside `deny.toml`'s permissive-only
+# global allow-list (MIT / Apache-2.0 / BSD / ISC / Unicode-3.0 / Zlib). Tauri
+# does pull four MPL-2.0 crates TRANSITIVELY (`selectors`, `cssparser`,
+# `cssparser-macros`, `dtoa-short`, via tauri-utils/wry -> dom_query); those are
+# covered by the scoped named exceptions in `deny.toml`, not the global allow-list
+# (see the exceptions there for why file-level MPL-2.0 copyleft doesn't reach this
+# proprietary binary). The commercial self-grant is untouched and no new global
+# exception was needed. `cargo deny check licenses` is the gate that holds this
+# true over time.
 #
 # `tauri` is the desktop runtime: window, WKWebView, IPC. Its crate name COLLIDES
 # with this crate's own `mod tauri` (the outer ring). The module keeps its name

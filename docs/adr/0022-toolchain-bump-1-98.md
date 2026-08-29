@@ -65,12 +65,15 @@ toolchain move that makes it possible.
 
 ## Consequences
 
-**The fingerprint moves, and that is provenance, not an invalidation.**
-`build.rs` folds the *resolved* `rustc -vV` (`release:` + `commit-hash:` lines) into
-`engine_fingerprint` alongside `Cargo.lock`'s bytes, so every `BacktestRun`'s stored
-fingerprint changes value the moment this pin changes. Read literally that sounds
-like a breaking change to every persisted run; it is not, for a reason worth stating
-precisely because an earlier draft of this ADR got it backwards:
+**The fingerprint moves for newly-persisted runs, and that is provenance, not a
+retroactive invalidation.** `build.rs` folds the *resolved* `rustc -vV` (`release:`
++ `commit-hash:` lines) into `engine_fingerprint` alongside `Cargo.lock`'s bytes,
+so a `BacktestRun` persisted BY THE REBUILT BINARY receives the new fingerprint
+value from the moment this pin changes onward. A toolchain pin cannot rewrite a
+value already written to disk: historical rows retain the exact fingerprint they
+were stored with, untouched by this bump. Read literally "the fingerprint moves"
+can sound like a breaking change to every persisted run; it is not, for a reason
+worth stating precisely because an earlier draft of this ADR got it backwards:
 [`EngineFingerprint::compare`](../../src/domain/fingerprint.rs) (line 120) returns
 [`Option<String>`](../../src/domain/fingerprint.rs) — `None` when two fingerprints
 match, `Some(<warning text>)` when they differ — **never an `Err`**. Its one
@@ -78,11 +81,13 @@ production caller, `persist_and_compare` in
 [`src/cli/backtest.rs`](../../src/cli/backtest.rs) (around line 314), only
 `eprintln!`s that warning to stderr; it never fails the run, never blocks
 `save_run`, and no test or fixture asserts a literal fingerprint hex anywhere in the
-crate. Nothing in the codebase treats "fingerprint changed" as more than a WARNING
-that two runs came from different engine builds — and the fingerprint already moves
-on **every** dependency change, since `Cargo.lock`'s bytes are input #1, so a
-version-controlled toolchain bump is not a new category of change, only a larger
-instance of one that already happens routinely.
+crate. So `compare`-ing an old row against a binary built after this bump reports a
+mismatch, exactly as designed: nothing in the codebase treats "fingerprint changed"
+as more than a WARNING that two runs came from different engine builds — and the
+fingerprint already moves this way on **every** dependency change, since
+`Cargo.lock`'s bytes are input #1, so a version-controlled toolchain bump is not a
+new category of change, only a larger instance of one that already happens
+routinely.
 
 **The cost that IS real: six releases of new `clippy::pedantic` lints under
 `deny(warnings)`.** Two categories fired, both fixed rather than allowed away:
