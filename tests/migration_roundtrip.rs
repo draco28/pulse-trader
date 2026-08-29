@@ -313,77 +313,10 @@ async fn migration_0004_llm_call_roundtrip() {
     );
 }
 
-/// **The reserved-number scheme actually works** — a later, LOWER-numbered
-/// migration still applies after `0007` is already in the database.
-///
-/// This test exists to settle a PR review finding (#115, Codex P1) claiming the
-/// opposite: that once an installation has applied `0007`, adding the reserved
-/// `0005` / `0006` files afterwards would make sqlx "report a missing-version /
-/// history error rather than execute them", stranding users of this build on a
-/// database no later build could open. That would invalidate the whole
-/// allocate-numbers-at-release-planning scheme the 0005/0006 gap exists for.
-///
-/// It is false, and this is the proof rather than an argument. sqlx 0.8.6's
-/// `Migrator::run_to` iterates the migration list and applies any version NOT
-/// present in `_sqlx_migrations`, regardless of whether it sorts above or below
-/// the database's current maximum; the only ordering check it performs
-/// (`validate_applied_migrations`) fires in the opposite direction — an APPLIED
-/// migration that has vanished from the source set. So the sequence below —
-/// apply through 0007, then introduce 0005 — is exactly what `r1.s2` will do,
-/// and it succeeds.
-#[tokio::test]
-async fn a_later_lower_numbered_migration_still_applies_after_0007() {
-    use sqlx::migrate::Migrator;
-
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join("migrations");
-    std::fs::create_dir_all(&dir).unwrap();
-
-    // Stage 1: the migration set exactly as this build ships it — 0001-0004
-    // plus 0007, with the 0005/0006 gap.
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    for entry in std::fs::read_dir(&shipped).unwrap() {
-        let path = entry.unwrap().path();
-        std::fs::copy(&path, dir.join(path.file_name().unwrap())).unwrap();
-    }
-
-    let db_path = tmp.path().join("pulse.db");
-    let db = Db::with_path(&db_path).await.expect("open");
-    Migrator::new(dir.as_path())
-        .await
-        .expect("build the shipped migrator")
-        .run(db.pool())
-        .await
-        .expect("the shipped set applies");
-    assert_eq!(applied_max(db.pool()).await, 7, "0007 is applied");
-
-    // Stage 2: `r1.s2` lands its reserved 0005 — a version BELOW the database's
-    // current maximum, arriving after 0007 was already applied.
-    std::fs::write(
-        dir.join("0005_reserved_spine_r1s2.up.sql"),
-        "CREATE TABLE reserved_0005_probe (id TEXT PRIMARY KEY);\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("0005_reserved_spine_r1s2.down.sql"),
-        "DROP TABLE reserved_0005_probe;\n",
-    )
-    .unwrap();
-
-    Migrator::new(dir.as_path())
-        .await
-        .expect("build the migrator with 0005 added")
-        .run(db.pool())
-        .await
-        .expect("adding a lower-numbered migration after 0007 must NOT be an error");
-
-    assert!(
-        object_present(db.pool(), "table", "reserved_0005_probe").await,
-        "0005 was applied out of numeric order, exactly as the reserved-number scheme needs"
-    );
-    assert_eq!(
-        applied_max(db.pool()).await,
-        7,
-        "the recorded maximum is still 7 — 0005 is recorded at its own version, not appended"
-    );
-}
+// The reserved-number scheme's own tests — that a later, LOWER-numbered migration
+// still applies after `0007`, and that a db holding a migration this binary does not
+// ship is refused — live in `src/adapters/db/migrate.rs`'s test module instead of
+// here. They must inject a synthetic migration SET, and the seam that accepts one
+// (`run_migrations_with_backup_using`) is private: the public entry point always uses
+// the embedded `MIGRATOR`. Widening that seam to `pub` just to reach it from an
+// integration test would grow the API surface for a test's convenience.
