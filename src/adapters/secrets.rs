@@ -219,12 +219,24 @@ impl CredentialSearch {
     /// The app-data location comes from [`default_data_dir`], the SAME
     /// `directories::ProjectDirs` helper that resolves `pulse.db` — the credential
     /// file sits beside the database rather than in a second invented location.
+    ///
+    /// **The manifest directory is included only when it exists.** `CARGO_MANIFEST_DIR`
+    /// is baked in at COMPILE time, so in a shipped `.app` it names a path on the
+    /// BUILD machine. Searching it there is merely useless; listing it is worse —
+    /// `missing_credential_message` names every searched location verbatim, and that
+    /// message is what the Designer renders when composition is blocked, so an
+    /// end user would be sent hunting for a directory they cannot create and have
+    /// no way to reason about. On a developer's machine the directory exists and is
+    /// searched exactly as before.
     pub(crate) fn from_process_env() -> Self {
         let mut dotenv_dirs = Vec::new();
         if let Ok(cwd) = std::env::current_dir() {
             dotenv_dirs.push(cwd);
         }
-        dotenv_dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if manifest_dir.is_dir() && !dotenv_dirs.contains(&manifest_dir) {
+            dotenv_dirs.push(manifest_dir);
+        }
 
         Self::empty()
             .with_env_key(std::env::var(OLLAMA_API_KEY_VAR).ok())
@@ -605,6 +617,24 @@ mod tests {
     /// An empty `OLLAMA_API_KEY` is treated as UNSET, not as an empty credential —
     /// otherwise an exported-but-blank shell variable would silently shadow a
     /// perfectly good `.env` file and fail at the transport instead of at resolution.
+    #[test]
+    fn the_production_search_names_only_directories_that_exist() {
+        // `CARGO_MANIFEST_DIR` is baked in at compile time, so in a shipped `.app`
+        // it points at the BUILD machine. `missing_credential_message` lists every
+        // searched location verbatim and that text reaches the Designer, so a
+        // location that cannot exist on the running machine must not be listed:
+        // it sends the user hunting for a directory they cannot create.
+        let search = CredentialSearch::from_process_env();
+        for (path, _) in search.file_locations() {
+            let dir = path.parent().expect("a .env path always has a parent");
+            assert!(
+                dir.is_dir(),
+                "the search names {}, which does not exist on this machine",
+                dir.display()
+            );
+        }
+    }
+
     #[test]
     fn an_empty_env_var_is_not_a_credential() {
         let search = CredentialSearch::empty().with_env_key(Some(String::new()));
