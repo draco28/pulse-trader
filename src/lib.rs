@@ -120,6 +120,18 @@ pub use domain::{
     EvalContext, compile, stop_price, take_profit_price,
 };
 
+// r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,
+// &Mutation) -> Result<CandidateDsl, MutationError>` is the whole surface — a
+// `CandidateDsl` exists only when the mutated strategy validated AND compiled,
+// and every other outcome is a typed `MutationError` a coaching session can
+// persist verbatim. `Mutation`/`ParamValue`/`ParamKind` are the parameter-only
+// vocabulary (r1). Re-exported on the same curated-surface pattern — REQUIRED
+// under `deny(warnings)` + `pub(crate) mod domain`, and the route r1.s2.w2/w3
+// and r1.s4 reach the framework through.
+pub use domain::{
+    CandidateDsl, Mutation, MutationError, ParamKind, ParamValue, apply, sweepable_paths,
+};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as
