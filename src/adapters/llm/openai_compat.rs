@@ -53,12 +53,11 @@ const OLLAMA_BASE_URL: &str = "https://ollama.com/v1";
 /// composition root resolves it: config `[llm].model` → const), so this is only the
 /// transport-level default.
 ///
-/// `glm-5.3-flash` is the default model as of ADR-0023 (2026-08-29), bumped from
-/// `glm-5.2`. The id is BARE — no `:cloud` tag — which a live probe confirmed the
-/// endpoint accepts, tool-calling included. See ADR-0023 for the evidence, which
-/// includes a full composer tool-loop run (the failure mode being guarded against
-/// is `gpt-oss:120b`'s historical HTTP 500s mid-tool-loop on this same endpoint).
-const OLLAMA_MODEL_ID: &str = "glm-5.3-flash";
+/// `glm-5.3-flash` since ADR-0023 (2026-08-29); the id is bare, no `:cloud` tag.
+/// See ADR-0023 for why bare, and for the composer tool-loop run that qualified
+/// the model. Kept in agreement with `config/prices.toml` by `agent::config`'s
+/// identity test (#126).
+pub(crate) const OLLAMA_MODEL_ID: &str = "glm-5.3-flash";
 
 /// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
 /// future coach loop forever; an unset/infinite timeout is a v1 reliability gap).

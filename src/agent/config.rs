@@ -370,6 +370,50 @@ mod tests {
         assert_eq!(transport.model.as_deref(), Some("glm-5.3-flash"));
     }
 
+    /// EVERY model-id site agrees with the shipped `[llm].model` — the guard the
+    /// five-site duplication needs (#126).
+    ///
+    /// One logical value is written in five places: the config `[llm].model`, its
+    /// `[models]` price-row key (covered by the sibling test below), and three
+    /// compiled-in `const` fallbacks. Nothing else compares them, and the pins that
+    /// look like they do are tautologies — `compose`'s own test asserts
+    /// `compose_config(None).model == COMPOSE_MODEL`, i.e. the const against itself.
+    ///
+    /// A bump that updates the config and two consts but misses the third is
+    /// therefore invisible to CI and lands as a runtime failure, worst on
+    /// `llm-check`: it never reads `[llm].model` at all, so its `DEMO_MODEL` is the
+    /// site most easily left behind and the one whose drift an operator meets while
+    /// trying to diagnose their configuration.
+    #[test]
+    fn every_model_id_site_agrees_with_the_shipped_config() {
+        let shipped = include_str!("../../config/prices.toml");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prices.toml"), shipped).unwrap();
+
+        let configured = load_llm_transport_from(dir.path())
+            .expect("shipped transport loads")
+            .model
+            .expect("the shipped file pins [llm].model");
+
+        for (site, value) in [
+            (
+                "adapters::llm::openai_compat::OLLAMA_MODEL_ID",
+                crate::adapters::llm::openai_compat::OLLAMA_MODEL_ID,
+            ),
+            (
+                "cli::compose::COMPOSE_MODEL",
+                crate::cli::compose::COMPOSE_MODEL,
+            ),
+            ("cli::llm::DEMO_MODEL", crate::cli::llm::DEMO_MODEL),
+        ] {
+            assert_eq!(
+                value, configured,
+                "{site} is {value:?} but config/prices.toml [llm].model is \
+                 {configured:?} — a model bump moved one and not the other"
+            );
+        }
+    }
+
     /// The shipped `[llm].model` MUST have a `[models]` price row in the same
     /// shipped file — the two halves of a model bump, checked against each other.
     ///

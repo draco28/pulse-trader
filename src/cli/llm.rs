@@ -50,12 +50,15 @@ use crate::domain::{
     LlmConfig, LlmProvider, LlmResponse, Message, PriceTable,
 };
 
-/// The demo model id — `glm-5.3-flash` via Ollama Cloud (ADR-0023, bumped
-/// from `glm-5.2`; the id is bare, no `:cloud` tag). Mirrors the `openai_compat.rs`
-/// `OLLAMA_MODEL_ID` default + the shipped price-table key so `cost` resolves —
-/// all three have to move together, which is the duplication tracked on the ossify
-/// feature map.
-const DEMO_MODEL: &str = "glm-5.3-flash";
+/// The demo model id — `glm-5.3-flash` via Ollama Cloud since ADR-0023, which
+/// carries the evidence.
+///
+/// `llm-check` never reads `[llm].model`, so this const is the ONLY thing choosing
+/// its model — while its PRICES still come from the config file. The shipped
+/// `[models]` row for this id must therefore exist, or the decorator's preflight
+/// fails the verb before the billed call. `agent::config`'s identity + pricing
+/// tests hold both halves (#126).
+pub(crate) const DEMO_MODEL: &str = "glm-5.3-flash";
 
 /// A conservative sampling temperature for the demo round-trip (wire-level `f32`,
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).

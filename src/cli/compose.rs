@@ -73,16 +73,15 @@ use super::llm::CapturingRepo;
 /// `[llm].model` is absent (README C2/C8). A model-id STRING (not a price literal)
 /// — AC-11 greps `src/cli/` only for price VALUE field names.
 ///
-/// `glm-5.3-flash` is the default model as of ADR-0023 (2026-08-29), bumped
-/// from `glm-5.2`; the id is bare, no `:cloud` tag. Exercised end to end through
-/// THIS tool loop before the bump landed — see ADR-0023's evidence line. That test
-/// exists because `gpt-oss:120b` returned reproducible HTTP 500s here mid-tool-loop
-/// (VS-1.3.2 slice-close correction, 2026-07-12): a model can transport cleanly and
-/// still fail partway through a multi-turn loop, so API-level tool-calling is
-/// necessary but not sufficient evidence for this const.
+/// `glm-5.3-flash` since ADR-0023 (2026-08-29) — see it for the bare-id evidence
+/// and for the composer tool-loop run that qualified this model. That run is the
+/// bar THIS const has to clear, because `gpt-oss:120b` once transported cleanly on
+/// this endpoint and still failed mid-loop.
+///
 /// The live model is config-driven per ADR-0013 (`config/prices.toml`
-/// `[llm].model`); this const is only the documented fallback (slice-close FIX A).
-const COMPOSE_MODEL: &str = "glm-5.3-flash";
+/// `[llm].model`); this const is only the documented fallback (slice-close FIX A),
+/// and `agent::config`'s identity test holds the two in agreement (#126).
+pub(crate) const COMPOSE_MODEL: &str = "glm-5.3-flash";
 
 /// A conservative sampling temperature for the compose run (wire-level `f32`, never
 /// a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
