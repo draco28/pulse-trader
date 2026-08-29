@@ -5,10 +5,19 @@
 //! **Clause 2 — async and cancellation.** Every `#[tauri::command]` here is an
 //! `async fn`. A synchronous command occupies the IPC thread for its whole duration and
 //! the window stops repainting, so "commands are async" is not a style preference — it
-//! is the property that keeps a slow query from freezing the app. When a screen
-//! unmounts, its channel is dropped and the next send fails; a streaming command reads
-//! that failure as **cancellation** and stops, rather than running to completion
-//! emitting into nothing or surfacing an error into a screen that no longer exists.
+//! is the property that keeps a slow query from freezing the app.
+//!
+//! A streaming command stops on either of **two** cancellation signals, rather than
+//! running to completion emitting into nothing:
+//!
+//!   1. **A failed send.** The far end is genuinely gone — the webview closed, or the
+//!      channel was torn down — and the next send errors.
+//!   2. **An explicit cancel command.** Unmounting a SCREEN does not do (1): a
+//!      JavaScript `Channel`'s callback stays registered with Tauri for the life of the
+//!      webview, so every send keeps succeeding and an SPA navigation leaves the run
+//!      streaming into a channel nobody reads — billable model calls and a persist the
+//!      user walked away from. [`compose_cancel`] is the signal that covers it, tripping
+//!      the run's latch in [`DesktopState`]'s in-flight registry.
 //!
 //! **Clause 3 — managed state ownership.** [`DesktopState`] holds the things that are
 //! expensive, shared and long-lived: the `SQLite` pool (opened and migrated **once**, at
@@ -33,8 +42,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::SecondsFormat;
 use rust_decimal::Decimal;
@@ -93,6 +102,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "credential_status",
     "library_overview",
     "compose_strategy",
+    "compose_cancel",
 ];
 
 // ---------------------------------------------------------------------------
@@ -104,8 +114,20 @@ pub const BUS_COMMANDS: &[&str] = &[
 /// Currently the migrated `SQLite` pool. Repositories are handed out over it by
 /// [`DesktopState::strategy_repo`] — cheap wrappers around a cloned pool handle, not new
 /// connections. Round 3 adds the backtest-run and LLM-call repos on the same pattern.
+///
+/// It also owns the **in-flight compose registry**: the cancellation latch of every
+/// compose run currently streaming, keyed by its run id. A latch has to outlive the
+/// command that created it because the thing that cancels the run — the
+/// [`compose_cancel`] command the Designer fires on unmount — arrives on a DIFFERENT
+/// invocation and can name the run only by id.
 pub struct DesktopState {
     db: Db,
+    /// Every compose run currently streaming → its cancellation latch (the same
+    /// `Arc<AtomicBool>` [`RefusingProvider`] reads before each model turn).
+    ///
+    /// A `std::sync::Mutex`, deliberately never held across an `.await`: every accessor
+    /// below locks, performs one map operation, and drops the guard before it returns.
+    compose_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl DesktopState {
@@ -120,7 +142,10 @@ impl DesktopState {
     /// Returns a [`BusError`] if the migration or the pool open fails.
     pub async fn open(path: &Path) -> Result<Self, BusError> {
         let db = open_migrated(path).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            compose_runs: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Open the default `~/Library/Application Support/PulseTrader/pulse.db`.
@@ -159,6 +184,51 @@ impl DesktopState {
     #[must_use]
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Register a compose run as in-flight and hand back its cancellation latch.
+    ///
+    /// The latch is what [`RefusingProvider`] reads before every model turn, so the
+    /// registry is the ONLY way a later, separate command can reach into a streaming
+    /// run and stop it. Registration happens before the run's first event, so the id
+    /// the frontend learns from that event is always already resolvable here.
+    #[must_use]
+    pub fn register_compose_run(&self, run_id: &RunId) -> Arc<AtomicBool> {
+        let latch = Arc::new(AtomicBool::new(false));
+        if let Ok(mut runs) = self.compose_runs.lock() {
+            runs.insert(run_id.as_str().to_owned(), Arc::clone(&latch));
+        }
+        latch
+    }
+
+    /// Drop a finished run from the registry.
+    ///
+    /// Called on EVERY exit path of the compose command — success, cancellation and
+    /// error alike — so the map holds only runs that are genuinely streaming and a
+    /// long session cannot accumulate dead latches.
+    pub fn finish_compose_run(&self, run_id: &RunId) {
+        if let Ok(mut runs) = self.compose_runs.lock() {
+            runs.remove(run_id.as_str());
+        }
+    }
+
+    /// Trip the cancellation latch of an in-flight compose run.
+    ///
+    /// Returns whether a run by that id was actually in flight. `false` is an
+    /// ordinary outcome, not an error: the run may have finished between the
+    /// frontend deciding to cancel and this command arriving.
+    pub fn cancel_compose_run(&self, run_id: &str) -> bool {
+        let latch = match self.compose_runs.lock() {
+            Ok(runs) => runs.get(run_id).map(Arc::clone),
+            Err(_) => None,
+        };
+        match latch {
+            Some(latch) => {
+                latch.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -667,6 +737,10 @@ fn render_sweepable<T: std::fmt::Display>(value: &SweepableValue<T>) -> String {
 }
 
 /// A cancelled run's outcome: nothing persisted, so no summary.
+///
+/// The `strategy: None` is the contract, not a convenience — a caller reading
+/// `cancelled: true` may conclude the database is untouched, so this shape is only
+/// ever returned from a path that genuinely persisted nothing.
 fn cancelled_compose(run_id: &RunId, emitted: u32) -> ComposeResult {
     ComposeResult {
         run_id: run_id.clone(),
@@ -677,20 +751,48 @@ fn cancelled_compose(run_id: &RunId, emitted: u32) -> ComposeResult {
 }
 
 /// Map a genuine (non-cancelled) compose failure onto the bus's one error
-/// shape, recovering the error FAMILY from the anyhow chain's root so the
-/// frontend's code stays meaningful (`llm` vs `composer` vs `data`).
+/// shape, recovering the error FAMILY from the anyhow chain so the frontend's
+/// code stays meaningful (`llm` vs `composer` vs `data`).
+///
+/// **Walks the whole chain, innermost first, rather than only `root_cause()`.**
+/// `root_cause()` alone is a false floor: a typed error that wraps an untyped one
+/// has a plain string at its root, and every such failure would classify as
+/// `Internal` — which is what happened while `run_compose_with` built its errors
+/// with `anyhow!("...: {e}")` (a formatted string with no source) instead of
+/// `.context(...)`. Innermost-first keeps the old preference where both apply: a
+/// transport failure inside the composer is an `Llm` error, which is the family
+/// the user can act on.
 fn compose_failure(error: anyhow::Error) -> BusError {
-    let root = error.root_cause();
-    let code = if root.downcast_ref::<LlmError>().is_some() {
-        BusErrorCode::Llm
-    } else if root.downcast_ref::<crate::agent::ComposerError>().is_some() {
-        BusErrorCode::Composer
-    } else if root.downcast_ref::<DataError>().is_some() {
-        BusErrorCode::Data
-    } else {
-        BusErrorCode::Internal
-    };
-    BusError::new(code, error.to_string())
+    let code = error
+        .chain()
+        .rev()
+        .find_map(|cause| {
+            if cause.downcast_ref::<LlmError>().is_some() {
+                Some(BusErrorCode::Llm)
+            } else if cause
+                .downcast_ref::<crate::agent::ComposerError>()
+                .is_some()
+            {
+                Some(BusErrorCode::Composer)
+            } else if cause.downcast_ref::<DataError>().is_some() {
+                Some(BusErrorCode::Data)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(BusErrorCode::Internal);
+    // The whole chain, not `to_string()`. An anyhow error Displays only its
+    // OUTERMOST layer, so with `.context("compose run failed")` above it the
+    // Designer would render exactly that and nothing about what actually went
+    // wrong. Joining the chain restores the detail the old `anyhow!("...: {e}")`
+    // formatting carried, without the erased source that cost the classifier
+    // above its only signal.
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+    BusError::new(code, message)
 }
 
 /// The transport-free compose core (r1.s1.w4) — `demo_stream_core`'s pinned
@@ -700,11 +802,27 @@ fn compose_failure(error: anyhow::Error) -> BusError {
 /// Opens the channel with `Started`, then runs [`run_compose_with`] over
 /// `deps`, mapping each [`ComposerEvent`] onto a [`BusEventPayload`] as it
 /// arrives — `ToolCallStarted` / `ToolCallResult` per step, and the composer's
-/// `Finalized` line as the closing `Finished`. A failed send trips the provider
-/// guard (see [`RefusingProvider`]); the run then ends as `cancelled: true`,
-/// never a `BusError`. The LLM credential is already INSIDE `deps.wiring`
-/// (label and redactor alike) — it neither crosses this seam nor appears in any
-/// event.
+/// `Finalized` line as the closing `Finished`. The LLM credential is already
+/// INSIDE `deps.wiring` (label and redactor alike) — it neither crosses this
+/// seam nor appears in any event.
+///
+/// **`cancelled` is the run's latch, owned by the caller.** Two things trip it,
+/// and both end the run as `cancelled: true` rather than as a `BusError`:
+///
+///   - a failed send, which means the far end is gone; and
+///   - the [`compose_cancel`] command, which the Designer fires when it
+///     unmounts — the latch lives in [`DesktopState`]'s registry precisely so a
+///     separate invocation can reach it.
+///
+/// Either way [`RefusingProvider`] refuses at the run's next model turn, so
+/// cancellation costs at most one further LLM call and nothing is persisted.
+///
+/// The latch is checked at every point the run can still be abandoned, but NOT
+/// after `run_compose_with` returns `Ok`: at that moment the composer has
+/// finalized and the version is already persisted. Reporting a persisted
+/// strategy as `cancelled` (whose contract is "nothing persisted", see
+/// [`cancelled_compose`]) would make the result lie about the database. A cancel
+/// that loses the race to the last event is therefore a completed run.
 ///
 /// # Errors
 ///
@@ -716,6 +834,7 @@ pub async fn compose_strategy_core<P, R, S, C, K>(
     deps: ComposeDeps<P, R, S, C>,
     nl_target: &str,
     sink: &K,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<ComposeResult, BusError>
 where
     P: LlmProvider + Send + Sync,
@@ -724,7 +843,11 @@ where
     C: Clock + Send + Sync,
     K: EventSink + Sync + ?Sized,
 {
-    let cancelled = Arc::new(AtomicBool::new(false));
+    // A cancel that arrived before the run started is honoured before anything
+    // billable happens — no `Started`, no composer, no persist.
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(cancelled_compose(run_id, 0));
+    }
 
     // The stream always opens with `Started`. A far end already dead cancels
     // before the composer is ever invoked — no run, no persist.
@@ -988,8 +1111,42 @@ pub async fn compose_strategy(
         strategy_repo: state.strategy_repo(),
     };
 
+    // Register BEFORE the run streams its first event, so the id the frontend
+    // learns from that event is always already cancellable, then deregister on
+    // every exit path — success, cancellation and error alike.
     let run_id = RunId::new();
-    compose_strategy_core(&run_id, deps, &nl_target, &channel).await
+    let cancelled = state.register_compose_run(&run_id);
+    let outcome = compose_strategy_core(&run_id, deps, &nl_target, &channel, cancelled).await;
+    state.finish_compose_run(&run_id);
+    outcome
+}
+
+/// Cancel an in-flight compose run by id.
+///
+/// The Designer fires this from its unmount cleanup. Without it, navigating away
+/// mid-compose left the run streaming into a channel nobody read: the JavaScript
+/// `Channel`'s callback stays registered with Tauri for the life of the webview, so
+/// every send kept SUCCEEDING, the failed-send guard never tripped, and the
+/// remaining billable LLM calls ran to completion and persisted a strategy the user
+/// had already walked away from.
+///
+/// Tripping the latch makes [`RefusingProvider`] refuse at the run's next model turn,
+/// so the run stops within one LLM call and persists nothing.
+///
+/// Returns whether a run by that id was in flight. `false` is an ordinary outcome —
+/// the run may have finished between the frontend deciding to cancel and this command
+/// arriving — not an error, so the Designer's cleanup needs no failure path.
+///
+/// # Errors
+///
+/// Never. The `Result` is the bus's uniform command shape.
+#[tauri::command]
+#[specta::specta]
+pub async fn compose_cancel(
+    state: tauri::State<'_, DesktopState>,
+    run_id: String,
+) -> Result<bool, BusError> {
+    Ok(state.cancel_compose_run(&run_id))
 }
 
 #[cfg(test)]

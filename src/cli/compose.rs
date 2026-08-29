@@ -50,6 +50,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
+
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo, SqliteStrategyRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
@@ -200,10 +202,15 @@ where
         Arc::clone(&captured),
     );
 
+    // `.context(...)` rather than `anyhow!("...: {e}")` on all three: a formatted
+    // string is a NEW error with no source, which erases the typed cause. The
+    // desktop bus classifies a compose failure by downcasting the anyhow chain
+    // (`compose_failure` in `src/tauri/commands.rs`) to tell the Designer which
+    // family failed, and a stringified cause makes every one of them `Internal`.
     let outcome: ComposeOutcome = composer
         .compose(nl_target, on_event)
         .await
-        .map_err(|e| anyhow::anyhow!("compose run failed: {e}"))?;
+        .context("compose run failed")?;
 
     // Persist the finalized StrategyVersion as a NEW strategy + its initial version
     // (parent_version_id = None); the repo mints id / strategy_id / version_hash /
@@ -211,7 +218,7 @@ where
     let strategy = strategy_repo
         .create_strategy(&outcome.version.dsl.name, None, &[])
         .await
-        .map_err(|e| anyhow::anyhow!("persist strategy: {e}"))?;
+        .context("persist strategy")?;
     let version = strategy_repo
         .create_version(NewVersion {
             strategy_id: strategy.id.clone(),
@@ -221,7 +228,7 @@ where
             creating_llm_call_ids: outcome.version.creating_llm_call_ids.clone(),
         })
         .await
-        .map_err(|e| anyhow::anyhow!("persist strategy version: {e}"))?;
+        .context("persist strategy version")?;
 
     Ok(ComposeCliOutcome {
         strategy,

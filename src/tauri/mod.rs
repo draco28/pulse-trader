@@ -61,6 +61,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::credential_status,
         commands::library_overview,
         commands::compose_strategy,
+        commands::compose_cancel,
     ])
 }
 

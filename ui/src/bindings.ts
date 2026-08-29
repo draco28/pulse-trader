@@ -88,6 +88,28 @@ export const commands = {
 	 *  `cancelled` in the [`ComposeResult`], not as an error.
 	 */
 	composeStrategy: (nlTarget: string, channel: Channel<BusEvent>) => typedError<ComposeResult, BusError>(__TAURI_INVOKE("compose_strategy", { nlTarget, channel })),
+	/**
+	 *  Cancel an in-flight compose run by id.
+	 * 
+	 *  The Designer fires this from its unmount cleanup. Without it, navigating away
+	 *  mid-compose left the run streaming into a channel nobody read: the JavaScript
+	 *  `Channel`'s callback stays registered with Tauri for the life of the webview, so
+	 *  every send kept SUCCEEDING, the failed-send guard never tripped, and the
+	 *  remaining billable LLM calls ran to completion and persisted a strategy the user
+	 *  had already walked away from.
+	 * 
+	 *  Tripping the latch makes [`RefusingProvider`] refuse at the run's next model turn,
+	 *  so the run stops within one LLM call and persists nothing.
+	 * 
+	 *  Returns whether a run by that id was in flight. `false` is an ordinary outcome —
+	 *  the run may have finished between the frontend deciding to cancel and this command
+	 *  arriving — not an error, so the Designer's cleanup needs no failure path.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Never. The `Result` is the bus's uniform command shape.
+	 */
+	composeCancel: (runId: string) => typedError<boolean, BusError>(__TAURI_INVOKE("compose_cancel", { runId })),
 };
 
 /* Types */

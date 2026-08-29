@@ -17,10 +17,12 @@ import type { Channel } from "@tauri-apps/api/core";
 import type { BusEvent } from "../bindings";
 
 const composeStrategyMock = vi.fn();
+const composeCancelMock = vi.fn();
 
 vi.mock("../bindings", () => ({
   commands: {
     composeStrategy: (...args: unknown[]) => composeStrategyMock(...args),
+    composeCancel: (...args: unknown[]) => composeCancelMock(...args),
   },
 }));
 
@@ -32,6 +34,16 @@ type Hook = ReturnType<typeof useComposeRun>;
 /** One streamed event, at `seq`, on the run under test. */
 function event(seq: number, payload: BusEvent["payload"]): BusEvent {
   return { runId: "run-1", seq, payload };
+}
+
+/** The same, on a DIFFERENT run — the straggler case. */
+function otherRunEvent(seq: number, payload: BusEvent["payload"]): BusEvent {
+  return { runId: "run-2", seq, payload };
+}
+
+/** A `toolCallStarted` payload, the only event shape these tests need to vary. */
+function started(name: string, argumentsPreview: string): BusEvent["payload"] {
+  return { kind: "toolCallStarted", name, argumentsPreview };
 }
 
 /** A finalize return value carrying the fields the summary state keeps. */
@@ -81,6 +93,8 @@ let resolveInvoke: (value: unknown) => void = () => {};
 
 beforeEach(() => {
   composeStrategyMock.mockReset();
+  composeCancelMock.mockReset();
+  composeCancelMock.mockResolvedValue({ status: "ok", data: true });
   composeStrategyMock.mockImplementation(
     () =>
       new Promise((resolve) => {
@@ -239,5 +253,120 @@ describe("useComposeRun", () => {
     expect(turn.status).toBe("error");
     expect(turn.error).toContain("no usable LLM credential found");
     expect(result.current.running).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Stream identity and lifecycle. The channel alone does not correlate a run
+  // with its turn: a straggler can outlive its run, an event can go missing,
+  // and unmounting used to leave the backend composing into a channel nobody
+  // read. Each test below pins one of those.
+  // -------------------------------------------------------------------------
+
+  it("binds the run on its first event and drops events from another run", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    // The real stream opens with `Started` at seq 0; the run binds `run-1` here.
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(event(1, started("add_entry_signal", "rsi(14) < 30")));
+    });
+    expect(lastTurn(result).steps).toHaveLength(1);
+
+    // A late event from a DIFFERENT run must not append a step to this one.
+    await act(async () => {
+      channel.onmessage?.(otherRunEvent(2, started("add_filter", "close > ema(200)")));
+    });
+    expect(lastTurn(result).steps).toHaveLength(1);
+    expect(lastTurn(result).steps[0]?.preview).toBe("rsi(14) < 30");
+    expect(lastTurn(result).status).toBe("streaming");
+  });
+
+  it("a gap in seq ends the run as a stream error rather than rendering a partial list", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(event(1, started("add_entry_signal", "rsi(14) < 30")));
+    });
+    // seq 2 never arrives.
+    await act(async () => {
+      channel.onmessage?.(event(3, started("add_filter", "close > ema(200)")));
+    });
+
+    const turn = lastTurn(result);
+    expect(turn.status).toBe("error");
+    expect(turn.error).toContain("expected event 2, received 3");
+    // The event that exposed the gap is not folded in — the list stops where
+    // it stopped being trustworthy.
+    expect(turn.steps).toHaveLength(1);
+  });
+
+  it("a broken stream keeps its error even when the command returns success", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(event(5, started("add_filter", "close > ema(200)")));
+    });
+    await act(async () => {
+      resolveInvoke({ status: "ok", data: finalizeResult() });
+    });
+
+    const turn = lastTurn(result);
+    expect(turn.status).toBe("error");
+    expect(turn.error).toContain("expected event 1, received 5");
+    expect(turn.summary).toBeUndefined();
+    expect(result.current.running).toBe(false);
+  });
+
+  it("unmounting mid-run cancels the backend run by id", async () => {
+    const { result, unmount } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    // The run id is only knowable from an event; `Started` carries it.
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+
+    unmount();
+
+    expect(composeCancelMock).toHaveBeenCalledTimes(1);
+    expect(composeCancelMock.mock.calls[0][0]).toBe("run-1");
+  });
+
+  it("unmounting with no run in flight cancels nothing", () => {
+    const { unmount } = renderHook(() => useComposeRun());
+    unmount();
+    expect(composeCancelMock).not.toHaveBeenCalled();
+  });
+
+  it("unmounting after a run finished cancels nothing", async () => {
+    const { result, unmount } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      resolveInvoke({ status: "ok", data: finalizeResult() });
+    });
+
+    unmount();
+
+    expect(composeCancelMock).not.toHaveBeenCalled();
   });
 });

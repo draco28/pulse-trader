@@ -27,8 +27,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pulse::{
     BusError, BusEvent, BusEventPayload, ComposeDeps, ComposeWiring, CreatedBy, CredentialSource,
@@ -44,6 +44,12 @@ use tempfile::TempDir;
 /// An API-key-shaped literal the redactor must strip from every persisted
 /// `LlmCall` prompt. NOT a real key.
 const FAKE_KEY: &str = "sk-COMPOSE1234abcd5678efgh9012ijkl3456";
+
+/// A fresh, untripped cancellation latch — what the `compose_strategy` command
+/// receives from `DesktopState::register_compose_run` for a run nobody cancelled.
+fn new_latch() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
 
 /// A stand-in composer system prompt (the fake provider ignores it).
 const TEST_PROMPT: &str = "You are PulseTrader's strategy composer. Build the \
@@ -210,6 +216,47 @@ impl EventSink for FlakySink {
     }
 }
 
+/// A provider that always fails with a typed [`pulse::LlmError`] — the transport
+/// half of the compose failure taxonomy.
+struct FailingProvider;
+
+impl LlmProvider for FailingProvider {
+    fn chat(
+        &self,
+        _messages: Vec<Message>,
+        _tools: &[ToolDefinition],
+        _config: &LlmConfig,
+    ) -> impl Future<Output = Result<LlmResponse, pulse::LlmError>> {
+        std::future::ready(Err(pulse::LlmError::Provider(
+            "upstream returned 503".to_owned(),
+        )))
+    }
+}
+
+/// A **healthy** sink that trips the run's cancellation latch after `trip_after`
+/// events — standing in for the `compose_cancel` command arriving mid-run.
+///
+/// Every send succeeds, which is the point: this is the case a failed send can
+/// never catch, because a JavaScript `Channel`'s callback outlives the screen
+/// that made it.
+struct TrippingSink {
+    latch: Arc<AtomicBool>,
+    trip_after: usize,
+    sent: AtomicUsize,
+    events: Mutex<Vec<BusEvent>>,
+}
+
+impl EventSink for TrippingSink {
+    fn send_event(&self, event: BusEvent) -> Result<(), BusError> {
+        let n = self.sent.fetch_add(1, Ordering::SeqCst);
+        self.events.lock().expect("events lock").push(event);
+        if n + 1 >= self.trip_after {
+            self.latch.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
 /// A sink that refuses every send — a screen that unmounted before the run
 /// opened its stream.
 struct DeadSink;
@@ -354,6 +401,75 @@ fn fake_deps(
     }
 }
 
+/// The same wiring over an arbitrary provider — the failure-taxonomy tests need
+/// a provider `fake_deps`'s concrete return type cannot express.
+fn deps_with_provider<P: LlmProvider>(
+    db: &Db,
+    provider: P,
+) -> ComposeDeps<P, SqliteLlmCallRepo<FakeClock>, SqliteStrategyRepo<SystemClock>, FakeClock> {
+    let clock = FakeClock::at(1_700_000_000_000);
+    ComposeDeps {
+        wiring: ComposeWiring {
+            provider,
+            llm_repo: SqliteLlmCallRepo::with_deps(db.pool().clone(), clock),
+            redactor: Redactor::from_config(vec![FAKE_KEY.to_owned()]),
+            prices: test_prices(),
+            clock,
+            prompt: TEST_PROMPT.to_owned(),
+            key_source: Some(CredentialSource::ConfigDir),
+            config: config(),
+        },
+        strategy_repo: SqliteStrategyRepo::new(db.pool().clone()),
+    }
+}
+
+/// The bus's typed error contract: a transport failure reaches the Designer as
+/// `BusErrorCode::Llm`, not as the catch-all `Internal`.
+///
+/// This is a REGRESSION test with a specific history. `compose_failure` recovers
+/// the family by downcasting the anyhow chain, but `run_compose_with` used to
+/// build its errors with `anyhow!("compose run failed: {e}")` — a formatted
+/// string is a NEW error with no source, so the typed cause was erased and every
+/// LLM, composer and persistence failure alike surfaced as `Internal`. The
+/// classifier existed and could never match. `.context(...)` keeps the chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_failure_keeps_its_llm_error_family_across_the_bus() {
+    let (_tmp, db) = migrated_db().await;
+    let deps = deps_with_provider(&db, FailingProvider);
+
+    let sink = Collector {
+        events: Mutex::new(Vec::new()),
+    };
+    let error = compose_strategy_core(
+        &RunId::new(),
+        deps,
+        "RSI oversold on BTC",
+        &sink,
+        new_latch(),
+    )
+    .await
+    .expect_err("a provider that always fails is a genuine failure, not cancellation");
+
+    assert_eq!(
+        error.code,
+        pulse::BusErrorCode::Llm,
+        "a transport failure must keep its family across the bus, not collapse to Internal"
+    );
+    // The whole chain reaches the user, not just the outermost context: an
+    // anyhow error Displays only its top layer, so a `BusError` built from
+    // `to_string()` alone would say "compose run failed" and nothing else.
+    assert!(
+        error.message.contains("compose run failed"),
+        "the context layer names the stage: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("503"),
+        "the underlying cause must survive for the Designer to render: {}",
+        error.message
+    );
+}
+
 /// AC-1's main claim (`d3`): a compose run driven through the desktop core
 /// streams its tool-call steps as structured events **in order** and persists an
 /// attributable `StrategyVersion` — with the risk gate's controls holding at
@@ -371,7 +487,7 @@ async fn compose_streams_steps_and_persists_an_attributable_version() {
         events: Mutex::new(Vec::new()),
     };
     let run_id = RunId::new();
-    let outcome = compose_strategy_core(&run_id, deps, &nl_target, &sink)
+    let outcome = compose_strategy_core(&run_id, deps, &nl_target, &sink, new_latch())
         .await
         .expect("the scripted tool sequence streams and persists a strategy version");
 
@@ -443,9 +559,15 @@ async fn a_sink_that_dies_mid_run_cancels_the_compose_rather_than_erroring() {
         ok_for: 3,
         sent: AtomicUsize::new(0),
     };
-    let outcome = compose_strategy_core(&RunId::new(), deps, "RSI oversold on BTC", &sink)
-        .await
-        .expect("a dead channel is cancellation, not a bus error");
+    let outcome = compose_strategy_core(
+        &RunId::new(),
+        deps,
+        "RSI oversold on BTC",
+        &sink,
+        new_latch(),
+    )
+    .await
+    .expect("a dead channel is cancellation, not a bus error");
 
     assert!(
         outcome.cancelled,
@@ -475,11 +597,103 @@ async fn an_already_dead_sink_cancels_before_the_run_opens() {
     let (_tmp, db) = migrated_db().await;
     let deps = fake_deps(&db, happy_path_script());
 
-    let outcome = compose_strategy_core(&RunId::new(), deps, "RSI oversold on BTC", &DeadSink)
-        .await
-        .expect("a dead channel is cancellation, not a bus error");
+    let outcome = compose_strategy_core(
+        &RunId::new(),
+        deps,
+        "RSI oversold on BTC",
+        &DeadSink,
+        new_latch(),
+    )
+    .await
+    .expect("a dead channel is cancellation, not a bus error");
 
     assert!(outcome.cancelled);
     assert_eq!(outcome.emitted, 0, "nothing crossed");
     assert!(outcome.strategy.is_none());
+}
+
+/// The OTHER way a run is cancelled: the `compose_cancel` command trips the
+/// run's latch while the sink is perfectly healthy.
+///
+/// This is the path the Designer's unmount cleanup takes. It exists because a
+/// dead sink is not detectable from the frontend: a JavaScript `Channel`'s
+/// callback stays registered with Tauri for the life of the webview, so
+/// navigating away left every send SUCCEEDING and the run streamed on, burning
+/// billable LLM calls and persisting a strategy nobody was waiting for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_externally_tripped_latch_cancels_a_run_whose_sink_is_alive() {
+    let (_tmp, db) = migrated_db().await;
+    let deps = fake_deps(&db, happy_path_script());
+
+    // Tripped BEFORE the run opens — the shape a cancel that lands during the
+    // command's credential/config load takes.
+    let latch = new_latch();
+    latch.store(true, Ordering::SeqCst);
+
+    let sink = Collector {
+        events: Mutex::new(Vec::new()),
+    };
+    let outcome = compose_strategy_core(&RunId::new(), deps, "RSI oversold on BTC", &sink, latch)
+        .await
+        .expect("an external cancel is cancellation, not a bus error");
+
+    assert!(outcome.cancelled);
+    assert_eq!(
+        outcome.emitted, 0,
+        "a run cancelled before it opens emits nothing — not even Started"
+    );
+    assert!(outcome.strategy.is_none());
+    assert!(
+        sink.events.lock().expect("events lock").is_empty(),
+        "the sink is alive, so an empty event list proves the run never ran"
+    );
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone())
+        .list_strategies(true)
+        .await
+        .expect("list_strategies");
+    assert!(
+        strategies.is_empty(),
+        "a cancelled run must not persist a strategy"
+    );
+}
+
+/// The same latch, tripped MID-run: the provider guard refuses at the next
+/// model turn, so cancellation costs at most one further LLM call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_latch_tripped_mid_run_stops_the_compose_at_the_next_model_turn() {
+    let (_tmp, db) = migrated_db().await;
+    let deps = fake_deps(&db, happy_path_script());
+
+    // A sink that trips the latch once a few events have crossed — standing in
+    // for the `compose_cancel` command arriving while the run streams.
+    let latch = new_latch();
+    let sink = TrippingSink {
+        latch: Arc::clone(&latch),
+        trip_after: 3,
+        sent: AtomicUsize::new(0),
+        events: Mutex::new(Vec::new()),
+    };
+
+    let outcome = compose_strategy_core(&RunId::new(), deps, "RSI oversold on BTC", &sink, latch)
+        .await
+        .expect("an external cancel is cancellation, not a bus error");
+
+    assert!(
+        outcome.cancelled,
+        "the tripped latch must read as cancellation"
+    );
+    assert!(
+        outcome.strategy.is_none(),
+        "a cancelled run carries no finalize summary"
+    );
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone())
+        .list_strategies(true)
+        .await
+        .expect("list_strategies");
+    assert!(
+        strategies.is_empty(),
+        "a run cancelled before it finalized must not persist a strategy"
+    );
 }
