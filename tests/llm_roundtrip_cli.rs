@@ -5,7 +5,7 @@
 //! provider (no network, MASTER-SPEC §9.4) + a literal test key + a tempfile-`Db`
 //! [`SqliteLlmCallRepo`] over a migrated scratch db (no Keychain), then asserts an
 //! [`LlmCall`] is persisted with the prompt **redacted** and tokens/cost/currency
-//! **populated**. This is the slice's `auto` demo criterion: "a GLM 5.2 call
+//! **populated**. This is the slice's `auto` demo criterion: "a GLM call
 //! round-trips through `PulseHive` and logs an `LlmCall` … redaction strips the
 //! secret", proven over a fake provider (the live `PulseHive` call is the `user:`
 //! demo).
@@ -64,13 +64,14 @@ impl LlmProvider for FakeProvider {
     }
 }
 
-/// A literal TEST price table keyed on `glm-5.2` (README C5), CNY-native — so the
-/// computed `cost` is populated + non-zero. These are TEST values, NOT production
-/// moat data (the real coding-plan rate is a nominal estimate, config-tunable).
+/// A literal TEST price table keyed on the `DEMO_MODEL` the core drives
+/// (`glm-5.3-flash`, README C5), CNY-native — so the computed `cost` is
+/// populated + non-zero. These are TEST values, NOT production moat data (the real
+/// subscription rate is a nominal estimate, config-tunable).
 fn test_prices() -> PriceTable {
     let mut models = HashMap::new();
     models.insert(
-        "glm-5.2".to_owned(),
+        "glm-5.3-flash".to_owned(),
         ModelPrice {
             input_per_mtok: Decimal::from(2),
             output_per_mtok: Decimal::from(8),
@@ -175,7 +176,7 @@ async fn logs_redacted_llm_call_over_fake_provider() {
     assert_eq!(call.cost.normalize(), Decimal::new(7, 3).normalize());
     assert_eq!(call.cost_currency, "CNY");
     assert_eq!(call.backend, LlmBackend::Ollama);
-    assert_eq!(call.model, "glm-5.2");
+    assert_eq!(call.model, "glm-5.3-flash");
 
     // (iii) OQ-A: the inner provider received the REAL, un-redacted prompt. Scope
     // the guard so it drops before the later read-back await (no lock held across

@@ -51,10 +51,13 @@ const OLLAMA_BASE_URL: &str = "https://ollama.com/v1";
 /// The default Ollama Cloud model id — the `OpenAIConfig` fallback carried by the
 /// provider. The per-request model actually flows from [`LlmConfig::model`] (the
 /// composition root resolves it: config `[llm].model` → const), so this is only the
-/// transport-level default. `glm-5.2` is the tested main model (Ollama Cloud,
-/// OpenAI-compat, tool-capable) — slice-close FIX B retired the pre-subscription
-/// `gpt-oss:120b` placeholder.
-const OLLAMA_MODEL_ID: &str = "glm-5.2";
+/// transport-level default.
+///
+/// `glm-5.3-flash` since ADR-0023 (2026-08-29); the id is bare, no `:cloud` tag.
+/// See ADR-0023 for why bare, and for the composer tool-loop run that qualified
+/// the model. Kept in agreement with `config/prices.toml` by `agent::config`'s
+/// identity test (#126).
+pub(crate) const OLLAMA_MODEL_ID: &str = "glm-5.3-flash";
 
 /// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
 /// future coach loop forever; an unset/infinite timeout is a v1 reliability gap).
@@ -267,12 +270,12 @@ mod tests {
     fn provider_constructs_with_pinned_ollama_config() {
         // Smoke test: the adapter builds against the pinned Ollama Cloud config with
         // NO network. The consts are the provider-pivot endpoint + default model id
-        // (README C2/C8); `glm-5.2` is the tested main model (slice-close FIX B).
+        // (README C2/C8); `glm-5.3-flash` is the default model (ADR-0023).
         let _provider = OpenAiCompatProvider::new("test-key");
         // FIX A: the config `[llm].base_url` override ctor also builds (NO network).
         let _override = OpenAiCompatProvider::with_base_url("test-key", "https://example.test/v1");
         assert_eq!(OLLAMA_BASE_URL, "https://ollama.com/v1");
-        assert_eq!(OLLAMA_MODEL_ID, "glm-5.2");
+        assert_eq!(OLLAMA_MODEL_ID, "glm-5.3-flash");
     }
 
     #[test]

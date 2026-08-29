@@ -367,7 +367,87 @@ mod tests {
     fn load_llm_transport_from_missing_file_uses_the_shipped_default() {
         let dir = tempfile::tempdir().unwrap();
         let transport = load_llm_transport_from(dir.path()).expect("absent file falls back");
-        assert_eq!(transport.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(transport.model.as_deref(), Some("glm-5.3-flash"));
+    }
+
+    /// EVERY model-id site agrees with the shipped `[llm].model` — the guard the
+    /// five-site duplication needs (#126).
+    ///
+    /// One logical value is written in five places: the config `[llm].model`, its
+    /// `[models]` price-row key (covered by the sibling test below), and three
+    /// compiled-in `const` fallbacks. Nothing else compares them, and the pins that
+    /// look like they do are tautologies — `compose`'s own test asserts
+    /// `compose_config(None).model == COMPOSE_MODEL`, i.e. the const against itself.
+    ///
+    /// A bump that updates the config and two consts but misses the third is
+    /// therefore invisible to CI and lands as a runtime failure, worst on
+    /// `llm-check`: it never reads `[llm].model` at all, so its `DEMO_MODEL` is the
+    /// site most easily left behind and the one whose drift an operator meets while
+    /// trying to diagnose their configuration.
+    #[test]
+    fn every_model_id_site_agrees_with_the_shipped_config() {
+        let shipped = include_str!("../../config/prices.toml");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prices.toml"), shipped).unwrap();
+
+        let configured = load_llm_transport_from(dir.path())
+            .expect("shipped transport loads")
+            .model
+            .expect("the shipped file pins [llm].model");
+
+        for (site, value) in [
+            (
+                "adapters::llm::openai_compat::OLLAMA_MODEL_ID",
+                crate::adapters::llm::openai_compat::OLLAMA_MODEL_ID,
+            ),
+            (
+                "cli::compose::COMPOSE_MODEL",
+                crate::cli::compose::COMPOSE_MODEL,
+            ),
+            ("cli::llm::DEMO_MODEL", crate::cli::llm::DEMO_MODEL),
+        ] {
+            assert_eq!(
+                value, configured,
+                "{site} is {value:?} but config/prices.toml [llm].model is \
+                 {configured:?} — a model bump moved one and not the other"
+            );
+        }
+    }
+
+    /// The shipped `[llm].model` MUST have a `[models]` price row in the same
+    /// shipped file — the two halves of a model bump, checked against each other.
+    ///
+    /// This is the coupling guard the model-id duplication needs. `RedactingLoggingProvider`
+    /// preflights `PriceTable::cost` BEFORE the billed call, so a `[llm].model` whose
+    /// price row is missing or whose key is typo'd does not degrade — every `compose`
+    /// and `llm-check` run fails closed with `no price for model …`. Without this
+    /// test that lands at runtime with green CI, since nothing else reads the two
+    /// tables together.
+    ///
+    /// Deliberately drives BOTH loaders off the SAME bytes and takes no `[llm]`
+    /// fallback: an absent-file run would silently pass on the embedded default even
+    /// if the on-disk file were inconsistent.
+    #[test]
+    fn the_shipped_default_model_is_priced_by_the_shipped_table() {
+        let shipped = include_str!("../../config/prices.toml");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prices.toml"), shipped).unwrap();
+
+        let model = load_llm_transport_from(dir.path())
+            .expect("shipped transport loads")
+            .model
+            .expect("the shipped file pins [llm].model");
+        let table = load_price_table_from(dir.path()).expect("shipped price table loads");
+
+        table
+            .cost(&model, &TokenUsage::default())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "shipped [llm].model {model:?} has no [models.\"{model}\"] price row \
+                     — every compose/llm-check run would fail closed before the billed \
+                     call: {e}"
+                )
+            });
     }
 
     /// Malformed TOML is a clear [`ConfigError::Parse`], never a panic.

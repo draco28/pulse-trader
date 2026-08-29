@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! resolve_llm_api_key()  →  ApiKey (opaque; carries the CredentialSource label)
-//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.2)
+//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.3-flash)
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
 //!                         .with_key_source(source)  — the audit label, never the key
 //!                         where capturing = CapturingRepo<SqliteLlmCallRepo> sharing ONE
@@ -71,19 +71,23 @@ use super::llm::CapturingRepo;
 
 /// The FALLBACK Ollama Cloud model id the composer drives when the config
 /// `[llm].model` is absent (README C2/C8). A model-id STRING (not a price literal)
-/// — AC-11 greps `src/cli/` only for price VALUE field names. `glm-5.2` is the
-/// tested main model (Ollama Cloud, OpenAI-compat, tool-capable); `gpt-oss:120b`
-/// was a pre-subscription placeholder that returned reproducible HTTP 500s under
-/// multi-turn tool-calling (VS-1.3.2 slice-close correction, 2026-07-12). The live
-/// model is config-driven per ADR-0013 (`config/prices.toml` `[llm].model`); this
-/// const is only the documented fallback (slice-close FIX A).
-const COMPOSE_MODEL: &str = "glm-5.2";
+/// — AC-11 greps `src/cli/` only for price VALUE field names.
+///
+/// `glm-5.3-flash` since ADR-0023 (2026-08-29) — see it for the bare-id evidence
+/// and for the composer tool-loop run that qualified this model. That run is the
+/// bar THIS const has to clear, because `gpt-oss:120b` once transported cleanly on
+/// this endpoint and still failed mid-loop.
+///
+/// The live model is config-driven per ADR-0013 (`config/prices.toml`
+/// `[llm].model`); this const is only the documented fallback (slice-close FIX A),
+/// and `agent::config`'s identity test holds the two in agreement (#126).
+pub(crate) const COMPOSE_MODEL: &str = "glm-5.3-flash";
 
 /// A conservative sampling temperature for the compose run (wire-level `f32`, never
 /// a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const COMPOSE_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap. glm-5.2 is a **reasoning** model whose thinking tokens
+/// The response token cap. GLM is a **reasoning** family whose thinking tokens
 /// count against this cap BEFORE its tool calls, so keep generous headroom past the
 /// reasoning ([VS-1.3.1 GLM]; the live demo uses 4096).
 const COMPOSE_MAX_TOKENS: u32 = 4096;
@@ -446,7 +450,7 @@ mod tests {
         let config = compose_config(None);
         assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, COMPOSE_MODEL);
-        // Reasoning headroom (glm-5.2 thinking tokens count against the cap).
+        // Reasoning headroom (GLM thinking tokens count against the cap).
         assert!(
             config.max_tokens >= 4096,
             "generous cap for reasoning tokens"
