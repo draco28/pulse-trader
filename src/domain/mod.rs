@@ -113,6 +113,14 @@ pub use port::{
 // (agent ring) + the redacting-logging decorator (adapters ring), so it is never
 // dead code under `deny(warnings)`.
 pub(crate) use secret::looks_like_secret_token;
+// r1.s1.w2: the credential value types on the risk gate's registered surface —
+// `ApiKey` (opaque by construction: no `Display`, no value-revealing `Debug`),
+// `CredentialSource` (the persisted `key_source` audit label) and
+// `CredentialStatus` (the value-free banner read `r1.s1.w5` renders). `pub`
+// (unlike `looks_like_secret_token`) because they appear in public signatures that
+// cross the crate boundary; `lib.rs` mirrors these — an un-re-exported public
+// domain type is a `dead_code` BUILD error under `deny(warnings)`.
+pub use secret::{ApiKey, CredentialSource, CredentialStatus};
 // VS-1.3.1 work-1.01: the LLM domain ring surface (FR-23 / FR-24, README C2–C5).
 // The message/response/usage/config value types + the dedicated `LlmError` + the
 // pure cost model (`ModelPrice`/`PriceTable`), and the `LlmCall` ledger entity +

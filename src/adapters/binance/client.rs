@@ -182,8 +182,9 @@ fn lcg_jitter(span: u64) -> u64 {
         if x == 0 {
             x = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-                .unwrap_or(0x9E37_79B9)
+                .map_or(0x9E37_79B9, |d| {
+                    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+                })
                 | 1;
         }
         // LCG (Numerical Recipes constants).

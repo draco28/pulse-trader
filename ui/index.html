@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1440, initial-scale=1.0" />
+    <title>PulseTrader</title>
+    <!--
+      r1.s1.w5 replaces r1.s1.w1's deliberately-unstyled placeholder wholesale
+      with the ported design system. `#root` deliberately carries NO
+      `app-screen` class -- see `ui/src/styles/app-shell.css`'s header for why
+      the mock's browser-tab centering/padding treatment does not apply to a
+      window that IS the viewport.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

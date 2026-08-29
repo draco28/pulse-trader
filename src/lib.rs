@@ -11,6 +11,10 @@ pub(crate) mod domain;
 mod adapters;
 mod agent;
 mod cli;
+// r1.s1.w1 (ADR-0020): the argv dispatch that decides GUI vs CLI. Kept OUT of
+// `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
+// inside one of them.
+mod entry;
 mod tauri;
 
 // The domain layer is the library's stable public API surface (the port traits
@@ -371,6 +375,21 @@ pub use domain::LlmCallRepository;
 pub use adapters::llm::openai_compat::OpenAiCompatProvider;
 pub use adapters::secrets::glm_api_key;
 
+// r1.s1.w2: the LLM credential resolver on the risk gate's registered surface.
+// `ApiKey`/`CredentialSource`/`CredentialStatus` are the domain value half (an
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`); `CredentialSearch` + the `_in` injectable cores are the
+// adapter half the out-of-crate suites (`tests/credential_source.rs`,
+// `tests/credential_redaction.rs`) drive.
+//
+// The zero-arg `pub(crate)` wrappers (`resolve_llm_api_key` /
+// `llm_credential_status`) are deliberately NOT re-exported: they read the real
+// process environment. `ApiKey::expose()` also stays `pub(crate)`, so an
+// out-of-crate caller can pass a key on but can never read one (least privilege).
+pub use adapters::secrets::CredentialSearch;
+pub use adapters::secrets::{llm_credential_status_in, resolve_llm_api_key_in};
+pub use domain::{ApiKey, CredentialSource, CredentialStatus};
+
 // VS-1.3.1 work-1.04: the redacting + cost-logging `LlmProvider` decorator
 // (README C7, FR-24 / NFR-6). `RedactingLoggingProvider` wraps any inner provider
 // (1.05 wraps `GlmProvider`), redacts the PERSISTED copy of the prompt/completion
@@ -390,6 +409,37 @@ pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
 // `deny(warnings)`; a `pub` item unused outside its private module is a `dead_code`
 // BUILD error). 2.05's `pulse compose` verb + composition root consume these.
 pub use agent::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+
+// r1.s1.w1 (ADR-0020): the executable-topology surface. `launch_mode` is the pure
+// argv decision (`tests/entry_topology.rs` drives both directions over it);
+// `launch_mode_from_env` is the call the binary shim makes; `LaunchMode` is the
+// two-variant answer. `run_desktop` is the GUI entry point the shim calls when the
+// launch carries no user arguments. REQUIRED under `deny(warnings)` + private
+// `mod entry`/`mod tauri` -- a `pub` item unused outside its private module is a
+// `dead_code` BUILD error, not a warning (the harvested gotcha).
+pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
+
+// r1.s1.w1 (ADR-0020): the desktop-shell surface. NOTE the `crate::` qualifier -- at the
+// crate root, the bare path `tauri::` is AMBIGUOUS between this crate's `mod tauri` (the
+// outer ring) and the `tauri` DEPENDENCY, and rustc rejects it (E0659). `crate::tauri`
+// names the ring unambiguously. The dependency deliberately keeps its own name because
+// `#[tauri::command]` / `generate_handler!` expand to hard-coded `::tauri::` paths.
+//
+// `run_desktop` is the GUI entry point the binary shim dispatches to. Everything else is
+// the command-bus contract `tests/tauri_bus_contract.rs` (AC-3/4/5) pins and `r1.s1.w3`,
+// `r1.s1.w4` and `r1.s1.w5` code against: `BusError`/`BusErrorCode` (the ONE serializable
+// error shape), `BusEvent`/`BusEventPayload`/`RunId`/`EventSink` (the per-invocation typed
+// channel), `DesktopState` (managed state), `BUS_COMMANDS` (the append-only registration
+// list), and the transport-free cores. REQUIRED under `deny(warnings)` + private
+// `mod tauri` -- a `pub` item unused outside its private module is a `dead_code` BUILD
+// error, not a warning (the harvested gotcha).
+pub use crate::tauri::{
+    BUS_COMMANDS, BusError, BusErrorCode, BusEvent, BusEventPayload, ComposeDeps,
+    ComposeDslSummary, ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EventSink,
+    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RunId, ShellInfo,
+    StreamOutcome, VersionStats, compose_strategy_core, demo_stream_core, export_bindings,
+    library_overview_core, run_desktop, shell_info_core,
+};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

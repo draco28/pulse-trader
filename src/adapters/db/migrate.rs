@@ -14,6 +14,7 @@
 //! discipline (those helpers are private to a different module tree — mirrored, not
 //! imported — per the audit-C5 re-derive convention).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -29,16 +30,21 @@ use crate::domain::DataError;
 /// `_sqlx_migrations`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationOutcome {
-    /// Schema already at the embedded max; no backup taken, no migration run.
+    /// Every embedded migration is already applied; no backup taken, none run.
     AlreadyCurrent {
-        /// The current (== embedded max) applied version.
+        /// The highest applied version (== the embedded max).
         version: i64,
     },
     /// Migrated `from` → `to`; the pre-migration db was backed up at `backup`.
+    ///
+    /// `from` and `to` are MAXIMA, and with reserved numbers landing out of order
+    /// a run can legitimately report `from == to`: filling a reserved gap (adding
+    /// `0005` to a db that already holds `0007`) applies a migration without moving
+    /// the maximum. The `backup` is the reliable signal that a migration ran.
     Migrated {
-        /// The applied version before the migration ran.
+        /// The highest applied version before the migration ran.
         from: i64,
-        /// The applied version after the migration ran (the embedded max).
+        /// The highest applied version after the migration ran (the embedded max).
         to: i64,
         /// The retained pre-migration backup file (NFR-12).
         backup: PathBuf,
@@ -66,10 +72,10 @@ pub enum MigrationOutcome {
 /// # Errors
 /// Returns [`DataError::Migration`] if the backup, migrate, or post-verify step
 /// fails (the original db is restored from the backup first; the backup is
-/// retained for forensics), OR if the db is **ahead** of the embedded set
-/// (`applied_max > embedded_max` — a db newer than the binary must NOT be migrated
-/// *or* opened; refuse to start, MASTER-SPEC §7.4). Returns [`DataError::Db`] if the
-/// pool cannot be opened.
+/// retained for forensics), OR if the db is **ahead** of the embedded set — it has
+/// applied a migration this binary does not ship, at ANY version, so a db newer than
+/// the binary must NOT be migrated *or* opened; refuse to start (MASTER-SPEC §7.4).
+/// Returns [`DataError::Db`] if the pool cannot be opened.
 pub async fn run_migrations_with_backup(db_path: &Path) -> Result<MigrationOutcome, DataError> {
     run_migrations_with_backup_using(db_path, &MIGRATOR).await
 }
@@ -84,27 +90,49 @@ async fn run_migrations_with_backup_using(
     let db = Db::with_path(db_path).await?;
     let pool = db.pool();
 
-    let applied_max = applied_max_version(pool).await?;
-    let embedded_max = embedded_max_version(migrator);
+    // SETS, not maxima. This project allocates migration numbers at release planning
+    // and ships them out of order — `r1.s1` shipped `0007` while `0005`/`0006` stayed
+    // reserved for `r1.s2`/`r1.s3` — so "applied" and "current" are not the same
+    // question. An installation holding `0001-0004` + `0007` has an applied max of 7,
+    // and so does the binary that later adds `0005`: a max comparison reports
+    // `AlreadyCurrent`, returns without ever invoking sqlx, and leaves `0005`
+    // unapplied while startup reports success. Silent schema divergence on a real
+    // installation. The set difference is what makes the reserved-number scheme safe.
+    let applied = applied_versions(pool).await?;
+    let embedded = embedded_versions(migrator);
+    let applied_max = applied.iter().copied().max().unwrap_or(0);
+    let embedded_max = embedded.iter().copied().max().unwrap_or(0);
 
-    if applied_max == embedded_max {
+    // AHEAD-state refusal (#38): the db has successfully applied a migration this
+    // binary does not ship. A db newer than the binary must NOT be migrated (there is
+    // no down path for migrations we don't ship) NOR opened — refuse to start
+    // (MASTER-SPEC §7.4). This is a REAL `Err` (#65), never a `debug_assert!`: the
+    // determinism gate + CI run `--release`, where a `debug_assert!` is compiled out
+    // exactly when this guard matters. It fires BEFORE the behind-branch so no backup
+    // is taken and `Migrated{from,to}` can never be reported inverted.
+    //
+    // Set-based for the same reason as above, and strictly stronger than the max
+    // comparison it replaces: a db carrying a version this binary lacks is refused
+    // even when that version sorts BELOW the embedded max.
+    let ahead: Vec<i64> = applied.difference(&embedded).copied().collect();
+    if !ahead.is_empty() {
+        let names = ahead
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DataError::Migration(format!(
+            "db has applied migration(s) [{names}] that this binary does not ship \
+             (embedded max {embedded_max}): refusing to migrate or open a db newer \
+             than the binary"
+        )));
+    }
+
+    let missing: Vec<i64> = embedded.difference(&applied).copied().collect();
+    if missing.is_empty() {
         return Ok(MigrationOutcome::AlreadyCurrent {
             version: applied_max,
         });
-    }
-
-    // AHEAD-state refusal (#38): the db's successfully-applied schema is NEWER than
-    // this binary's embedded set. A db newer than the binary must NOT be migrated
-    // (there is no down path for migrations we don't ship) NOR opened — refuse to
-    // start (MASTER-SPEC §7.4). This is a REAL `Err` (#65), never a `debug_assert!`:
-    // the determinism gate + CI run `--release`, where a `debug_assert!` is compiled
-    // out exactly when this guard matters. It fires BEFORE the behind-branch so no
-    // backup is taken and `Migrated{from,to}` can never be reported inverted.
-    if applied_max > embedded_max {
-        return Err(DataError::Migration(format!(
-            "db schema version {applied_max} is ahead of this binary's embedded max \
-             {embedded_max}: refusing to migrate or open a db newer than the binary"
-        )));
     }
 
     // Behind: snapshot the live db (consistent, WAL-safe) BEFORE migrating, then
@@ -119,7 +147,7 @@ async fn run_migrations_with_backup_using(
     }
 
     // Migrate, then verify; on ANY failure restore from the backup and refuse.
-    match migrate_and_verify(pool, migrator, embedded_max).await {
+    match migrate_and_verify(pool, migrator, &embedded).await {
         Ok(()) => Ok(MigrationOutcome::Migrated {
             from: applied_max,
             to: embedded_max,
@@ -167,44 +195,78 @@ pub async fn undo_to(pool: &SqlitePool, target_version: i64) -> Result<(), DataE
         .map_err(|e| DataError::Migration(format!("undo to version {target_version} failed: {e}")))
 }
 
-/// Run the migrator, then re-derive the applied max and assert it now equals the
-/// embedded max (defense-in-depth, mirroring `store/mod.rs`'s audit-C5
-/// re-derive-and-reject guard). Any error here drives the caller's restore path.
+/// Run the migrator, then re-derive the applied version SET and assert it now
+/// covers every embedded version (defense-in-depth, mirroring `store/mod.rs`'s
+/// audit-C5 re-derive-and-reject guard). Any error here drives the caller's
+/// restore path.
+///
+/// Set-based rather than max-based for the reason the caller's gate is: with
+/// reserved migration numbers landing out of order, a run that filled a gap
+/// leaves the max unchanged, so a max comparison would report success whether the
+/// gap was filled or silently skipped. The property that matters is coverage.
 async fn migrate_and_verify(
     pool: &SqlitePool,
     migrator: &Migrator,
-    embedded_max: i64,
+    embedded: &BTreeSet<i64>,
 ) -> Result<(), DataError> {
     migrator
         .run(pool)
         .await
         .map_err(|e| DataError::Migration(format!("migration run failed: {e}")))?;
 
-    let post = applied_max_version(pool).await?;
-    if post != embedded_max {
+    let post = applied_versions(pool).await?;
+    let still_missing: Vec<i64> = embedded.difference(&post).copied().collect();
+    if !still_missing.is_empty() {
+        let names = still_missing
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(DataError::Migration(format!(
-            "post-migration verify mismatch: applied max {post} != embedded max {embedded_max}"
+            "post-migration verify mismatch: migration(s) [{names}] are embedded but \
+             still not applied"
         )));
     }
     Ok(())
 }
 
-/// The max **successfully-applied** migration version from `_sqlx_migrations`, or
-/// `0` when no migration has ever committed (the table absent or empty). Raw
-/// `sqlx::query_scalar` (no `query!` macro — this item ships no `.sqlx` cache).
+/// The max **successfully-applied** migration version, or `0` when none has ever
+/// committed. TEST-ONLY: the protocol itself compares version SETS (see
+/// [`applied_versions`]), because with reserved numbers landing out of order a max
+/// cannot distinguish "current" from "missing a lower version". The tests still
+/// assert on the max, which is the readable thing to assert once coverage is
+/// established.
+#[cfg(test)]
+async fn applied_max_version(pool: &SqlitePool) -> Result<i64, DataError> {
+    Ok(applied_versions(pool)
+        .await?
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0))
+}
+
+/// Every successfully-applied version, as a set.
+///
+/// The MAX alone is not enough to decide whether a database is current, because
+/// this project ALLOCATES MIGRATION NUMBERS AT RELEASE PLANNING and ships them out
+/// of order: `r1.s1` shipped `0007` while `0005` and `0006` stayed reserved for
+/// `r1.s2` and `r1.s3`. When those land, an installation that already applied
+/// `0001-0004` + `0007` has `applied_max == embedded_max == 7` while genuinely
+/// missing two migrations. A max comparison calls that current and skips the
+/// migrator entirely; the set difference sees the gap.
 ///
 /// **Committed-state filter (#38 / audit C6).** sqlx records a row in
 /// `_sqlx_migrations` for *every* attempt, with a `success` column that is `0`
-/// until the migration commits. This function MUST read `MAX(version) WHERE
-/// success = TRUE` so the value reflects the **applied schema**, not arbitrary
-/// migration history: a failed or partially-applied future-version row
-/// (`success = 0`) must NOT count, otherwise a single botched future-migration
-/// attempt would spuriously trip the ahead-state refusal and brick the binary.
-/// The ahead-state guard in [`run_migrations_with_backup_using`] depends on this
-/// filter being in place.
-async fn applied_max_version(pool: &SqlitePool) -> Result<i64, DataError> {
-    // `MAX(version)` over an empty/absent set is NULL → coalesce to 0. The table
-    // is created lazily by the migrator; guard against its absence on a fresh db.
+/// until the migration commits. This function MUST filter on `success = TRUE` so
+/// the value reflects the **applied schema**, not arbitrary migration history: a
+/// failed or partially-applied future-version row (`success = 0`) must NOT count,
+/// otherwise a single botched future-migration attempt would spuriously trip the
+/// ahead-state refusal and brick the binary. The ahead-state guard in
+/// [`run_migrations_with_backup_using`] depends on this filter being in place.
+///
+/// Raw `sqlx::query_scalar` (no `query!` macro — this item ships no `.sqlx` cache).
+async fn applied_versions(pool: &SqlitePool) -> Result<BTreeSet<i64>, DataError> {
     let exists: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
@@ -212,24 +274,33 @@ async fn applied_max_version(pool: &SqlitePool) -> Result<i64, DataError> {
     .await
     .map_err(|e| DataError::Db(e.to_string()))?;
     if exists == 0 {
-        return Ok(0);
+        return Ok(BTreeSet::new());
     }
-    let max: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = TRUE",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| DataError::Db(e.to_string()))?;
-    Ok(max)
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = TRUE")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(versions.into_iter().collect())
 }
 
-/// The max version among the migrator's *up* migrations (the `iter()` yields both
+/// Every version among the migrator's *up* migrations (the `iter()` yields both
 /// up and down entries per reversible step; only up entries define the target).
-fn embedded_max_version(migrator: &Migrator) -> i64 {
+fn embedded_versions(migrator: &Migrator) -> BTreeSet<i64> {
     migrator
         .iter()
         .filter(|m| m.migration_type.is_up_migration())
         .map(|m| m.version)
+        .collect()
+}
+
+/// The max version among the migrator's *up* migrations. TEST-ONLY, for the same
+/// reason as [`applied_max_version`].
+#[cfg(test)]
+fn embedded_max_version(migrator: &Migrator) -> i64 {
+    embedded_versions(migrator)
+        .iter()
+        .copied()
         .max()
         .unwrap_or(0)
 }
@@ -468,7 +539,7 @@ mod tests {
         match outcome {
             MigrationOutcome::Migrated { from, to, backup } => {
                 assert_eq!(from, 1, "from must be the pre-migration version");
-                assert_eq!(to, 4, "to must be the embedded max");
+                assert_eq!(to, 7, "to must be the embedded max");
                 assert!(
                     backup.exists(),
                     "backup file must exist: {}",
@@ -486,7 +557,7 @@ mod tests {
         }
 
         let db = Db::with_path(&path).await.expect("reopen db");
-        assert_eq!(applied_max(&db).await, 4, "schema must now be at 0004");
+        assert_eq!(applied_max(&db).await, 7, "schema must now be at 0007");
         assert!(
             index_present(&db).await,
             "idx_strategy_name must exist after migrate"
@@ -512,7 +583,7 @@ mod tests {
 
         match outcome {
             MigrationOutcome::AlreadyCurrent { version } => {
-                assert_eq!(version, 4, "version must be the embedded max");
+                assert_eq!(version, 7, "version must be the embedded max");
             }
             other @ MigrationOutcome::Migrated { .. } => {
                 panic!("expected AlreadyCurrent, got {other:?}")
@@ -603,27 +674,31 @@ mod tests {
 
     #[tokio::test]
     async fn migration_up_down_round_run_undo_rerun() {
-        // run → undo_to(1) → re-run. Index gone then back; max 4→1→4.
+        // run → undo_to(1) → re-run. Index gone then back; max 7→1→7.
+        // The embedded max is 7, not 5: `0005`/`0006` are reserved for `r1.s2`
+        // and `r1.s3`, allocated at release planning so parallel spines cannot
+        // collide on a migration number. sqlx applies versions in numeric order
+        // and does not require them to be contiguous.
         let (_tmp, path) = db_at_0001().await;
 
-        // Up: 1 → 4 (the embedded max, now that 0004 ships).
-        run_migrations_with_backup(&path).await.expect("up to 0004");
+        // Up: 1 → 7 (the embedded max, now that 0007 ships).
+        run_migrations_with_backup(&path).await.expect("up to 0007");
         let db = Db::with_path(&path).await.expect("reopen after up");
-        assert_eq!(applied_max(&db).await, 4, "after run, max == 4");
+        assert_eq!(applied_max(&db).await, 7, "after run, max == 7");
         assert!(index_present(&db).await, "after run, index present");
 
-        // Down: 4 → 1.
+        // Down: 7 → 1.
         undo_to(db.pool(), 1).await.expect("undo to 1");
         assert_eq!(applied_max(&db).await, 1, "after undo, max == 1");
         assert!(!index_present(&db).await, "after undo, index gone");
         drop(db);
 
-        // Re-run: 1 → 4.
+        // Re-run: 1 → 7.
         run_migrations_with_backup(&path)
             .await
-            .expect("re-run to 0004");
+            .expect("re-run to 0007");
         let db = Db::with_path(&path).await.expect("reopen after re-run");
-        assert_eq!(applied_max(&db).await, 4, "after re-run, max == 4");
+        assert_eq!(applied_max(&db).await, 7, "after re-run, max == 7");
         assert!(index_present(&db).await, "after re-run, index back");
     }
 
@@ -717,6 +792,156 @@ mod tests {
         assert!(
             matches!(outcome, MigrationOutcome::AlreadyCurrent { version } if version == embedded),
             "expected AlreadyCurrent at the embedded max, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod reserved_number_tests {
+    use super::{MigrationOutcome, applied_max_version, run_migrations_with_backup_using};
+    use crate::adapters::db::Db;
+    use sqlx::migrate::Migrator;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Copy the shipped `migrations/` set into `dir`.
+    fn copy_shipped_set(dir: &Path) {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        for entry in std::fs::read_dir(&shipped).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, dir.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+
+    /// Write a reversible probe migration whose up creates `<name>` and down drops it.
+    fn write_probe(dir: &Path, stem: &str, table: &str) {
+        std::fs::write(
+            dir.join(format!("{stem}.up.sql")),
+            format!("CREATE TABLE {table} (id TEXT PRIMARY KEY);\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{stem}.down.sql")),
+            format!("DROP TABLE {table};\n"),
+        )
+        .unwrap();
+    }
+
+    async fn table_present(db: &Db, name: &str) -> bool {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")
+                .bind(name)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        n == 1
+    }
+
+    /// **The reserved-number scheme actually works** — a later, LOWER-numbered
+    /// migration is applied through the production startup path after `0007` is
+    /// already in the database.
+    ///
+    /// Two PR review findings meet here (#115). The first claimed sqlx itself would
+    /// refuse: that adding the reserved `0005`/`0006` after `0007` is applied makes
+    /// sqlx report a missing-version error rather than execute them. That is false —
+    /// `sqlx-core-0.8.6`'s `Migrator::run_to` applies any version absent from
+    /// `_sqlx_migrations` regardless of how it sorts against the current maximum,
+    /// and its only ordering check fires in the opposite direction.
+    ///
+    /// The second finding was RIGHT, and is why this test lives here rather than in
+    /// `tests/migration_roundtrip.rs` driving `Migrator::run` directly: THIS wrapper
+    /// gated on `applied_max == embedded_max` and returned `AlreadyCurrent` without
+    /// invoking sqlx at all. Filling a reserved gap does not move the maximum, so
+    /// `0005` would have been silently skipped while startup reported success —
+    /// schema divergence on a real installation, reached by a different route than
+    /// the one first claimed. The gate compares version SETS now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_lower_numbered_migration_applies_through_the_startup_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("migrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        copy_shipped_set(&dir);
+
+        let db_path = tmp.path().join("pulse.db");
+        let shipped = Migrator::new(dir.as_path()).await.unwrap();
+
+        let first = run_migrations_with_backup_using(&db_path, &shipped)
+            .await
+            .expect("the shipped set applies");
+        assert!(matches!(first, MigrationOutcome::Migrated { .. }));
+        {
+            let db = Db::with_path(&db_path).await.unwrap();
+            assert_eq!(applied_max_version(db.pool()).await.unwrap(), 7);
+        }
+
+        // An unchanged set is still a genuine no-op — the short-circuit must survive.
+        let again = run_migrations_with_backup_using(&db_path, &shipped)
+            .await
+            .expect("re-running an unchanged set is current");
+        assert!(
+            matches!(again, MigrationOutcome::AlreadyCurrent { version: 7 }),
+            "an unchanged set must short-circuit: {again:?}"
+        );
+
+        // r1.s2 lands its reserved 0005 — BELOW the database's current maximum, so
+        // the max is unchanged and a max-based gate would call this current.
+        write_probe(&dir, "0005_reserved_spine_r1s2", "reserved_0005_probe");
+        let gapped = Migrator::new(dir.as_path()).await.unwrap();
+
+        let filled = run_migrations_with_backup_using(&db_path, &gapped)
+            .await
+            .expect("a lower-numbered migration arriving later must NOT be skipped");
+        assert!(
+            matches!(filled, MigrationOutcome::Migrated { from: 7, to: 7, .. }),
+            "filling a reserved gap runs a migration without moving the max: {filled:?}"
+        );
+
+        let db = Db::with_path(&db_path).await.unwrap();
+        assert!(
+            table_present(&db, "reserved_0005_probe").await,
+            "0005 was applied out of numeric order, as the reserved-number scheme needs"
+        );
+        assert_eq!(
+            applied_max_version(db.pool()).await.unwrap(),
+            7,
+            "0005 is recorded at its own version, not appended after 0007"
+        );
+    }
+
+    /// A database carrying a migration this binary does not ship is refused as
+    /// ahead — even when that version sorts BELOW the embedded maximum.
+    ///
+    /// The refusal used to be `applied_max > embedded_max`, which a db holding an
+    /// unknown LOW version walks straight past. There is no down path for a
+    /// migration we do not ship, so opening that db is not an option.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_db_holding_an_unknown_low_version_is_refused_as_ahead() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("migrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        copy_shipped_set(&dir);
+        // A future spine's 0006, applied by a NEWER binary than the one run after.
+        write_probe(&dir, "0006_from_a_newer_binary", "newer_binary_probe");
+
+        let db_path = tmp.path().join("pulse.db");
+        let newer = Migrator::new(dir.as_path()).await.unwrap();
+        run_migrations_with_backup_using(&db_path, &newer)
+            .await
+            .expect("the newer binary's set applies");
+
+        // Now the OLDER binary — the shipped set, without 0006 — opens the same db.
+        std::fs::remove_file(dir.join("0006_from_a_newer_binary.up.sql")).unwrap();
+        std::fs::remove_file(dir.join("0006_from_a_newer_binary.down.sql")).unwrap();
+        let older = Migrator::new(dir.as_path()).await.unwrap();
+
+        let err = run_migrations_with_backup_using(&db_path, &older)
+            .await
+            .expect_err("a db holding a migration this binary lacks must refuse to start");
+        let message = err.to_string();
+        assert!(
+            message.contains('6'),
+            "the refusal must name the offending version: {message}"
         );
     }
 }

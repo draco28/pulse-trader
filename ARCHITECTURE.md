@@ -169,9 +169,10 @@ mechanisms enforce it:
    CI matrix half is delivered alongside mechanism #3.
 
 2. **Pinned toolchain.** `rust-toolchain.toml` pins an exact Rust version
-   (`1.92.0`), not a floating `stable` channel. The toolchain version feeds
+   (`1.98.0`), not a floating `stable` channel. The toolchain version feeds
    `engine_fingerprint`. See the comment in `rust-toolchain.toml` — bumps are
-   deliberate and ADR-recorded.
+   deliberate and ADR-recorded ([ADR-0022](docs/adr/0022-toolchain-bump-1-98.md)
+   is the most recent one, `1.92.0` → `1.98.0`).
 
 3. **`engine_fingerprint`.** Every `BacktestRun` record stores a hash of
    (crate versions + Rust toolchain + DSL schema version + target architecture

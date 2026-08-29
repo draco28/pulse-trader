@@ -434,33 +434,34 @@ mod tests {
     use crate::domain::series::CandleSeries;
     use crate::domain::timeframe::Timeframe;
     use crate::domain::version::DataVersion;
+    use std::future::Future;
 
     /// A trivial generic fake implementing the port with no I/O.
     struct FakeSource;
 
     impl MarketDataSource for FakeSource {
-        async fn fetch_historical(
+        fn fetch_historical(
             &self,
             pair: &Pair,
             tf: Timeframe,
             _start_ms: i64,
             _end_ms: i64,
-        ) -> Result<CandleSeries, DataError> {
-            Ok(CandleSeries {
+        ) -> impl Future<Output = Result<CandleSeries, DataError>> {
+            std::future::ready(Ok(CandleSeries {
                 pair: pair.clone(),
                 timeframe: tf,
                 version: DataVersion::new("fake"),
                 candles: Vec::new(),
-            })
+            }))
         }
 
-        async fn fetch_incremental(
+        fn fetch_incremental(
             &self,
             _pair: &Pair,
             _tf: Timeframe,
             _since_ms: i64,
-        ) -> Result<Vec<Candle>, DataError> {
-            Ok(Vec::new())
+        ) -> impl Future<Output = Result<Vec<Candle>, DataError>> {
+            std::future::ready(Ok(Vec::new()))
         }
     }
 
@@ -516,6 +517,7 @@ mod repository_tests {
     };
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
+    use std::future::Future;
 
     /// A canonical `1.0.0` typed DSL the fake embeds in created versions.
     fn canonical_dsl() -> StrategyDsl {
@@ -566,12 +568,12 @@ mod repository_tests {
     }
 
     impl StrategyRepository for FakeRepo {
-        async fn create_strategy(
+        fn create_strategy(
             &self,
             name: &str,
             owner: Option<&str>,
             tags: &[String],
-        ) -> Result<Strategy, DataError> {
+        ) -> impl Future<Output = Result<Strategy, DataError>> {
             let strat = Strategy {
                 id: StrategyId::new(self.next_id("strat")),
                 name: name.to_owned(),
@@ -585,81 +587,99 @@ mod repository_tests {
                 .lock()
                 .expect("strategies lock")
                 .insert(strat.id.as_str().to_owned(), strat.clone());
-            Ok(strat)
+            std::future::ready(Ok(strat))
         }
 
-        async fn get_strategy(&self, id: &StrategyId) -> Result<Option<Strategy>, DataError> {
-            Ok(self
+        fn get_strategy(
+            &self,
+            id: &StrategyId,
+        ) -> impl Future<Output = Result<Option<Strategy>, DataError>> {
+            std::future::ready(Ok(self
                 .strategies
                 .lock()
                 .expect("strategies lock")
                 .get(id.as_str())
-                .cloned())
+                .cloned()))
         }
 
-        async fn list_strategies(
+        fn list_strategies(
             &self,
             include_archived: bool,
-        ) -> Result<Vec<Strategy>, DataError> {
-            Ok(self
+        ) -> impl Future<Output = Result<Vec<Strategy>, DataError>> {
+            std::future::ready(Ok(self
                 .strategies
                 .lock()
                 .expect("strategies lock")
                 .values()
                 .filter(|s| include_archived || !s.archived)
                 .cloned()
-                .collect())
+                .collect()))
         }
 
-        async fn rename_strategy(
+        fn rename_strategy(
             &self,
             id: &StrategyId,
             new_name: &str,
-        ) -> Result<Strategy, DataError> {
-            let mut map = self.strategies.lock().expect("strategies lock");
-            let strat = map
-                .get_mut(id.as_str())
-                .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
-            strat.name = new_name.to_owned();
-            Ok(strat.clone())
+        ) -> impl Future<Output = Result<Strategy, DataError>> {
+            std::future::ready((|| {
+                let mut map = self.strategies.lock().expect("strategies lock");
+                let strat = map
+                    .get_mut(id.as_str())
+                    .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
+                strat.name = new_name.to_owned();
+                Ok(strat.clone())
+            })())
         }
 
-        async fn set_tags(&self, id: &StrategyId, tags: &[String]) -> Result<Strategy, DataError> {
-            let mut map = self.strategies.lock().expect("strategies lock");
-            let strat = map
-                .get_mut(id.as_str())
-                .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
-            strat.tags = tags.to_vec();
-            Ok(strat.clone())
+        fn set_tags(
+            &self,
+            id: &StrategyId,
+            tags: &[String],
+        ) -> impl Future<Output = Result<Strategy, DataError>> {
+            std::future::ready((|| {
+                let mut map = self.strategies.lock().expect("strategies lock");
+                let strat = map
+                    .get_mut(id.as_str())
+                    .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
+                strat.tags = tags.to_vec();
+                Ok(strat.clone())
+            })())
         }
 
-        async fn set_pinned_version(
+        fn set_pinned_version(
             &self,
             id: &StrategyId,
             version_id: Option<&VersionId>,
-        ) -> Result<Strategy, DataError> {
-            let mut map = self.strategies.lock().expect("strategies lock");
-            let strat = map
-                .get_mut(id.as_str())
-                .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
-            strat.pinned_version_id = version_id.cloned();
-            Ok(strat.clone())
+        ) -> impl Future<Output = Result<Strategy, DataError>> {
+            std::future::ready((|| {
+                let mut map = self.strategies.lock().expect("strategies lock");
+                let strat = map
+                    .get_mut(id.as_str())
+                    .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
+                strat.pinned_version_id = version_id.cloned();
+                Ok(strat.clone())
+            })())
         }
 
-        async fn archive_strategy(
+        fn archive_strategy(
             &self,
             id: &StrategyId,
             archived: bool,
-        ) -> Result<Strategy, DataError> {
-            let mut map = self.strategies.lock().expect("strategies lock");
-            let strat = map
-                .get_mut(id.as_str())
-                .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
-            strat.archived = archived;
-            Ok(strat.clone())
+        ) -> impl Future<Output = Result<Strategy, DataError>> {
+            std::future::ready((|| {
+                let mut map = self.strategies.lock().expect("strategies lock");
+                let strat = map
+                    .get_mut(id.as_str())
+                    .ok_or_else(|| DataError::Io("no such strategy".to_owned()))?;
+                strat.archived = archived;
+                Ok(strat.clone())
+            })())
         }
 
-        async fn create_version(&self, request: NewVersion) -> Result<StrategyVersion, DataError> {
+        fn create_version(
+            &self,
+            request: NewVersion,
+        ) -> impl Future<Output = Result<StrategyVersion, DataError>> {
             let version = StrategyVersion {
                 id: VersionId::new(self.next_id("ver")),
                 strategy_id: request.strategy_id,
@@ -676,30 +696,33 @@ mod repository_tests {
                 .lock()
                 .expect("versions lock")
                 .insert(version.id.as_str().to_owned(), version.clone());
-            Ok(version)
+            std::future::ready(Ok(version))
         }
 
-        async fn get_version(&self, id: &VersionId) -> Result<Option<StrategyVersion>, DataError> {
-            Ok(self
+        fn get_version(
+            &self,
+            id: &VersionId,
+        ) -> impl Future<Output = Result<Option<StrategyVersion>, DataError>> {
+            std::future::ready(Ok(self
                 .versions
                 .lock()
                 .expect("versions lock")
                 .get(id.as_str())
-                .cloned())
+                .cloned()))
         }
 
-        async fn list_versions(
+        fn list_versions(
             &self,
             strategy_id: &StrategyId,
-        ) -> Result<Vec<StrategyVersion>, DataError> {
-            Ok(self
+        ) -> impl Future<Output = Result<Vec<StrategyVersion>, DataError>> {
+            std::future::ready(Ok(self
                 .versions
                 .lock()
                 .expect("versions lock")
                 .values()
                 .filter(|v| &v.strategy_id == strategy_id)
                 .cloned()
-                .collect())
+                .collect()))
         }
 
         async fn version_tree(
@@ -774,6 +797,7 @@ mod backtest_run_repository_tests {
     use crate::domain::strategy::VersionId;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Mutex;
 
     /// An in-memory, zero-I/O fake implementing `BacktestRunRepository`. It locks
@@ -796,13 +820,13 @@ mod backtest_run_repository_tests {
     }
 
     impl BacktestRunRepository for FakeRunRepo {
-        async fn save_run(
+        fn save_run(
             &self,
             strategy_version_id: &VersionId,
             result: &BacktestResult,
             summary: &SummaryStats,
             starting_equity: Decimal,
-        ) -> Result<BacktestRunId, DataError> {
+        ) -> impl Future<Output = Result<BacktestRunId, DataError>> {
             let id = BacktestRunId::new(self.next_id());
             let persisted = PersistedRun {
                 id: id.clone(),
@@ -823,37 +847,40 @@ mod backtest_run_repository_tests {
                 .lock()
                 .expect("runs lock")
                 .insert(id.as_str().to_owned(), (persisted, result.trades.clone()));
-            Ok(id)
+            std::future::ready(Ok(id))
         }
 
-        async fn get_run(&self, id: &BacktestRunId) -> Result<Option<PersistedRun>, DataError> {
-            Ok(self
+        fn get_run(
+            &self,
+            id: &BacktestRunId,
+        ) -> impl Future<Output = Result<Option<PersistedRun>, DataError>> {
+            std::future::ready(Ok(self
                 .runs
                 .lock()
                 .expect("runs lock")
                 .get(id.as_str())
-                .map(|(run, _)| run.clone()))
+                .map(|(run, _)| run.clone())))
         }
 
-        async fn latest_run_for_version(
+        fn latest_run_for_version(
             &self,
             strategy_version_id: &VersionId,
-        ) -> Result<Option<PersistedRun>, DataError> {
-            Ok(self
+        ) -> impl Future<Output = Result<Option<PersistedRun>, DataError>> {
+            std::future::ready(Ok(self
                 .runs
                 .lock()
                 .expect("runs lock")
                 .values()
                 .filter(|(run, _)| &run.strategy_version_id == strategy_version_id)
                 .map(|(run, _)| run.clone())
-                .last())
+                .last()))
         }
 
-        async fn list_runs_for_version(
+        fn list_runs_for_version(
             &self,
             strategy_version_id: &VersionId,
-        ) -> Result<Vec<RunSummary>, DataError> {
-            Ok(self
+        ) -> impl Future<Output = Result<Vec<RunSummary>, DataError>> {
+            std::future::ready(Ok(self
                 .runs
                 .lock()
                 .expect("runs lock")
@@ -871,17 +898,20 @@ mod backtest_run_repository_tests {
                     expectancy: run.summary.expectancy,
                     trade_count: run.summary.trade_count,
                 })
-                .collect())
+                .collect()))
         }
 
-        async fn get_trades(&self, id: &BacktestRunId) -> Result<Vec<Trade>, DataError> {
-            Ok(self
+        fn get_trades(
+            &self,
+            id: &BacktestRunId,
+        ) -> impl Future<Output = Result<Vec<Trade>, DataError>> {
+            std::future::ready(Ok(self
                 .runs
                 .lock()
                 .expect("runs lock")
                 .get(id.as_str())
                 .map(|(_, trades)| trades.clone())
-                .unwrap_or_default())
+                .unwrap_or_default()))
         }
     }
 
@@ -943,6 +973,7 @@ mod llm_provider_tests {
     use crate::domain::llm::{
         LlmBackend, LlmConfig, LlmError, LlmResponse, Message, TokenUsage, ToolDefinition,
     };
+    use std::future::Future;
 
     /// An in-memory, zero-I/O fake implementing [`LlmProvider`]. It echoes the
     /// last user message back as the completion and reports fixed token usage,
@@ -952,24 +983,24 @@ mod llm_provider_tests {
     struct FakeProvider;
 
     impl LlmProvider for FakeProvider {
-        async fn chat(
+        fn chat(
             &self,
             messages: Vec<Message>,
             _tools: &[ToolDefinition],
             _config: &LlmConfig,
-        ) -> Result<LlmResponse, LlmError> {
+        ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
             let content = messages.iter().rev().find_map(|m| match m {
                 Message::User { content } => Some(content.clone()),
                 _ => None,
             });
-            Ok(LlmResponse {
+            std::future::ready(Ok(LlmResponse {
                 content,
                 tool_calls: Vec::new(),
                 usage: TokenUsage {
                     input_tokens: 7,
                     output_tokens: 2,
                 },
-            })
+            }))
         }
     }
 
@@ -1013,6 +1044,7 @@ mod llm_call_repository_tests {
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Mutex;
 
     /// An in-memory, zero-I/O fake implementing [`LlmCallRepository`]. It locks the
@@ -1027,21 +1059,24 @@ mod llm_call_repository_tests {
     }
 
     impl LlmCallRepository for FakeLlmCallRepo {
-        async fn save_call(&self, call: &LlmCall) -> Result<LlmCallId, DataError> {
+        fn save_call(&self, call: &LlmCall) -> impl Future<Output = Result<LlmCallId, DataError>> {
             self.calls
                 .lock()
                 .expect("calls lock")
                 .insert(call.id.as_str().to_owned(), call.clone());
-            Ok(call.id.clone())
+            std::future::ready(Ok(call.id.clone()))
         }
 
-        async fn get_call(&self, id: &LlmCallId) -> Result<Option<LlmCall>, DataError> {
-            Ok(self
+        fn get_call(
+            &self,
+            id: &LlmCallId,
+        ) -> impl Future<Output = Result<Option<LlmCall>, DataError>> {
+            std::future::ready(Ok(self
                 .calls
                 .lock()
                 .expect("calls lock")
                 .get(id.as_str())
-                .cloned())
+                .cloned()))
         }
     }
 
@@ -1058,6 +1093,7 @@ mod llm_call_repository_tests {
             cost_currency: "CNY".to_owned(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: CreatedBy::ComposerLlm,
+            key_source: None,
         }
     }
 

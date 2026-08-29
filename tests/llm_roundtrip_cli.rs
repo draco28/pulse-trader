@@ -18,6 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use pulse::{
@@ -48,18 +49,18 @@ struct FakeProvider {
 }
 
 impl LlmProvider for FakeProvider {
-    async fn chat(
+    fn chat(
         &self,
         messages: Vec<Message>,
         _tools: &[ToolDefinition],
         _config: &LlmConfig,
-    ) -> Result<LlmResponse, LlmError> {
+    ) -> impl Future<Output = Result<LlmResponse, LlmError>> {
         self.received.lock().expect("received lock").push(messages);
-        Ok(LlmResponse {
+        std::future::ready(Ok(LlmResponse {
             content: Some(self.reply.clone()),
             tool_calls: Vec::new(),
             usage: self.usage,
-        })
+        }))
     }
 }
 

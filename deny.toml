@@ -133,6 +133,29 @@ exceptions = [
     # Named exception keeps the global allow-list permissive-only; any future
     # MPL dep will fail the gate until consciously added here.
     { allow = ["MPL-2.0"], crate = "option-ext" },
+    # r1.s1.w1 (ADR-0020 desktop shell / ADR-0011 licence surface): four MPL-2.0
+    # crates arrive TRANSITIVELY with Tauri, via
+    #   tauri → tauri-utils → dom_query → {selectors, cssparser, …}
+    #   tauri → tauri-runtime-wry → wry → dom_query → (same)
+    # They are Servo's CSS selector/parser crates — Tauri uses them to rewrite the
+    # embedded frontend's HTML at build time. None is a direct dependency and none is
+    # modified by this project.
+    #
+    # Why this does NOT violate ADR-0011's dual-license position. MPL-2.0 is
+    # FILE-LEVEL (weak) copyleft: §3.3 explicitly permits combining MPL files into a
+    # "Larger Work" under other terms, and the source-disclosure obligation attaches to
+    # the MPL-licensed FILES only, which we neither modify nor redistribute in modified
+    # form. That is the same reasoning already accepted for `option-ext` above, and it is
+    # categorically different from the AGPL self-grant below (which is authorized by
+    # OWNERSHIP, not by the licence's own terms).
+    #
+    # Scoped per-crate on purpose: the global allow-list stays permissive-only, so any
+    # OTHER MPL dependency — including a future direct one, where the calculus is
+    # different — still fails this gate until it is consciously reviewed and named here.
+    { allow = ["MPL-2.0"], crate = "selectors" },
+    { allow = ["MPL-2.0"], crate = "cssparser" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },
     # VS-1.3.1 work-1.03 (ADR-0011): the PulseHive SDK (GLM transport, README C8)
     # is published AGPL-3.0-only. AGPL is deliberately OUTSIDE the permissive-only
     # global allow-list. These named exceptions are the COMMERCIAL SELF-GRANT: the

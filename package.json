@@ -1,0 +1,36 @@
+{
+  "name": "pulsetrader-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PulseTrader desktop frontend (ADR-0020). r1.s1.w5 ports the design system (React + the tokens/shared.css chrome) into the shell r1.s1.w1 stood up.",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tauri": "tauri",
+    "bundle": "tauri build",
+    "desktop": "tauri dev"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vitest": "^3.2.7",
+    "jsdom": "^30.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0"
+  }
+}

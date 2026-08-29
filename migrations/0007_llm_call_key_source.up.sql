@@ -1,0 +1,31 @@
+-- r1.s1.w2 — 0007: record WHICH credential source answered for each LLM call
+-- (the *LLM credential handling and redaction* risk gate's audit-trail control).
+--
+-- One nullable TEXT column holding the kebab-case `CredentialSource` serde tag —
+-- `env` / `config-dir` / `cwd-dotenv` / `app-data-dir`. It is a LABEL, never the key:
+-- the whole value of an audit trail is that it can be read by someone who must not
+-- learn the credential, so no fragment of the key is stored here or anywhere else on
+-- the row (ADR-0016, redact before persist).
+--
+-- NULLABLE, and `llm_call.schema_version` deliberately STAYS at 1:
+--   * `llm_call_repo::get_call` fail-closes on any stored `schema_version` that is
+--     not the current constant (the #68 read-reject). Bumping the tag to 2 would
+--     therefore make every row written before this migration permanently unreadable
+--     — data stranding, and the exact opposite of ADR-0018's forward-only intent.
+--   * An ADDED nullable column is backward-compatible by construction: a v1 row
+--     reads back with `key_source = NULL` → `None`, meaning "provenance not
+--     recorded", which is true rather than an error.
+--
+-- Migration number `0007` is RESERVED for this spine: `r1.s2` holds `0005` and
+-- `r1.s3` holds `0006`, allocated at release planning so three spines in flight
+-- cannot collide on a number. The gap between 0004 and 0007 is intentional; sqlx
+-- does not require contiguous versions.
+--
+-- No index: `key_source` is a low-cardinality provenance label read alongside a row
+-- already located by primary key, never a search predicate.
+--
+-- The `llm_call_no_update` / `llm_call_no_delete` immutability triggers are row
+-- triggers and do not fire on DDL, so the append-only guarantee is untouched: an
+-- existing row's `key_source` stays NULL forever and still cannot be updated.
+
+ALTER TABLE llm_call ADD COLUMN key_source TEXT;

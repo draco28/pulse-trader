@@ -1,0 +1,71 @@
+// The app's root composition. r1.s1.w5 built the chrome + sidebar with the
+// no-credential banner as the pane's sole child; r1.s1.w6 makes the shell
+// navigable (G5-G9): `location.hash` drives which nav row is active and what
+// the content pane renders, through the table-driven router in `routes.ts`.
+//
+// No product screen mounts here -- the Library is `w3`, the Designer is `w4`.
+// Every nav row lands on either a real route's `element` (none exist yet) or
+// the honest `UnbuiltScreen` -- never a screen-shaped placeholder, which is
+// exactly the fake `r1.s1` SPINE.md's ledger exists to catch.
+
+import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
+
+import { CredentialBanner } from "./components/CredentialBanner";
+import { NAV_ALL, Sidebar, WindowChrome } from "./shell/AppShell";
+import { resolveNavId, resolveRoute } from "./routes";
+import type { Route } from "./routes";
+import UnbuiltScreen from "./screens/UnbuiltScreen";
+
+const KNOWN_NAV_IDS = NAV_ALL.map((item) => item.id);
+
+/**
+ * Given a resolved route (or none), render its screen or the unbuilt pane.
+ * Deliberately independent of `location.hash` / nav-id resolution, so it is
+ * testable with a synthetic `Route` regardless of what `ROUTES` currently
+ * contains (r1.s1.w6, spec step 7's rendered layer).
+ */
+export function RouteContent({ route }: { route: Route | undefined }): ReactNode {
+  if (route?.element !== undefined) {
+    const Element = route.element;
+    return <Element />;
+  }
+  return <UnbuiltScreen />;
+}
+
+export function App() {
+  const [navId, setNavId] = useState<string>(() =>
+    resolveNavId(window.location.hash, KNOWN_NAV_IDS),
+  );
+
+  useEffect(() => {
+    const onHashChange = () => setNavId(resolveNavId(window.location.hash, KNOWN_NAV_IDS));
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const route = resolveRoute("/" + navId);
+  const navEntry = NAV_ALL.find((item) => item.id === navId);
+  const title = route?.title ?? navEntry?.label;
+
+  // Table-driven (r1.s1.w3, G7): whether the third (360px) `.layout` track
+  // exists is declared by the ROUTE (`details: true`), never by a screen-name
+  // list here. The existing `.layout-no-details` modifier does the rest; the
+  // shell owns the track, the screen owns what fills it — a route with
+  // `details` gets an empty host `<aside>` and its screen portals the pane
+  // content in (see `LibraryScreen.tsx`).
+  const showDetailsPane = route?.details === true;
+
+  return (
+    <WindowChrome docTitle={title}>
+      <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
+        <Sidebar active={navId} />
+        <main className="content">
+          <CredentialBanner />
+          <RouteContent route={route} />
+        </main>
+        {showDetailsPane && <aside className="details" id="details-pane" />}
+      </div>
+    </WindowChrome>
+  );
+}

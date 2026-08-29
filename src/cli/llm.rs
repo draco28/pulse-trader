@@ -6,8 +6,10 @@
 //! ([`run_llm_check`]) wires:
 //!
 //! ```text
-//! glm_api_key()  →  OpenAiCompatProvider::new(key)
+//! glm_api_key()  →  ApiKey (opaque; carries the CredentialSource::Keychain label)
+//!                →  OpenAiCompatProvider::new(key.expose())
 //!                →  RedactingLoggingProvider::new(inner, repo, clock, redactor, prices)
+//!                   .with_key_source(Some(key.source()))  — the audit label, never the key
 //!                   where repo = SqliteLlmCallRepo over the opened Db
 //!                →  .chat()  →  a redacted, cost-logged LlmCall row
 //! ```
@@ -44,8 +46,8 @@ use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor
 use crate::adapters::secrets::glm_api_key;
 use crate::agent::LlmCallCapture;
 use crate::domain::{
-    Clock, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmProvider,
-    LlmResponse, Message, PriceTable,
+    Clock, CredentialSource, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository,
+    LlmConfig, LlmProvider, LlmResponse, Message, PriceTable,
 };
 
 /// The demo model id — `glm-5.2` via Ollama Cloud (the tested main model; mirrors
@@ -186,6 +188,13 @@ impl<R: LlmCallRepository + Send + Sync> LlmCallRepository for CapturingRepo<R> 
 /// `clock` value should be injected here AND into the `SqliteLlmCallRepo` so
 /// `created_at` is single-sourced (the 1.04 deferral).
 ///
+/// A thin, signature-preserving wrapper over [`run_llm_check_core`] with
+/// `key_source: None` (provenance not recorded) — its exact 6-argument shape is
+/// part of the crate's public API (`tests/llm_roundtrip_cli.rs` calls it directly),
+/// so it stays untouched rather than growing a 7th parameter; the LIVE arm
+/// ([`run_llm_check`]) calls [`run_llm_check_core`] directly with the real
+/// [`CredentialSource`] instead.
+///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] if the provider round-trip fails, the model has no
@@ -204,6 +213,39 @@ where
     R: LlmCallRepository + Send + Sync,
     C: Clock + Send + Sync,
 {
+    run_llm_check_core(provider, repo, redactor, prices, clock, prompt, None).await
+}
+
+/// The real body behind [`run_llm_check_with`], additionally carrying `key_source`
+/// (r1.s1.w2 — the risk gate's audit-trail control) onto the decorator so it rides
+/// onto every ledger row this run writes.
+///
+/// A LABEL, never the key: `key_source` is an [`ApiKey::source()`](crate::domain::ApiKey::source)
+/// value, a type that cannot carry the credential. [`run_llm_check_with`] calls
+/// this with `None` (so every existing caller, including the out-of-crate
+/// `tests/llm_roundtrip_cli.rs` offline round-trip that never touches the
+/// Keychain, keeps its current, honest "provenance not recorded" behavior
+/// unchanged); [`run_llm_check`] — the only caller that actually sourced a
+/// credential — calls this with `Some(CredentialSource::Keychain)`, the ONLY
+/// credential source `llm-check` ever has.
+///
+/// # Errors
+///
+/// Same as [`run_llm_check_with`].
+async fn run_llm_check_core<P, R, C>(
+    provider: P,
+    repo: R,
+    redactor: Redactor,
+    prices: PriceTable,
+    clock: C,
+    prompt: Vec<Message>,
+    key_source: Option<CredentialSource>,
+) -> anyhow::Result<LlmCheckOutcome>
+where
+    P: LlmProvider + Send + Sync,
+    R: LlmCallRepository + Send + Sync,
+    C: Clock + Send + Sync,
+{
     let captured: Arc<Mutex<Option<LlmCall>>> = Arc::new(Mutex::new(None));
     // `llm-check` uses only the single-row `captured` slot; the id buffer is a
     // throwaway here (the composer's provenance buffer is a `compose`-only concern).
@@ -215,7 +257,10 @@ where
 
     // The composition root: wrap the (already-selected) provider in the redacting +
     // cost-logging decorator over the capturing repo, sharing the single `clock`.
-    let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices);
+    // r1.s1.w2: which credential source answered rides onto every ledger row, so a
+    // call's provenance is reconstructible without the key ever being stored.
+    let decorator = RedactingLoggingProvider::new(provider, capturing, clock, redactor, prices)
+        .with_key_source(key_source);
     let config = demo_config();
 
     // No-tool back-compat: the `llm-check` demo advertises no tools (composer tools
@@ -239,7 +284,9 @@ where
 
 /// The LIVE arm (composition root): source the GLM key from the Keychain, build the
 /// `GlmProvider` → `RedactingLoggingProvider` → `SqliteLlmCallRepo` composition over
-/// the opened `db`, run the round-trip via [`run_llm_check_with`], and print the
+/// the opened `db`, run the round-trip via [`run_llm_check_core`] (passing the
+/// resolved [`CredentialSource`] — see that function's doc comment for why this
+/// calls the core directly rather than [`run_llm_check_with`]), and print the
 /// result. This is the ONLY place the concrete GLM types are assembled.
 ///
 /// `db` is `Some` for this verb (the dispatcher opens a migrated `pulse.db` — the
@@ -248,20 +295,26 @@ where
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] on an absent db, a missing/unreadable Keychain key
-/// (pointing at `pulse setup-keys`), a provider/transport failure, or a ledger
+/// (whose message says seeding is not yet supported), a provider/transport
+/// failure, or a ledger
 /// persist failure — every path a clear message + non-zero exit, never a panic.
 pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()> {
     let db = db.ok_or_else(|| anyhow::anyhow!("internal: llm-check requires an open db"))?;
 
     // Source the key from the macOS Keychain (READ only — the seed path is
     // VS-1.3.4's `pulse setup-keys`). A missing entry is a clear error, not a panic.
+    // `glm_api_key` returns the opaque `ApiKey`, already tagged
+    // `CredentialSource::Keychain` — llm-check's ONLY credential source.
     let key = glm_api_key().map_err(|e| anyhow::anyhow!("read GLM API key: {e}"))?;
+    // The provenance LABEL, captured up front: it is all that reaches the ledger.
+    let key_source = key.source();
 
     // Tag the live key value as a secret so an accidental echo of it in the prompt
     // is scrubbed from the STORED copy too (structural sk-shaped stripping is always
-    // on). Clone before moving the key into the provider ctor.
-    let redactor = Redactor::from_config(vec![key.clone()]);
-    let provider = OpenAiCompatProvider::new(key);
+    // on). `expose()` is the ONE in-crate read of the value; it never leaves this
+    // function as a bare String beyond the two consumers below.
+    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
+    let provider = OpenAiCompatProvider::new(key.expose().to_owned());
 
     // SINGLE SHARED CLOCK (1.04 deferral): ONE SystemClock injected into BOTH the
     // repo AND the decorator (via the core), so `created_at` is single-sourced.
@@ -274,7 +327,19 @@ pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()
         .map_err(|e| anyhow::anyhow!("load price table: {e}"))?;
     let prompt = build_prompt(args);
 
-    let outcome = run_llm_check_with(provider, repo, redactor, prices, clock, prompt).await?;
+    // `run_llm_check_core` directly (not `run_llm_check_with`): this is the ONE
+    // call site that actually resolved a credential, so it is the one that passes
+    // `Some(key_source)` — r1.s1.w2, the audit-trail control.
+    let outcome = run_llm_check_core(
+        provider,
+        repo,
+        redactor,
+        prices,
+        clock,
+        prompt,
+        Some(key_source),
+    )
+    .await?;
     print_outcome(&outcome);
     Ok(())
 }

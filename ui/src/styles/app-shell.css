@@ -1,0 +1,53 @@
+/* ============================================================
+   PulseTrader — app-shell.css
+   ORIGINAL to this app, not ported from docs/design/mock/. Two things live
+   here that the browser mock had no reason to define, both explained below.
+   ============================================================ */
+
+/* ---- root layout: this window IS the viewport ---------------------------
+   The mock's `body.app-screen` rule (shared.css) centers a `.window` inside
+   an arbitrarily-sized BROWSER TAB with 24px of letterbox padding -- that
+   only makes sense together with the browser-tab `fit()` hack this item does
+   not port (grill G1/A5). `tauri.conf.json` pins this app's WKWebView
+   viewport to exactly 1440x900, undecorated and non-resizable, so `.window`
+   (already 1440x900 per shared.css) fills it exactly on its own: `<body>`
+   deliberately does NOT carry the `app-screen` class. `overflow: hidden` is
+   kept as a defensive floor -- a pinned, non-resizable window that grows a
+   scrollbar reads as broken (AC-11). */
+body {
+  overflow: hidden;
+}
+
+/* ---- traffic-light window controls -------------------------------------
+   `shared.css`'s `.traffic span` rule (width/height/border-radius) still
+   sizes these -- they are real `<button>`s now (r1.s1 PR review: the
+   app-drawn titlebar under `decorations: false` is the window's only chrome,
+   so close/minimize must actually work), which means resetting the browser's
+   default button chrome on top of that shared sizing. */
+.traffic button {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.traffic button:disabled {
+  cursor: default;
+}
+
+/* ---- the no-credential banner (grill G4/A7) ------------------------------
+   Not a per-screen stylesheet -- there is no screen here to style, only the
+   frame's own first-run notice. Built from tokens.css's existing warn
+   palette rather than introducing a new colour, so it reads as part of the
+   same design system rather than a bolted-on alert box. */
+.credential-banner {
+  margin: 12px;
+  padding: 8px 12px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--r-6);
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  line-height: var(--lh-normal);
+}

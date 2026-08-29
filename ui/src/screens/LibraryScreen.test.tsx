@@ -1,0 +1,247 @@
+// Rendered tests for the Strategy Library screen (r1.s1.w3, spec step 7).
+//
+// The command module is mocked (`vi.mock("../bindings")`) so the screen's
+// behaviour is asserted against a payload SHAPE, not a live IPC bridge — the
+// payload fixtures mirror the generated `LibraryOverview` types exactly. The
+// empty-payload test is the anti-fabrication backstop: with the command
+// returning nothing, no row and no number may render (`r1.s1` SPINE.md
+// "Fakes"). Reuses `src/test/setup.ts` (cleanup + matchMedia) — not
+// re-registered here.
+
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../bindings", () => ({
+  commands: {
+    // "env" keeps the credential banner hidden so library content is the only
+    // status-ish thing in the tree.
+    credentialStatus: vi.fn().mockResolvedValue("env"),
+    libraryOverview: vi.fn(),
+  },
+}));
+
+import { commands } from "../bindings";
+import type { LibraryOverview, LibraryVersion, VersionStats } from "../bindings";
+import { App, RouteContent } from "../App";
+import { resolveRoute } from "../routes";
+
+const overviewMock = vi.mocked(commands.libraryOverview);
+
+function stats(expectancy: string, winRate: string, trades: number): VersionStats {
+  return { expectancy, winRate, trades };
+}
+
+function version(
+  id: string,
+  parentId: string | null,
+  versionStats: VersionStats | null,
+  delta: string | null = null,
+): LibraryVersion {
+  return {
+    id,
+    parentId,
+    createdAt: "2026-08-20T10:00:00.000Z",
+    dsl: {
+      name: "RSI Oversold",
+      direction: "long",
+      entry: ["rsi(14) < 30"],
+      filters: [],
+      exits: ["stop loss 5%", "take profit 2R"],
+      risk: ["risk per trade 1%", "max leverage 3x"],
+    },
+    stats: versionStats,
+    deltaVsParent: delta,
+    recentRuns:
+      versionStats === null
+        ? []
+        : [
+            {
+              id: "run-2222-3333",
+              createdAt: "2026-08-21T08:30:00.000Z",
+              expectancy: versionStats.expectancy,
+              trades: versionStats.trades,
+            },
+          ],
+  };
+}
+
+const SEEDED: LibraryOverview = {
+  strategies: [
+    {
+      id: "strat-alpha",
+      name: "Alpha Wave",
+      createdAt: "2026-08-01T09:00:00.000Z",
+      pinnedVersionId: "v-alpha-2",
+      versions: [
+        version("v-alpha-1", null, stats("+0.3R", "46.2%", 38)),
+        version("v-alpha-2", "v-alpha-1", stats("+0.42R", "48.3%", 64), "+0.12R"),
+        version("v-alpha-3", "v-alpha-2", null),
+      ],
+    },
+    {
+      id: "strat-beta",
+      name: "Beta Break",
+      createdAt: "2026-08-10T09:00:00.000Z",
+      pinnedVersionId: null,
+      versions: [version("v-beta-1", null, null)],
+    },
+  ],
+};
+
+beforeEach(() => {
+  overviewMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+});
+
+describe("LibraryScreen (empty payload — the anti-fabrication backstop)", () => {
+  it("renders the empty state naming the next action, and no strategy rows", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+    const { container } = render(<App />);
+
+    expect(await screen.findByText(/strategy designer/i)).toBeTruthy();
+    expect(container.querySelector(".scard")).toBeNull();
+    expect(container.querySelector(".vnode")).toBeNull();
+  });
+});
+
+describe("LibraryScreen (seeded payload)", () => {
+  it("renders every strategy with an honest count line", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    expect(await screen.findByText("Alpha Wave")).toBeTruthy();
+    expect(screen.getByText("Beta Break")).toBeTruthy();
+    expect(screen.getByText("2 strategies · 4 versions")).toBeTruthy();
+  });
+
+  it("shows the version tree with parent-child edges when a card is expanded", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+
+    // Scoped to the tree: the sidebar carries a "v3" tier badge and Beta's
+    // collapsed card shows its own "v1" ordinal, neither of which is a node.
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    const inTree = within(tree as HTMLElement);
+
+    expect(await inTree.findByText("v1")).toBeTruthy();
+    expect(inTree.getByText("v2")).toBeTruthy();
+    expect(inTree.getByText("v3")).toBeTruthy();
+    // One bezier edge per parent-child pair (2 in Alpha's chain).
+    expect(container.querySelectorAll(".vtree-svg path").length).toBe(2);
+  });
+
+  it("renders an em dash and no number for a version with no run (A1)", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    const node = within(tree as HTMLElement).getByText("v3").closest(".vnode");
+    expect(node).not.toBeNull();
+
+    const kpis = (node as HTMLElement).querySelector(".vnode-kpis");
+    expect(kpis).not.toBeNull();
+    expect((kpis as HTMLElement).textContent).toContain("—");
+    expect((kpis as HTMLElement).textContent).not.toMatch(/\d/);
+  });
+
+  it("fills the third track's details pane from the selected version, with no coaching block (A3)", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const tree = container.querySelector(".vtree-wrap");
+    expect(tree).not.toBeNull();
+    fireEvent.click(within(tree as HTMLElement).getByText("v2"));
+
+    const pane = document.getElementById("details-pane");
+    expect(pane).not.toBeNull();
+    const inPane = within(pane as HTMLElement);
+
+    expect(await inPane.findByText("Alpha Wave")).toBeTruthy();
+    expect(inPane.getByText("v2")).toBeTruthy();
+    expect(inPane.getByText("rsi(14) < 30")).toBeTruthy();
+    expect(inPane.getByText("stop loss 5%")).toBeTruthy();
+    // The KPI block and the recent-run row both carry the run's expectancy —
+    // at least one occurrence, scoped to the pane.
+    expect(inPane.getAllByText("+0.42R").length).toBeGreaterThan(0);
+    expect(inPane.getByText("48.3%")).toBeTruthy();
+
+    // A3: the coaching block is NOT rendered at all — not rendered-empty.
+    expect(screen.queryByText(/recent coaching/i)).toBeNull();
+  });
+});
+
+describe("LibraryScreen (VersionNode keyboard accessibility — PR finding 1)", () => {
+  it("renders a version node as a real <button>, reachable by its own accessible name", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+
+    const node = screen.getByRole("button", { name: "Version v2" });
+    expect(node.tagName).toBe("BUTTON");
+  });
+
+  it("is keyboard-focusable — the bug this regresses: a <div role=\"button\"> with no tabIndex cannot receive focus, so a keyboard-only user could never reach it", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    node.focus();
+    expect(document.activeElement).toBe(node);
+  });
+
+  it("activating a focused node fills the details pane", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    // jsdom does not synthesize a real browser's native "Enter/Space on a
+    // focused <button> dispatches click" default action, and
+    // @testing-library/user-event (which patches that in) is not a
+    // dependency of this project. This drives the same two steps a keyboard
+    // user's Enter/Space press produces in a real browser — focus, then the
+    // click a native <button> fires for it — which is exactly the behaviour
+    // the fix relies on the browser for, rather than a hand-rolled key
+    // handler.
+    node.focus();
+    expect(document.activeElement).toBe(node);
+    fireEvent.click(node);
+
+    const pane = document.getElementById("details-pane");
+    expect(pane).not.toBeNull();
+    const inPane = within(pane as HTMLElement);
+    expect(await inPane.findByText("v2")).toBeTruthy();
+    expect(inPane.getByText("rsi(14) < 30")).toBeTruthy();
+  });
+
+  it("exposes selection via aria-pressed, not only the CSS class", async () => {
+    overviewMock.mockResolvedValue({ status: "ok", data: SEEDED });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /toggle alpha wave/i }));
+    const node = screen.getByRole("button", { name: "Version v2" });
+
+    expect(node.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(node);
+    expect(node.getAttribute("aria-pressed")).toBe("true");
+  });
+});
+
+describe("the library route entry (the real ROUTES table)", () => {
+  it("mounts the screen through RouteContent", async () => {
+    const route = resolveRoute("/library");
+    expect(route).toBeDefined();
+
+    render(<RouteContent route={route} />);
+    expect(await screen.findByText("Strategy Library")).toBeTruthy();
+  });
+});

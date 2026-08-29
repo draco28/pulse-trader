@@ -2,7 +2,7 @@
 name = "pulse"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.98.0"
 description = "PulseTrader core engine — domain types, ports, and adapters"
 license = "proprietary"
 publish = false
@@ -84,6 +84,54 @@ keyring = "3"
 # not math — NOT in any determinism fingerprint, so a caret pin is fine (its
 # transitive graph does not bump rust_decimal/ta/polars — OQ-C lockfile guard).
 toml = "0.9"
+# r1.s1.w2: `getuid()` for the credential file's ownership check (the least-privilege
+# control, AC-5) — std has no API for the running user's uid. Already resolved at
+# 0.2.186 in Cargo.lock as a transitive dep, so this is a promotion, not a new edge:
+# zero lockfile churn and no determinism-fingerprint impact. I/O not math, so a caret
+# pin is fine (unlike ta/sqlx). Use it for the uid read ONLY.
+libc = "0.2"
+
+# ---------------------------------------------------------------------------
+# r1.s1.w1 (ADR-0020) — the desktop shell.
+#
+# ADR-0011 (dual-license surface) note: no NEW DIRECT dependency added here is
+# copyleft — every direct crate resolves inside `deny.toml`'s permissive-only
+# global allow-list (MIT / Apache-2.0 / BSD / ISC / Unicode-3.0 / Zlib). Tauri
+# does pull four MPL-2.0 crates TRANSITIVELY (`selectors`, `cssparser`,
+# `cssparser-macros`, `dtoa-short`, via tauri-utils/wry -> dom_query); those are
+# covered by the scoped named exceptions in `deny.toml`, not the global allow-list
+# (see the exceptions there for why file-level MPL-2.0 copyleft doesn't reach this
+# proprietary binary). The commercial self-grant is untouched and no new global
+# exception was needed. `cargo deny check licenses` is the gate that holds this
+# true over time.
+#
+# `tauri` is the desktop runtime: window, WKWebView, IPC. Its crate name COLLIDES
+# with this crate's own `mod tauri` (the outer ring). The module keeps its name
+# because ADR-0020's registered touch surface is `src/tauri/**`; the collision is
+# resolved at every use site with a leading `::tauri` (extern crate) versus
+# `crate::tauri` (our ring). Do NOT rename the dependency: the `#[tauri::command]`
+# and `generate_handler!` macros expand to hard-coded `::tauri::` paths.
+tauri = { version = "2", features = ["specta"] }
+# The typed seam (ADR-0020): `tauri-specta` reflects the command signatures + the
+# bus types into `ui/src/bindings.ts`, and AC-8 fails on any regeneration diff.
+#
+# EXACT `=` pins, for ONE reason now (r1.s5 closed the second):
+#  1. specta 2 and tauri-specta 2 are both PRE-RELEASE (`-rc.N`), and an rc bump
+#     changes generated-TypeScript output. A caret would let a background
+#     `cargo update` silently rewrite the committed bindings and red AC-8 with no
+#     source change. Same reasoning as the ta-rs/sqlx determinism pins, applied to
+#     a generated artifact instead of a numeric one.
+#  2. (retired by r1.s5.w1/w2) The newest specta used to not build on this crate's
+#     pinned toolchain: rc.24+ needs `core::fmt::from_fn` (the unstable
+#     `debug_closure_helpers` feature, rust-lang#117729), which was not stable on
+#     the old 1.92.0 pin. `r1.s5.w1` moved `rust-toolchain.toml` to 1.98.0 and
+#     verified `core::fmt::from_fn` compiles there; this item (`r1.s5.w2`) is the
+#     one that actually moves these three pins onto the newest published trio.
+#     tauri-specta HARD-pins its specta (`specta = "=2.0.0-rc.N"`), so the pair
+#     still has to move together — re-resolve, don't assume the numbers align.
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-typescript = "=0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 # VS-1.2.3 work-3.01: the build-time engine_fingerprint script (build.rs) hashes
 # the four D5 inputs. `sha2`/`hex` reuse the versions ALREADY resolved in Cargo.lock
@@ -92,6 +140,11 @@ toml = "0.9"
 [build-dependencies]
 sha2 = "0.11"
 hex = "0.4"
+# r1.s1.w1 (ADR-0020): `tauri_build::build()` reads `tauri.conf.json`, emits the
+# platform metadata `tauri::generate_context!` consumes, and re-runs the build when
+# the config or the frontend dist changes. Build-script-only — it never enters the
+# crate's runtime dependency surface (same discipline as sha2/hex above).
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 serde_json = "1"

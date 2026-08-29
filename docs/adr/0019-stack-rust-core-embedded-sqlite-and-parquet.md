@@ -65,10 +65,15 @@ does. They are listed so the omission reads as deliberate rather than forgotten.
   `tracing::warn` aspirationally), LLM-call records go to SQLite, and there is no
   export path. It arrives with the structured-logging work ADR-0017 defers.
 - **The Tauri/TypeScript desktop shell** — React + Vite in Tauri's WebView, a Tauri
-  backend, tauri-specta-generated bindings. None of it exists at `49f229a`;
-  `src/tauri/mod.rs` is an empty stub pinned at WI-01 to reserve the layout. It is a
-  direction, not a settled contract, and the first slice that builds it may revisit
-  the choice without violating any bone.
+  backend, tauri-specta-generated bindings. **Decided, as of 2026-08-25, by
+  [ADR-0020](0020-desktop-shell-tauri-react.md)** — the dedicated ADR this bullet asked
+  for. It is no longer undecided: `r1.s1.w1` built the shell, replacing the
+  `src/tauri/mod.rs` stub with a real Tauri v2 backend, and ADR-0020 records the stack,
+  the command-bus contract, the least-privilege capability set, and the single-binary
+  argv-dispatch topology that keeps ADR-0015's one-artifact rule literally true. This
+  ADR still does not own that decision — it scopes itself to the stack the `49f229a`
+  baseline exercised, which the shell was not part of. The pointer is here so the
+  omission reads as *closed elsewhere* rather than as still open.
 
 `ARCHITECTURE.md` and `EXECUTIVE-SUMMARY.md` still describe some of these as present;
 that drift is tracked in **#111**.
@@ -79,3 +84,9 @@ One toolchain for all deterministic work, and no cross-language serialization bo
 in the hot path. Embedded storage keeps the app installable with no service to run,
 at the cost of ruling out multi-machine deployment without revisiting this bone. A
 second backend language or any server-side component is the revisit trigger.
+
+**The exact toolchain *version* `rust-toolchain.toml` pins is not decided here.**
+This ADR decides Rust as the language; the specific channel string is a separate,
+narrower decision `rust-toolchain.toml`'s own header comment requires an ADR to
+move. [ADR-0022](0022-toolchain-bump-1-98.md) is where that move — and any future
+one — is recorded.
