@@ -5,7 +5,7 @@
 //! provider (no network, MASTER-SPEC §9.4) + a literal test key + a tempfile-`Db`
 //! [`SqliteLlmCallRepo`] over a migrated scratch db (no Keychain), then asserts an
 //! [`LlmCall`] is persisted with the prompt **redacted** and tokens/cost/currency
-//! **populated**. This is the slice's `auto` demo criterion: "a GLM 5.2 call
+//! **populated**. This is the slice's `auto` demo criterion: "a GLM call
 //! round-trips through `PulseHive` and logs an `LlmCall` … redaction strips the
 //! secret", proven over a fake provider (the live `PulseHive` call is the `user:`
 //! demo).

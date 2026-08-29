@@ -37,8 +37,11 @@ model = "glm-5.3-flash"
 # is what was actually exercised, and because it matches how `glm-5.2` was written
 # when it worked in VS-1.3.2.
 #
-# The z.ai model tiering (glm-5.3 for harder tasks, gpt-oss:120b for light ones)
-# is PLANNED work, not wired: nothing reads more than `[llm].model`.
+# Model tiering ON THIS ENDPOINT (glm-5.3 for harder tasks, gpt-oss:120b for
+# light ones) is PLANNED work, not wired: nothing reads more than `[llm].model`.
+# Ollama Cloud, not z.ai — ADR-0023 rejected the z.ai coding endpoint on its
+# licensing terms, and the feature map registers this as "Multi-model routing on
+# Ollama Cloud".
 #
 # glm-5.2 and gpt-oss:120b are retained as priced alternates for an operator who
 # pins `[llm].model` back to them. gpt-oss:120b returned reproducible HTTP 500s

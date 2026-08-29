@@ -370,6 +370,42 @@ mod tests {
         assert_eq!(transport.model.as_deref(), Some("glm-5.3-flash"));
     }
 
+    /// The shipped `[llm].model` MUST have a `[models]` price row in the same
+    /// shipped file — the two halves of a model bump, checked against each other.
+    ///
+    /// This is the coupling guard the model-id duplication needs. `RedactingLoggingProvider`
+    /// preflights `PriceTable::cost` BEFORE the billed call, so a `[llm].model` whose
+    /// price row is missing or whose key is typo'd does not degrade — every `compose`
+    /// and `llm-check` run fails closed with `no price for model …`. Without this
+    /// test that lands at runtime with green CI, since nothing else reads the two
+    /// tables together.
+    ///
+    /// Deliberately drives BOTH loaders off the SAME bytes and takes no `[llm]`
+    /// fallback: an absent-file run would silently pass on the embedded default even
+    /// if the on-disk file were inconsistent.
+    #[test]
+    fn the_shipped_default_model_is_priced_by_the_shipped_table() {
+        let shipped = include_str!("../../config/prices.toml");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prices.toml"), shipped).unwrap();
+
+        let model = load_llm_transport_from(dir.path())
+            .expect("shipped transport loads")
+            .model
+            .expect("the shipped file pins [llm].model");
+        let table = load_price_table_from(dir.path()).expect("shipped price table loads");
+
+        table
+            .cost(&model, &TokenUsage::default())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "shipped [llm].model {model:?} has no [models.\"{model}\"] price row \
+                     — every compose/llm-check run would fail closed before the billed \
+                     call: {e}"
+                )
+            });
+    }
+
     /// Malformed TOML is a clear [`ConfigError::Parse`], never a panic.
     #[test]
     fn load_price_table_from_malformed_toml_is_parse_error() {

@@ -20,11 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `glm-5.3-flash:cloud`, but the endpoint accepts the bare id (verified by a live
     call, tool-calling included), and the bare form matches how `glm-5.2` was
     written. Noted because the docs and the endpoint disagree here.
-  - **A `$PULSE_CONFIG_DIR/prices.toml` overlay wins over the shipped default.** An
-    overlay written before this release still pins `glm-5.2` and will keep using it.
-    Delete it to inherit the new default, or edit its `[llm].model` and add a
-    matching `[models."glm-5.3-flash"]` row — the cost path fails closed on a
-    model with no price row.
+  - **A `$PULSE_CONFIG_DIR/prices.toml` overlay wins over the shipped default, and
+    the two verbs then diverge.** `pulse compose` reads `[llm].model` from the
+    overlay, so it keeps running `glm-5.2`. `pulse llm-check` does **not** read that
+    table — it is const-driven and now asks for `glm-5.3-flash`, a model the stale
+    overlay never priced, so it fails closed *before* the billed call with
+    `no price for model glm-5.3-flash`. Fix either way: delete the overlay to
+    inherit the new default, or edit its `[llm].model` **and** add a matching
+    `[models."glm-5.3-flash"]` row — the added row is what unblocks `llm-check`.
   - **Verified end to end before landing.** A live `pulse compose` run on the new
     default dispatched six tool calls, finalized a schema-valid strategy, and
     persisted six `LlmCall` rows (peak `output_tokens` 701 against the 4096 cap, so

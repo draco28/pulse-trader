@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! resolve_llm_api_key()  →  ApiKey (opaque; carries the CredentialSource label)
-//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.2)
+//!                      →  OpenAiCompatProvider::{new|with_base_url}(key)  (Ollama Cloud, glm-5.3-flash)
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
 //!                         .with_key_source(source)  — the audit label, never the key
 //!                         where capturing = CapturingRepo<SqliteLlmCallRepo> sharing ONE
@@ -78,8 +78,8 @@ use super::llm::CapturingRepo;
 /// THIS tool loop before the bump landed — see ADR-0023's evidence line. That test
 /// exists because `gpt-oss:120b` returned reproducible HTTP 500s here mid-tool-loop
 /// (VS-1.3.2 slice-close correction, 2026-07-12): a model can transport cleanly and
-/// still fail on the third tool call, so API-level tool-calling is necessary but
-/// not sufficient evidence for this const.
+/// still fail partway through a multi-turn loop, so API-level tool-calling is
+/// necessary but not sufficient evidence for this const.
 /// The live model is config-driven per ADR-0013 (`config/prices.toml`
 /// `[llm].model`); this const is only the documented fallback (slice-close FIX A).
 const COMPOSE_MODEL: &str = "glm-5.3-flash";
@@ -88,7 +88,7 @@ const COMPOSE_MODEL: &str = "glm-5.3-flash";
 /// a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const COMPOSE_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap. glm-5.2 is a **reasoning** model whose thinking tokens
+/// The response token cap. GLM is a **reasoning** family whose thinking tokens
 /// count against this cap BEFORE its tool calls, so keep generous headroom past the
 /// reasoning ([VS-1.3.1 GLM]; the live demo uses 4096).
 const COMPOSE_MAX_TOKENS: u32 = 4096;
@@ -451,7 +451,7 @@ mod tests {
         let config = compose_config(None);
         assert_eq!(config.backend, LlmBackend::Ollama);
         assert_eq!(config.model, COMPOSE_MODEL);
-        // Reasoning headroom (glm-5.2 thinking tokens count against the cap).
+        // Reasoning headroom (GLM thinking tokens count against the cap).
         assert!(
             config.max_tokens >= 4096,
             "generous cap for reasoning tokens"

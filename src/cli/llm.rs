@@ -61,7 +61,7 @@ const DEMO_MODEL: &str = "glm-5.3-flash";
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const DEMO_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap for the demo round-trip. GLM 5.2 is a **reasoning**
+/// The response token cap for the demo round-trip. GLM is a **reasoning**
 /// model whose thinking tokens count against this cap BEFORE the final answer, so
 /// a tight cap yields empty `content` (the live VS-1.3.1 close demo saw an empty
 /// reply at 256 and a real one at ~343). Keep generous headroom past the reasoning.
@@ -70,7 +70,7 @@ const DEMO_MAX_TOKENS: u32 = 4096;
 /// The fixed demo prompt used when the operator gives no prompt argument.
 const DEMO_PROMPT: &str = "In one concise sentence, what is a liquidation in crypto futures?";
 
-/// `pulse llm-check [PROMPT] [--db <path>]` — run a GLM 5.2 chat round-trip through
+/// `pulse llm-check [PROMPT] [--db <path>]` — run a GLM chat round-trip through
 /// the redacting + cost-logging composition and print the persisted `LlmCall`.
 ///
 /// The verb name derives from the [`Command::LlmCheck`](super::Command) variant
@@ -324,7 +324,9 @@ pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()
     let repo = SqliteLlmCallRepo::with_deps(db.pool().clone(), clock);
 
     // Prices load from `config/prices.toml` via the 2.03 loader (AC-11 — no price
-    // literal in `src/cli/`); the shipped glm-5.2 entry backs this demo.
+    // literal in `src/cli/`); the shipped `[models]` row for DEMO_MODEL backs this
+    // demo — llm-check is const-driven, so that row must exist or the decorator
+    // fails closed before the billed call.
     let prices = crate::agent::config::load_price_table()
         .map_err(|e| anyhow::anyhow!("load price table: {e}"))?;
     let prompt = build_prompt(args);
