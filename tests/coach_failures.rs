@@ -3,10 +3,16 @@
 //!
 //! The half of the capability sentence that is easy to skip and expensive to get
 //! wrong: *zero calls, several calls, malformed arguments, an inapplicable
-//! mutation, a timeout, context overflow — each ends as a recorded failed session.*
-//! A coach that quietly returns nothing when the model misbehaves is the failure
-//! mode this spine exists to remove, so each of the six is driven here through the
-//! REAL turn against a scripted provider and asserted to leave a row behind.
+//! mutation, a timeout, context overflow, a transport fault — each ends as a
+//! recorded failed session.* A coach that quietly returns nothing when the model
+//! misbehaves is the failure mode this spine exists to remove, so each of the
+//! seven is driven here through the REAL turn against a scripted provider and
+//! asserted to leave a row behind.
+//!
+//! And the counterpart: the two faults that are NOT coaching outcomes — a local
+//! fault on the call path, and a session that cannot be written — surface as
+//! errors with nothing (or everything) recorded, never as a false reason in the
+//! audit trail.
 //!
 //! **No live LLM call happens here.** This binary is a demo-ledger line (`d7`)
 //! re-run at every future spine close.
@@ -16,16 +22,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulse::{
     BacktestResult, BacktestRunId, BacktestRunRepository, CoachCliOutcome, CoachFailure,
-    CoachWiring, CoachingRepository, CreatedBy, Db, EngineFingerprint, FakeClock, LlmConfig,
-    LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, MutationError, NewVersion, Redactor,
-    RegimeBreakdown, SessionOutcome, SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository, SummaryStats, TokenUsage, ToolCall,
+    CoachWiring, CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy, DataError, Db,
+    Disposition, EngineFingerprint, FakeClock, LlmConfig, LlmError, LlmProvider, LlmResponse,
+    MIGRATOR, Message, MutationError, NewVersion, Redactor, RegimeBreakdown, SessionOutcome,
+    SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo,
+    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats, TokenUsage, ToolCall,
     ToolDefinition, run_coach_with,
 };
 use rust_decimal::Decimal;
@@ -271,7 +279,7 @@ impl OutcomeRef for CoachCliOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// The six typed failures
+// The seven typed failures
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -306,10 +314,56 @@ async fn a_turn_with_several_tool_calls_is_recorded_as_several_calls() {
     let outcome = turn_with(&db, &run_id, provider, None, None).await;
 
     match failure_of(&outcome) {
-        CoachFailure::SeveralCalls { count } => assert_eq!(*count, 2),
+        CoachFailure::SeveralCalls {
+            count,
+            propose_mutation_count,
+        } => {
+            assert_eq!(*count, 2);
+            assert_eq!(
+                *propose_mutation_count, 2,
+                "both calls were propose_mutation, and the record says so"
+            );
+        }
         other => panic!("expected SeveralCalls, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "still ONE provider call");
+    assert_persisted(&db, &outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_calls_counts_a_foreign_named_call_separately() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, _calls) = ScriptedProvider::new(vec![with_calls(vec![
+        call(
+            "c1",
+            "propose_mutation",
+            good_args("entry.lhs.indicator.rsi.period"),
+        ),
+        call("c2", "finalize_strategy", json!({})),
+    ])]);
+
+    let outcome = turn_with(&db, &run_id, provider, None, None).await;
+
+    // One proposal plus one reach for a tool the coach does not have is a
+    // DIFFERENT mistake from proposing twice; the recorded reason has to say which.
+    match failure_of(&outcome) {
+        CoachFailure::SeveralCalls {
+            count,
+            propose_mutation_count,
+        } => {
+            assert_eq!(*count, 2, "two tool calls arrived");
+            assert_eq!(
+                *propose_mutation_count, 1,
+                "only one of them was propose_mutation"
+            );
+        }
+        other => panic!("expected SeveralCalls, got {other:?}"),
+    }
+    let rendered = failure_of(&outcome).to_string();
+    assert!(
+        rendered.contains("1 of them propose_mutation"),
+        "the recorded reason must not claim two propose_mutation calls: {rendered}"
+    );
     assert_persisted(&db, &outcome).await;
 }
 
@@ -333,6 +387,64 @@ async fn unparseable_arguments_are_recorded_as_malformed() {
         other => panic!("expected MalformedArguments, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_persisted(&db, &outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_float_threshold_is_recorded_as_malformed() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, _calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        json!({
+            "path": "exits[0].distance_pct",
+            // The tool schema promises "a decimal STRING, never a float".
+            "new_value": { "type": "Threshold", "value": 0.03 },
+            "hypothesis": "a tighter stop should raise expectancy",
+        }),
+    )])]);
+
+    let outcome = turn_with(&db, &run_id, provider, None, None).await;
+
+    // NFR-2: the f64 ingress path is closed. Accepting the float would write a
+    // binary-rounded threshold into the strategy — a number the coach did not
+    // propose and the trader cannot reproduce.
+    match failure_of(&outcome) {
+        CoachFailure::MalformedArguments { detail } => assert!(
+            detail.contains("propose_mutation"),
+            "the recorded reason names what failed: {detail}"
+        ),
+        other => panic!("expected MalformedArguments, got {other:?}"),
+    }
+    assert_persisted(&db, &outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrecognized_argument_is_recorded_as_malformed() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, _calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        json!({
+            "path": "entry.lhs.indicator.rsi.period",
+            "new_value": { "type": "Period", "value": 21 },
+            "hypothesis": "a slower RSI should cut whipsaw entries",
+            // Not a field of the tool. Accepting it silently is how a model's
+            // misunderstanding of the surface becomes a proposal that does
+            // something other than what it described (PR #93's rule).
+            "confidence": "high",
+        }),
+    )])]);
+
+    let outcome = turn_with(&db, &run_id, provider, None, None).await;
+
+    match failure_of(&outcome) {
+        CoachFailure::MalformedArguments { detail } => assert!(
+            detail.contains("confidence"),
+            "the recorded reason names the argument it did not recognize: {detail}"
+        ),
+        other => panic!("expected MalformedArguments, got {other:?}"),
+    }
     assert_persisted(&db, &outcome).await;
 }
 
@@ -411,7 +523,14 @@ async fn a_provider_that_outlives_the_guard_is_recorded_as_a_timeout() {
     .await;
 
     match failure_of(&outcome) {
-        CoachFailure::ProviderTimeout { elapsed_ms } => assert_eq!(*elapsed_ms, 20),
+        // The MEASURED wait, not the configured budget: at least the guard, and
+        // nowhere near the provider's own 30s stall.
+        CoachFailure::ProviderTimeout { elapsed_ms } => {
+            assert!(
+                (20..5_000).contains(elapsed_ms),
+                "the recorded elapsed_ms must be the measured wait past the 20ms guard, got {elapsed_ms}"
+            );
+        }
         other => panic!("expected ProviderTimeout, got {other:?}"),
     }
     assert_eq!(
@@ -451,6 +570,42 @@ async fn an_oversized_dsl_is_recorded_as_context_overflow_before_any_call() {
     assert!(
         outcome.session.llm_call_id.is_none(),
         "a pre-call failure records no ledger row (audit C3)"
+    );
+    assert_persisted(&db, &outcome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_overflow_budget_measures_the_bytes_the_turn_would_send() {
+    let (_tmp, db, run_id) = seeded().await;
+    let dsl: StrategyDsl =
+        serde_json::from_str(&canonical_dsl_json()).expect("the canonical fixture parses");
+    let compact = serde_json::to_string(&dsl)
+        .expect("serialize compactly")
+        .len();
+
+    let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        good_args("entry.lhs.indicator.rsi.period"),
+    )])]);
+
+    // A budget the COMPACT serialization fits exactly. The turn sends PRETTY JSON,
+    // which is strictly larger, so a check measuring the compact form would pass
+    // this document and then send a message that does not fit — a pre-call refusal
+    // that refuses the wrong things.
+    let outcome = turn_with(&db, &run_id, provider, None, Some(compact)).await;
+
+    match failure_of(&outcome) {
+        CoachFailure::ContextOverflow { detail } => assert!(
+            detail.contains(&compact.to_string()),
+            "the recorded reason states the budget it measured against: {detail}"
+        ),
+        other => panic!("expected ContextOverflow, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "still a pre-call refusal, so it still costs nothing"
     );
     assert_persisted(&db, &outcome).await;
 }
@@ -535,23 +690,139 @@ async fn a_transport_failure_is_recorded_rather_than_returned() {
     assert_persisted(&db, &outcome).await;
 }
 
+/// Drive one turn against an EXPLICIT coaching repo, returning the error text
+/// rather than panicking — the two cases below are about what does NOT get
+/// recorded, so they need the `Err`.
+async fn try_turn_against<K>(
+    db: &Db,
+    run_id: &BacktestRunId,
+    provider: ScriptedProvider,
+    turn_timeout: Option<Duration>,
+    coaching_repo: &K,
+) -> Result<(), String>
+where
+    K: CoachingRepository + Send + Sync,
+{
+    let clock = FakeClock::at(1_700_000_000_000);
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let wiring = CoachWiring {
+        provider,
+        llm_repo: CapturingLlmRepo::new(
+            SqliteLlmCallRepo::with_deps(db.pool().clone(), clock),
+            Arc::clone(&ids),
+        ),
+        redactor: Redactor::default(),
+        prices: test_prices(),
+        clock,
+        key_source: None,
+        config: config(),
+        prompt_dir: None,
+        turn_timeout,
+        max_dsl_bytes: None,
+        captured: ids,
+    };
+    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
+    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    run_coach_with(wiring, &run_repo, &strategy_repo, coaching_repo, run_id)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
+}
+
+// ---------------------------------------------------------------------------
+// What is NOT a coaching outcome (PR #128, findings 5 and 6)
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_config_error_is_recorded_on_the_same_road() {
+async fn a_local_fault_is_surfaced_rather_than_recorded_as_a_transport_failure() {
     let (_tmp, db, run_id) = seeded().await;
+    // An unpriced model and a failed ledger insert both arrive here as
+    // `LlmError::Config` / `LlmError::Local` — this process faulting on the call
+    // path, not the provider failing.
     let (provider, _calls) = ScriptedProvider::failing(LlmError::Config(
         "unknown model `glm-9.9` in the price table".to_owned(),
     ));
 
-    let outcome = turn_with(&db, &run_id, provider, None, None).await;
+    let coaching_repo =
+        SqliteCoachingRepo::with_deps(db.pool().clone(), FakeClock::at(1_700_000_000_000));
+    let error = try_turn_against(&db, &run_id, provider, None, &coaching_repo)
+        .await
+        .expect_err("a local fault must surface, not be recorded");
+    assert!(
+        error.contains("glm-9.9"),
+        "the fault is preserved at the edge: {error}"
+    );
 
-    match failure_of(&outcome) {
-        CoachFailure::TransportFailure { detail } => assert!(
-            detail.contains("config"),
-            "the recorded reason keeps the error's own wording, so a config fault \
-             is not mistaken for an outage: {detail}"
-        ),
-        other => panic!("expected TransportFailure, got {other:?}"),
+    // And nothing was written. `TransportFailure` says "the coach's provider call
+    // failed"; recording that for a price-table miss would put a false reason in
+    // the one record an auditor trusts.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
+        .fetch_one(db.pool())
+        .await
+        .expect("count sessions");
+    assert_eq!(rows, 0, "a local fault records no coaching session");
+}
+
+/// A coaching repo that refuses every write — the double-fault fixture.
+struct RefusingCoachingRepo;
+
+impl CoachingRepository for RefusingCoachingRepo {
+    fn save_session(
+        &self,
+        _session: &CoachingSession,
+    ) -> impl Future<Output = Result<CoachingSessionId, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
     }
-    assert!(outcome.session.llm_call_id.is_none());
-    assert_persisted(&db, &outcome).await;
+
+    fn get_session(
+        &self,
+        _id: &CoachingSessionId,
+    ) -> impl Future<Output = Result<Option<CoachingSession>, DataError>> {
+        std::future::ready(Ok(None))
+    }
+
+    fn list_sessions_for_run(
+        &self,
+        _run_id: &BacktestRunId,
+    ) -> impl Future<Output = Result<Vec<CoachingSession>, DataError>> {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    fn record_disposition(
+        &self,
+        _id: &CoachingSessionId,
+        _disposition: &Disposition,
+    ) -> impl Future<Output = Result<(), DataError>> {
+        std::future::ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_that_cannot_be_recorded_reports_both_halves() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, _calls) = ScriptedProvider::stalling(Duration::from_secs(30));
+
+    let error = try_turn_against(
+        &db,
+        &run_id,
+        provider,
+        Some(Duration::from_millis(20)),
+        &RefusingCoachingRepo,
+    )
+    .await
+    .expect_err("an unwritable session is fatal");
+
+    // The double fault: the write error alone would leave the operator knowing
+    // that something could not be written and nothing about what the turn did.
+    // The turn's reason exists ONLY in that frame — dropping it loses the incident.
+    assert!(
+        error.contains("unwritable"),
+        "the write error is reported: {error}"
+    );
+    assert!(
+        error.contains("did not answer"),
+        "the original failure travels with it: {error}"
+    );
 }

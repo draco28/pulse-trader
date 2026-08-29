@@ -343,7 +343,7 @@ where
 
         let now_ms = self.clock.now_ms();
         let created_at = DateTime::from_timestamp_millis(now_ms)
-            .ok_or_else(|| LlmError::Provider(format!("clock.now_ms() {now_ms} out of range")))?;
+            .ok_or_else(|| LlmError::Local(format!("clock.now_ms() {now_ms} out of range")))?;
 
         let call = LlmCall {
             id: LlmCallId::new(Uuid::new_v4().to_string()),
@@ -367,7 +367,10 @@ where
         self.repo
             .save_call(&call)
             .await
-            .map_err(|e| LlmError::Provider(format!("llm_call persist failed: {e}")))?;
+            // LOCAL, not `Provider`: the provider answered; it is our ledger write
+            // that failed. A caller that records provider faults as domain outcomes
+            // (the coach) must be able to tell the two apart (PR #128, finding 5).
+            .map_err(|e| LlmError::Local(format!("llm_call persist failed: {e}")))?;
 
         Ok(response)
     }

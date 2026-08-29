@@ -2,9 +2,15 @@
 //! session out.
 //!
 //! **Never silence.** Every path through [`Coach::run_turn`] ends by persisting
-//! exactly one [`CoachingSession`]: a `Proposed` proposal, or one of the six typed
-//! [`CoachFailure`]s. Persistence is inside the turn rather than left to the
-//! caller on purpose — a guarantee a caller can forget is not a guarantee.
+//! exactly one [`CoachingSession`]: a `Proposed` proposal, or one of the SEVEN
+//! typed [`CoachFailure`]s (`TransportFailure` joined the taxonomy in `r1.s2.w4`).
+//! Persistence is inside the turn rather than left to the caller on purpose — a
+//! guarantee a caller can forget is not a guarantee.
+//!
+//! The two things that are NOT recorded outcomes are the two that are not
+//! *coaching* at all: a fault this process raised on the call path (a failed
+//! ledger write, an unpriced model) and a failure to write the session row itself.
+//! Both surface as [`CoachTurnError`] at the CLI edge (ADR-0017).
 //!
 //! **One provider call, and every deviation is terminal** (grill L3). Zero tool
 //! calls, several tool calls, unparseable arguments, an empty hypothesis, a
@@ -25,7 +31,7 @@
 //! run config header, no credential. The provider handed in is the redacting
 //! decorator, so the persisted copy of prompt and completion is scrubbed at rest.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::domain::strategy::StrategyVersion;
 use crate::domain::{
@@ -39,24 +45,55 @@ use crate::adapters::llm::redacting_logging::Redactor;
 use super::composer::LlmCallCapture;
 use super::tools::{PROPOSE_MUTATION_TOOL, ProposeMutationArgs, coach_tool_definitions};
 
-/// A turn that never happened: the provider transport failed before any coaching
-/// outcome existed to record.
+/// A turn that produced no record — the two faults that are not coaching outcomes.
 ///
-/// Deliberately NOT a [`CoachFailure`]. The six failure variants are the ways a
-/// *coach turn* can deviate; an HTTP error is an infrastructure fault, and writing
-/// it into the audit trail as (say) a timeout would put a false reason in the one
-/// record `r1.s4` and the operator have to trust. It surfaces at the CLI edge
-/// instead, preserved (ADR-0017).
+/// Deliberately NOT [`CoachFailure`]s. The seven failure variants are the ways a
+/// *coach turn* can deviate, and each of them is written to the audit trail. What
+/// is left here is what a session row would have to lie about: a fault raised
+/// inside this process on the call path, and a failure to write the row at all.
+/// Both surface at the CLI edge, preserved (ADR-0017).
 #[derive(Debug, thiserror::Error)]
 pub enum CoachTurnError {
-    /// The provider transport failed — the turn did not happen.
-    #[error("the coach's provider call failed before the turn began: {0}")]
-    Provider(#[from] LlmError),
-    /// The session could not be recorded. Fatal by design: an unrecordable turn is
+    /// The turn never happened because THIS process faulted on the provider call
+    /// path — the decorator's ledger insert failed, the configured model has no
+    /// price-table entry, the clock is out of range.
+    ///
+    /// A true *transport* fault is NOT here: it is recorded as
+    /// [`CoachFailure::TransportFailure`] (r1.s2.w4) and the CLI still exits
+    /// non-zero for it. The split is what keeps "the coach's provider call failed"
+    /// from being written into the audit trail for a fault that never left this
+    /// binary (PR #128, finding 5).
+    #[error("the coach turn could not run: {0}")]
+    LocalFault(#[from] LlmError),
+    /// The proposal could not be recorded. Fatal by design: an unrecordable turn is
     /// the silence this spine exists to prevent, so it is surfaced rather than
     /// swallowed.
-    #[error("the coach turn could not be recorded: {0}")]
-    Record(#[from] DataError),
+    #[error("the coach turn could not be recorded: {source}")]
+    Record {
+        /// Why the write failed.
+        #[source]
+        source: DataError,
+    },
+    /// The turn deviated AND the deviation could not be recorded — the double
+    /// fault.
+    ///
+    /// Both halves travel together on purpose (PR #128, finding 6). Reporting only
+    /// the write error leaves the operator with "the session could not be written"
+    /// and no way to learn what the turn actually did — which, on the paths that
+    /// reach here after a timeout or a transport fault, is the entire content of
+    /// the incident.
+    #[error("the coach turn failed ({failure}) and the failure could not be recorded: {source}")]
+    RecordFailed {
+        /// What the turn actually did — the reason that never reached the row.
+        ///
+        /// Boxed to keep this error small: it rides in the `Err` of every
+        /// `run_turn`, and a `CoachFailure` inlined here (it carries a `Mutation`
+        /// and a `MutationError`) makes every `Ok` pay for the rarest failure.
+        failure: Box<CoachFailure>,
+        /// Why it could not be written.
+        #[source]
+        source: DataError,
+    },
 }
 
 /// The coach: drives one provider turn over the `propose_mutation` tool and
@@ -149,15 +186,16 @@ impl<P: LlmProvider> Coach<P> {
 
     /// Run one coach turn against `run` / `version` and record it.
     ///
-    /// Returns the session it persisted. The only `Err`s are a provider transport
-    /// failure (the turn never happened) and a persistence failure — see
-    /// [`CoachTurnError`]. Every *coaching* outcome, success or deviation, is an
-    /// `Ok` carrying its recorded session.
+    /// Returns the session it persisted. The only `Err`s are a local fault on the
+    /// call path (the turn never happened) and a persistence failure — see
+    /// [`CoachTurnError`]. Every *coaching* outcome, success or deviation — a
+    /// transport fault included — is an `Ok` carrying its recorded session.
     ///
     /// # Errors
     ///
-    /// [`CoachTurnError::Provider`] if the transport failed;
-    /// [`CoachTurnError::Record`] if the session could not be written.
+    /// [`CoachTurnError::LocalFault`] if this process faulted on the call path;
+    /// [`CoachTurnError::Record`] / [`CoachTurnError::RecordFailed`] if the session
+    /// could not be written.
     pub async fn run_turn<R: CoachingRepository>(
         &self,
         sessions: &R,
@@ -186,6 +224,7 @@ impl<P: LlmProvider> Coach<P> {
 
         // 3. ONE call, under the wall-clock guard.
         let start = self.captured_len();
+        let started = Instant::now();
         let response = match tokio::time::timeout(
             self.turn_timeout,
             self.provider.chat(messages, &self.tools, &self.config),
@@ -193,8 +232,13 @@ impl<P: LlmProvider> Coach<P> {
         .await
         {
             Err(_elapsed) => {
+                // The MEASURED wait, not the configured budget (PR #128, finding
+                // 10). They are close but not equal, and the recorded number is
+                // read as evidence of what happened — "the provider did not answer
+                // within 120000 ms" restating the setting tells an auditor nothing
+                // the config file did not already say.
                 let failure = CoachFailure::ProviderTimeout {
-                    elapsed_ms: u64::try_from(self.turn_timeout.as_millis()).unwrap_or(u64::MAX),
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 };
                 // A timed-out call may still have produced a ledger row if the
                 // decorator got far enough; name it if so.
@@ -203,20 +247,32 @@ impl<P: LlmProvider> Coach<P> {
                     .record(sessions, session_id, run, version, call_id, failure)
                     .await;
             }
-            Ok(Err(source)) => {
-                // r1.s2.w4: a transport fault is a RECORDED outcome, not an early
+            Ok(Err(LlmError::Provider(detail))) => {
+                // r1.s2.w4: a TRANSPORT fault is a RECORDED outcome, not an early
                 // return. The error text is scrubbed on the way in — an error body
                 // can echo the request that produced it, the same road hazard
                 // `classify()` handles for tool arguments.
                 let failure = CoachFailure::TransportFailure {
-                    detail: self.redactor.redact(&source.to_string()),
+                    detail: self.redactor.redact(&detail),
                 };
+                // A transport fault may still have minted a ledger row if the
+                // decorator wrote one before failing; name it if so rather than
+                // asserting NULL (audit C3 is "NULL iff no call was made").
+                let call_id = self.captured_since(start);
                 let recorded = self
-                    .record(sessions, session_id, run, version, None, failure)
+                    .record(sessions, session_id, run, version, call_id, failure)
                     .await?;
                 // Recorded AND loud: the CLI still preserves the provider error at
                 // the edge (ADR-0017); the session is what makes it non-silent.
                 return Ok(recorded);
+            }
+            Ok(Err(local)) => {
+                // NOT a coaching outcome (PR #128, finding 5). An unpriced model or
+                // a failed ledger insert is this process faulting, and recording it
+                // as `TransportFailure` would write "the coach's provider call
+                // failed" into the audit trail for something the provider never
+                // did. Surfaced at the edge instead, with nothing persisted.
+                return Err(CoachTurnError::LocalFault(local));
             }
             Ok(Ok(response)) => response,
         };
@@ -225,8 +281,8 @@ impl<P: LlmProvider> Coach<P> {
         // 4. Route the one response. No retries, no nudges (grill L3).
         let outcome = classify(&self.redactor, &version.dsl, response.tool_calls);
         match outcome {
-            Ok(proposal) => {
-                self.persist(
+            Ok(proposal) => self
+                .persist(
                     sessions,
                     session_id,
                     run,
@@ -235,7 +291,7 @@ impl<P: LlmProvider> Coach<P> {
                     SessionOutcome::Proposed { proposal },
                 )
                 .await
-            }
+                .map_err(|source| CoachTurnError::Record { source }),
             Err(failure) => {
                 self.record(sessions, session_id, run, version, call_id, failure)
                     .await
@@ -244,6 +300,11 @@ impl<P: LlmProvider> Coach<P> {
     }
 
     /// Persist a failed turn — the never-silence path, used by every deviation.
+    ///
+    /// On the double fault — the deviation could not be written — the returned
+    /// error carries BOTH the write error and the reason that never reached the
+    /// row ([`CoachTurnError::RecordFailed`], PR #128 finding 6). That reason is
+    /// otherwise unrecoverable: it exists only in this frame.
     async fn record<R: CoachingRepository>(
         &self,
         sessions: &R,
@@ -253,6 +314,7 @@ impl<P: LlmProvider> Coach<P> {
         llm_call_id: Option<LlmCallId>,
         failure: CoachFailure,
     ) -> Result<CoachingSession, CoachTurnError> {
+        let reason = failure.clone();
         self.persist(
             sessions,
             session_id,
@@ -262,6 +324,10 @@ impl<P: LlmProvider> Coach<P> {
             SessionOutcome::Failed { failure },
         )
         .await
+        .map_err(|source| CoachTurnError::RecordFailed {
+            failure: Box::new(reason),
+            source,
+        })
     }
 
     /// Write the turn and return **what was recorded**, not what was submitted.
@@ -279,7 +345,7 @@ impl<P: LlmProvider> Coach<P> {
         version: &StrategyVersion,
         llm_call_id: Option<LlmCallId>,
         outcome: SessionOutcome,
-    ) -> Result<CoachingSession, CoachTurnError> {
+    ) -> Result<CoachingSession, DataError> {
         let session = CoachingSession {
             id: session_id.clone(),
             backtest_run_id: run.id.clone(),
@@ -291,10 +357,10 @@ impl<P: LlmProvider> Coach<P> {
         };
         sessions.save_session(&session).await?;
         sessions.get_session(&session_id).await?.ok_or_else(|| {
-            CoachTurnError::Record(DataError::Db(format!(
+            DataError::Db(format!(
                 "coaching session `{}` was written but did not read back",
                 session_id.as_str()
-            )))
+            ))
         })
     }
 
@@ -334,8 +400,18 @@ fn classify(
             calls.remove(0)
         }
         n => {
+            // Count what was actually asked for, not just how many calls arrived
+            // (PR #128, finding 7): "two propose_mutation calls" and "one
+            // propose_mutation plus one call to a tool the coach does not have"
+            // are different mistakes, and the recorded reason has to be able to
+            // say which one happened.
+            let proposals = tool_calls
+                .iter()
+                .filter(|c| c.name == PROPOSE_MUTATION_TOOL)
+                .count();
             return Err(CoachFailure::SeveralCalls {
                 count: u32::try_from(n).unwrap_or(u32::MAX),
+                propose_mutation_count: u32::try_from(proposals).unwrap_or(u32::MAX),
             });
         }
     };

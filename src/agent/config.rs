@@ -276,8 +276,18 @@ fn load_llm_transport_from(config_dir: &Path) -> Result<LlmTransport, ConfigErro
 /// override exists but cannot be read; the compiled-in default path is
 /// infallible.
 pub(crate) fn load_composer_prompt() -> Result<String, ConfigError> {
-    let override_dir = std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from);
-    load_composer_prompt_from(override_dir.as_deref())
+    load_composer_prompt_from(prompt_override_dir().as_deref())
+}
+
+/// The prompt-overlay directory the operator installed, if any — `$PULSE_PROMPT_DIR`.
+///
+/// The ONE place the variable is read, so every agent surface resolves the overlay
+/// the same way. A composition root that needs to hand the directory onward
+/// (`pulse coach`, whose injectable core takes it as a parameter so tests stay
+/// hermetic) calls this; one that resolves in place ([`load_composer_prompt`])
+/// calls it too.
+pub(crate) fn prompt_override_dir() -> Option<PathBuf> {
+    std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from)
 }
 
 /// Load the composer prompt given an optional override directory (the testable
@@ -310,23 +320,12 @@ pub(crate) struct CoachPrompt {
     pub(crate) version: String,
 }
 
-/// Load the coach system prompt and its version.
+/// Load the coach prompt given an optional override directory.
 ///
-/// Resolution mirrors [`load_composer_prompt`]: `$PULSE_PROMPT_DIR/coach.md` wins
-/// if it exists (the private-workspace runtime override), otherwise the
-/// compiled-in default.
-///
-/// # Errors
-///
-/// Returns [`ConfigError::Read`] only when a `$PULSE_PROMPT_DIR/coach.md` override
-/// exists but cannot be read; the compiled-in default path is infallible.
-pub(crate) fn load_coach_prompt() -> Result<CoachPrompt, ConfigError> {
-    let override_dir = std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from);
-    load_coach_prompt_from(override_dir.as_deref())
-}
-
-/// Load the coach prompt given an optional override directory (the testable core
-/// of [`load_coach_prompt`]).
+/// Unlike [`load_composer_prompt`] this does NOT read the environment itself: the
+/// coach's composition root resolves [`prompt_override_dir`] and passes it in, so
+/// the injectable core (`run_coach_with`) stays hermetic under test rather than
+/// picking up a developer's exported `$PULSE_PROMPT_DIR`.
 ///
 /// **The version is computed from the RESOLVED bytes** — whichever source won
 /// (audit C2). That is what makes an overlay edit change the recorded version with
@@ -371,8 +370,9 @@ fn prompt_version(text: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        CONFIG_DIR_ENV, ConfigError, load_composer_prompt_from, load_llm_transport,
-        load_llm_transport_from, load_price_table_from, resolve_config_dir,
+        CONFIG_DIR_ENV, ConfigError, PROMPT_DIR_ENV, load_coach_prompt_from,
+        load_composer_prompt_from, load_llm_transport, load_llm_transport_from,
+        load_price_table_from, prompt_override_dir, resolve_config_dir,
     };
     use crate::domain::{SchemaVersion, TokenUsage};
     use std::sync::Mutex;
@@ -574,6 +574,45 @@ mod tests {
         std::fs::write(dir.path().join("composer.md"), "OVERRIDDEN COMPOSER PROMPT").unwrap();
         let prompt = load_composer_prompt_from(Some(dir.path())).expect("override read");
         assert_eq!(prompt, "OVERRIDDEN COMPOSER PROMPT");
+    }
+
+    /// The live coach path: `pulse coach` resolves [`prompt_override_dir`] and
+    /// feeds it to [`load_coach_prompt_from`], so an operator's
+    /// `$PULSE_PROMPT_DIR/coach.md` really does drive the turn AND the recorded
+    /// `prompt_version` (audit C2). Before PR #128 the live arm passed `None` here
+    /// and the overlay was silently ignored — the moat installed and inert.
+    ///
+    /// Env-mutating, so it shares `ENV_LOCK`.
+    #[test]
+    fn the_live_coach_path_resolves_the_prompt_dir_overlay() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("coach.md"), "OVERRIDDEN COACH PROMPT").unwrap();
+
+        // SAFETY: serialized by ENV_LOCK; no other test reads $PULSE_PROMPT_DIR.
+        unsafe {
+            std::env::set_var(PROMPT_DIR_ENV, dir.path());
+        }
+        let resolved = prompt_override_dir();
+        let overlay = load_coach_prompt_from(resolved.as_deref()).expect("overlay read");
+        // SAFETY: same lock scope; restore the environment before releasing it.
+        unsafe {
+            std::env::remove_var(PROMPT_DIR_ENV);
+        }
+
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+        assert_eq!(overlay.text, "OVERRIDDEN COACH PROMPT");
+        let default = load_coach_prompt_from(None).expect("compiled-in default");
+        assert_ne!(
+            overlay.version, default.version,
+            "an overlay edit must change the recorded prompt_version with no release step"
+        );
+
+        // And with nothing exported, the compiled-in default is what resolves.
+        assert!(
+            prompt_override_dir().is_none(),
+            "no $PULSE_PROMPT_DIR means no overlay"
+        );
     }
 
     /// Resolution order #1: an explicit `$PULSE_CONFIG_DIR` wins. The sole

@@ -54,7 +54,7 @@ use crate::domain::{
 
 use super::llm::CapturingRepo;
 
-/// `pulse coach <RUN_ID> [--db <path>] [--json]`.
+/// `pulse coach <RUN_ID> [--db <path>]`.
 #[derive(Debug, clap::Args)]
 pub struct CoachArgs {
     /// The persisted backtest run to coach on.
@@ -81,8 +81,11 @@ pub struct CoachWiring<P, R, C> {
     pub key_source: Option<CredentialSource>,
     /// The per-request chat config.
     pub config: LlmConfig,
-    /// The prompt-override directory. `None` means "read `$PULSE_PROMPT_DIR`";
-    /// a test passes an explicit directory so it never mutates process-global env.
+    /// The prompt-override directory. The live arm passes the RESOLVED
+    /// `$PULSE_PROMPT_DIR` ([`prompt_override_dir`]); a test passes an explicit
+    /// directory so it never mutates process-global env. `None` means "no overlay
+    /// — use the compiled-in default", which is what keeps the offline tests
+    /// hermetic against a developer's exported `$PULSE_PROMPT_DIR`.
     pub prompt_dir: Option<PathBuf>,
     /// Override the per-turn wall-clock guard (audit C5). `None` = the default.
     pub turn_timeout: Option<Duration>,
@@ -108,9 +111,11 @@ pub struct CoachCliOutcome {
 /// # Errors
 ///
 /// Returns an error when the run or its version is absent, when the prompt overlay
-/// exists but cannot be read, when the provider transport fails (the turn never
-/// happened — ADR-0017 preserves it here at the edge), or when the session cannot
-/// be recorded.
+/// exists but cannot be read, when this process faults on the provider call path
+/// (an unpriced model, a failed ledger write — the turn never happened and nothing
+/// is recorded), or when the session cannot be recorded. A provider TRANSPORT
+/// fault is not an error here: it is a recorded `TransportFailure` session, which
+/// the live arm below then exits non-zero on (recorded AND loud, ADR-0017).
 pub async fn run_coach_with<P, L, B, S, K, C>(
     wiring: CoachWiring<P, L, C>,
     run_repo: &B,
@@ -245,9 +250,17 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
             backend: LlmBackend::Ollama,
             model,
             temperature: 0.0,
-            max_tokens: 2_048,
+            // The shared reasoning-model cap, not a second private guess at it
+            // (#124): GLM spends thinking tokens against this budget BEFORE the
+            // tool call, so a tight cap produces a turn with no tool call — which
+            // this taxonomy records as `ZeroCalls`, indistinguishable from a model
+            // that genuinely declined to propose.
+            max_tokens: super::llm::REASONING_MAX_TOKENS,
         },
-        prompt_dir: None,
+        // The live arm honours the operator's `$PULSE_PROMPT_DIR/coach.md` overlay
+        // — the whole point of the resolved-bytes prompt version (audit C2) is that
+        // an overlay edit changes what the coach says AND what the ledger records.
+        prompt_dir: crate::agent::config::prompt_override_dir(),
         turn_timeout: None,
         max_dsl_bytes: None,
         captured,
@@ -300,7 +313,7 @@ fn print_outcome(outcome: &CoachCliOutcome) {
     println!("prompt_version: {}", outcome.prompt_version);
     match outcome.session.llm_call_id.as_ref() {
         Some(id) => println!("llm_call:       {}", id.as_str()),
-        None => println!("llm_call:       (none — the turn failed before any provider call)"),
+        None => println!("llm_call:       (none — {})", no_ledger_reason(outcome)),
     }
     match &outcome.session.outcome {
         SessionOutcome::Proposed { proposal } => {
@@ -316,5 +329,25 @@ fn print_outcome(outcome: &CoachCliOutcome) {
             println!("\nRECORDED FAILURE");
             println!("  {failure}");
         }
+    }
+}
+
+/// Why a session names no ledger row.
+///
+/// A missing `llm_call_id` used to print "the turn failed before any provider
+/// call" unconditionally, which is FALSE for the two failures that reach the
+/// provider and come back with nothing to bill — a transport fault and a timeout
+/// (PR #128, finding 5). The operator reading this line is deciding whether a
+/// billed call happened; the answer has to come from the recorded failure, not
+/// from the NULL alone.
+fn no_ledger_reason(outcome: &CoachCliOutcome) -> &'static str {
+    match &outcome.session.outcome {
+        SessionOutcome::Failed {
+            failure: CoachFailure::TransportFailure { .. },
+        } => "the call was attempted and produced no usable exchange",
+        SessionOutcome::Failed {
+            failure: CoachFailure::ProviderTimeout { .. },
+        } => "the call was attempted and did not answer inside the turn's budget",
+        _ => "the turn failed before any provider call",
     }
 }

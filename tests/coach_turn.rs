@@ -320,7 +320,7 @@ async fn the_prompt_overlay_changes_the_recorded_prompt_version() {
     let overlay = "You are a coach. This is the private overlay prompt.\n";
     std::fs::write(overlay_dir.path().join("coach.md"), overlay).expect("write overlay");
 
-    let (outcome, _seen) = coach_once(
+    let (outcome, seen) = coach_once(
         &db,
         &run_id,
         vec![propose_call(
@@ -357,9 +357,22 @@ async fn the_prompt_overlay_changes_the_recorded_prompt_version() {
         .expect("row present");
     assert_eq!(call.prompt_version.as_deref(), Some(expected.as_str()));
 
-    // The overlay text really is the system prompt the model saw.
-    let seen_overlay = outcome.prompt_version == expected;
-    assert!(seen_overlay, "the resolved overlay drove the turn");
+    // The overlay text really is the system prompt the model saw. Re-comparing the
+    // hash to itself would prove only that the same expression equals itself; the
+    // property is that the RESOLVED bytes reached the provider, so read them off
+    // the captured message.
+    let seen = seen.lock().expect("seen lock");
+    let system = seen
+        .first()
+        .and_then(|messages| messages.first())
+        .expect("the turn sent a system message");
+    match system {
+        Message::System { content } => assert!(
+            content.contains("This is the private overlay prompt."),
+            "the overlay's text is what framed the turn, got: {content}"
+        ),
+        other => panic!("the first message must be the system prompt, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -395,6 +408,23 @@ async fn an_empty_overlay_dir_falls_back_to_the_compiled_in_default() {
         "exactly a system prompt and the bounded context: {:?}",
         seen[0]
     );
+
+    // The DSL is a stored document carrying user-supplied text (its `name`), so it
+    // travels fenced as inert data — the composer's `frame_target` precedent
+    // (`PROMPT_GOVERNANCE` §7).
+    match &seen[0][1] {
+        Message::User { content } => {
+            assert!(
+                content.contains("<untrusted_dsl>") && content.contains("</untrusted_dsl>"),
+                "the rendered DSL must be fenced as inert data: {content}"
+            );
+            assert!(
+                content.contains("inert data"),
+                "the fence must be declared, not just drawn: {content}"
+            );
+        }
+        other => panic!("the second message must be the bounded context, got {other:?}"),
+    }
 
     // A Threshold-typed mutation applies just as a Period one does.
     match &outcome.session.outcome {

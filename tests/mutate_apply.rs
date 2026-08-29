@@ -158,6 +158,50 @@ fn a_decimal_leaf_takes_a_threshold_value() {
     }
 }
 
+#[test]
+fn a_threshold_is_a_decimal_string_on_the_wire_and_a_bare_float_is_refused() {
+    // NFR-2: the DSL admits decimal STRINGS only, and `ParamValue` is the shape
+    // the `propose_mutation` tool schema promises ("a decimal STRING, never a
+    // float"). `rust_decimal`'s default Deserialize would also accept a bare JSON
+    // float, which is the f64 ingress path closed everywhere else — a threshold
+    // that arrives as binary 0.03 is not the number that was proposed, and it is
+    // not reproducible.
+    let as_string = serde_json::to_value(ParamValue::Threshold {
+        value: Decimal::new(3, 2),
+    })
+    .expect("serialize a threshold");
+    assert_eq!(
+        as_string,
+        serde_json::json!({ "type": "Threshold", "value": "0.03" }),
+        "a threshold serializes as a decimal string"
+    );
+
+    let round_trip: ParamValue = serde_json::from_value(as_string).expect("the string parses");
+    assert_eq!(
+        round_trip,
+        ParamValue::Threshold {
+            value: Decimal::new(3, 2)
+        }
+    );
+
+    let bare_float: Result<ParamValue, _> =
+        serde_json::from_value(serde_json::json!({ "type": "Threshold", "value": 0.03 }));
+    assert!(
+        bare_float.is_err(),
+        "a bare JSON float must be refused, got {bare_float:?}"
+    );
+
+    // And an argument the shape does not declare is refused too (PR #93's rule):
+    // silently ignoring it is how a misunderstanding becomes a wrong mutation.
+    let unknown: Result<ParamValue, _> = serde_json::from_value(
+        serde_json::json!({ "type": "Period", "value": 21, "unit": "bars" }),
+    );
+    assert!(
+        unknown.is_err(),
+        "an unrecognized field must be refused, got {unknown:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Every MutationError variant
 // ---------------------------------------------------------------------------

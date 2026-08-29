@@ -146,11 +146,23 @@ fn a_session_carries_a_proposal_or_a_failure() {
 // 2. Every failure variant constructs and reads back as a reason
 // ---------------------------------------------------------------------------
 
-#[test]
-fn every_failure_variant_displays_with_its_context() {
-    let cases: Vec<(CoachFailure, &str)> = vec![
+/// One instance of every [`CoachFailure`] variant, paired with the context its
+/// `Display` must carry.
+///
+/// The `match` below is EXHAUSTIVE and has no `_` arm on purpose: an eighth
+/// failure kind stops this file compiling until someone writes down what that
+/// kind reads back as. A `vec![...]` alone cannot do that — it would just quietly
+/// cover six of seven, which is how `TransportFailure` shipped untested here.
+fn every_failure_case() -> Vec<(CoachFailure, &'static str)> {
+    let cases = vec![
         (CoachFailure::ZeroCalls, "no"),
-        (CoachFailure::SeveralCalls { count: 3 }, "3"),
+        (
+            CoachFailure::SeveralCalls {
+                count: 3,
+                propose_mutation_count: 2,
+            },
+            "3",
+        ),
         (
             CoachFailure::MalformedArguments {
                 detail: "`path` was not a string".to_owned(),
@@ -174,9 +186,44 @@ fn every_failure_variant_displays_with_its_context() {
             },
             "42kB of DSL",
         ),
+        (
+            CoachFailure::TransportFailure {
+                detail: "HTTP 503 from upstream".to_owned(),
+            },
+            "503",
+        ),
     ];
 
-    for (failure, needle) in cases {
+    // The completeness gate: every variant must appear at least once, and the
+    // exhaustive match is what makes "every variant" a compile-time list.
+    let mut seen: Vec<&'static str> = cases.iter().map(|(f, _)| variant_tag(f)).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        7,
+        "every CoachFailure variant must be exercised, got {seen:?}"
+    );
+    cases
+}
+
+/// The variant tag, by exhaustive match — no `_` arm, so an added variant is a
+/// compile error here and in [`every_failure_case`]'s count.
+fn variant_tag(failure: &CoachFailure) -> &'static str {
+    match failure {
+        CoachFailure::ZeroCalls => "zero_calls",
+        CoachFailure::SeveralCalls { .. } => "several_calls",
+        CoachFailure::MalformedArguments { .. } => "malformed_arguments",
+        CoachFailure::InapplicableMutation { .. } => "inapplicable_mutation",
+        CoachFailure::ProviderTimeout { .. } => "provider_timeout",
+        CoachFailure::ContextOverflow { .. } => "context_overflow",
+        CoachFailure::TransportFailure { .. } => "transport_failure",
+    }
+}
+
+#[test]
+fn every_failure_variant_displays_with_its_context() {
+    for (failure, needle) in every_failure_case() {
         let rendered = failure.to_string();
         assert!(
             rendered.contains(needle),
@@ -187,6 +234,32 @@ fn every_failure_variant_displays_with_its_context() {
             "no failure may read back as silence"
         );
     }
+}
+
+#[test]
+fn several_calls_does_not_claim_a_foreign_call_was_a_proposal() {
+    let two_proposals = CoachFailure::SeveralCalls {
+        count: 2,
+        propose_mutation_count: 2,
+    };
+    let one_foreign = CoachFailure::SeveralCalls {
+        count: 2,
+        propose_mutation_count: 1,
+    };
+
+    assert!(
+        one_foreign
+            .to_string()
+            .contains("1 of them propose_mutation"),
+        "a turn that made one propose_mutation call plus one foreign call must not \
+         read back as two proposals: {one_foreign}"
+    );
+    assert_ne!(
+        two_proposals.to_string(),
+        one_foreign.to_string(),
+        "two proposals and one-plus-a-foreign-tool are different mistakes and must \
+         read back differently"
+    );
 }
 
 #[test]

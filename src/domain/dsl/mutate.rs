@@ -80,8 +80,16 @@ impl fmt::Display for ParamKind {
 /// Internally-tagged with **struct variants only** — the DSL-wide serde invariant
 /// (`dsl/mod.rs`): serde cannot serialize an internally-tagged tuple/newtype
 /// variant.
+///
+/// **`Threshold` is a decimal STRING on the wire, in both directions** (NFR-2,
+/// `tools.rs`'s `serde(with = "…str")` convention). `rust_decimal`'s default
+/// `Deserialize` also accepts a bare JSON float, which would reopen the f64
+/// ingress path the DSL closes everywhere else — and the `propose_mutation` tool
+/// schema promises `"a decimal STRING (e.g. \"0.03\"), never a float"`, so a
+/// model that sends `0.03` must get one clean `MalformedArguments` rather than a
+/// silently binary-rounded threshold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ParamValue {
     /// A period / bar-count value for a `SweepableValue<u32>` leaf.
     Period {
@@ -91,7 +99,8 @@ pub enum ParamValue {
     /// A threshold / distance / fraction value for a `SweepableValue<Decimal>`
     /// leaf.
     Threshold {
-        /// The new threshold.
+        /// The new threshold — a decimal string (`"0.03"`), never a bare float.
+        #[serde(with = "rust_decimal::serde::str")]
         value: Decimal,
     },
 }

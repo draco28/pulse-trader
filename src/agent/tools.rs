@@ -1105,7 +1105,13 @@ pub(crate) const PROPOSE_MUTATION_TOOL: &str = "propose_mutation";
 ///
 /// `hypothesis` is a plain `String` here and is validated into the domain's
 /// non-empty `Hypothesis` by the caller — an empty one is `MalformedArguments`.
+///
+/// `deny_unknown_fields` (PR #93 review, the rule every other tool-arg struct in
+/// this file follows): an unrecognized argument is a misunderstanding of the tool,
+/// and accepting it silently is how a model's `"value_pct"` typo becomes a
+/// proposal that mutates something other than what it described.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProposeMutationArgs {
     /// The `validate.rs` dotted/indexed locator of the leaf to retune.
     pub(crate) path: String,

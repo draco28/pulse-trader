@@ -217,6 +217,18 @@ pub enum LlmError {
     /// up, or an unknown model in the [`PriceTable`]).
     #[error("llm config error: {0}")]
     Config(String),
+    /// A fault raised on the call path by THIS process rather than by the provider
+    /// — the ledger write failing, a clock out of range.
+    ///
+    /// Separated from [`LlmError::Provider`] because a caller that RECORDS a
+    /// provider fault as a domain outcome must not record a local one the same way
+    /// (r1.s2 PR #128, finding 5): the coach's
+    /// [`TransportFailure`](crate::domain::CoachFailure::TransportFailure) audit
+    /// row says "the coach's provider call failed", and writing that for our own
+    /// failed ledger insert puts a false reason in the one record the operator has
+    /// to trust.
+    #[error("llm local error: {0}")]
+    Local(String),
 }
 
 /// The per-model price (README C5), expressed per 1,000,000 tokens in the owning

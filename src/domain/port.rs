@@ -501,12 +501,28 @@ pub trait CoachingRepository {
     /// Dormant in `r1.s2`: `w2` writes only the `Proposed` state, and `r1.s4`'s
     /// rail is what drives the rest.
     ///
+    /// **It settles a proposal; it does not edit one.** The two writable targets
+    /// are [`Disposition::Accepted`] and [`Disposition::Rejected`], and the write
+    /// is CONDITIONAL on the proposal still being open (`proposed` or `modified`) —
+    /// the state machine in [`Proposal::transition`](crate::domain::Proposal)
+    /// enforced where the row actually changes, so a settled proposal cannot be
+    /// re-pointed at a second child version. Replaying the IDENTICAL write is a
+    /// no-op (the session id is the accept idempotency key); replaying an accept
+    /// with a different child version is an error.
+    ///
+    /// [`Disposition::Modified`] is refused here on purpose: a modify replaces the
+    /// proposal's stored mutation, and this operation writes only the disposition
+    /// columns — recording it would leave a row that says "edited" while carrying
+    /// the un-edited mutation.
+    ///
     /// # Errors
     ///
     /// Returns [`DataError::Db`] when the session has no proposal to disposition
-    /// (an absent session, or a turn that failed), or when the store rejects the
-    /// write — including the `0005` `CHECK` that an accepted proposal must name its
-    /// child version and nothing else may.
+    /// (an absent session, or a turn that failed), when the requested transition is
+    /// not legal from the proposal's current state, when the target is
+    /// [`Disposition::Proposed`] or [`Disposition::Modified`], or when the store
+    /// rejects the write — including the `0005` `CHECK` that an accepted proposal
+    /// must name its child version and nothing else may.
     fn record_disposition(
         &self,
         id: &CoachingSessionId,
