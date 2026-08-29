@@ -880,3 +880,30 @@ fn a_fifo_at_a_searched_location_is_a_miss_rather_than_a_hang() {
         CredentialStatus::AppDataDir
     );
 }
+
+/// The "no credential" message names the real environment variable, not the Rust
+/// const that holds its name.
+///
+/// A reviewer read `write!(message, "... ${PULSE_CONFIG_DIR_ENV} ...")` as having no
+/// format arguments and concluded the literal identifier `PULSE_CONFIG_DIR_ENV`
+/// reached the user, who would then export the wrong variable and go in circles.
+/// It does not — that is an inline format capture and it renders the const's VALUE.
+/// This test is the standing proof, so the next reader does not have to re-derive it
+/// and nobody "fixes" the capture away.
+#[test]
+fn the_missing_credential_message_names_the_real_environment_variable() {
+    // No config dir configured, so the message appends the overlay note.
+    let search = CredentialSearch::empty();
+    let message = resolve_llm_api_key_in(&search)
+        .expect_err("an empty search resolves nothing")
+        .to_string();
+
+    assert!(
+        message.contains("${PULSE_CONFIG_DIR}"),
+        "the note must name the variable a user can actually export: {message}"
+    );
+    assert!(
+        !message.contains("PULSE_CONFIG_DIR_ENV"),
+        "the Rust const's NAME must never reach the user: {message}"
+    );
+}

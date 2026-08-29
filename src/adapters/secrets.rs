@@ -319,8 +319,9 @@ pub(crate) fn resolve_llm_api_key() -> Result<ApiKey, LlmError> {
 /// needs to say. The *reason* belongs in the resolver's error, which the operator
 /// sees when they actually try to run.
 ///
-/// Performs no LLM request and touches no network: it reads at most three small
-/// files, so it is safe to call on a UI paint.
+/// Performs no LLM request and touches no network: it reads at most four small
+/// files (the overlay, working, manifest and app-data `.env`s), each opened
+/// non-blocking, so it is safe to call on a UI paint.
 #[must_use]
 pub fn llm_credential_status_in(search: &CredentialSearch) -> CredentialStatus {
     resolve_llm_api_key_in(search).map_or(CredentialStatus::None, |key| {
@@ -519,7 +520,11 @@ fn missing_credential_message(search: &CredentialSearch) -> String {
     if search.config_dir.is_none() {
         let _ = write!(
             message,
-            "\n  (${PULSE_CONFIG_DIR_ENV} is not set, so no overlay location was searched)"
+            // `{PULSE_CONFIG_DIR_ENV}` is an INLINE format capture, so this renders
+            // the const's VALUE (`PULSE_CONFIG_DIR`), not its Rust name. The extra
+            // brace pair matches the `${PULSE_CONFIG_DIR}` label the numbered list
+            // above uses, so the message names the variable one way throughout.
+            "\n  (${{{PULSE_CONFIG_DIR_ENV}}} is not set, so no overlay location was searched)"
         );
     }
     message.push_str(
