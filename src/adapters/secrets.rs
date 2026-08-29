@@ -20,7 +20,9 @@
 //! as a ctor arg — the key
 //! never lives in a committed config file, an env var baked into the binary, or
 //! plaintext on disk (NFR-5). A **missing** entry returns a clear
-//! [`LlmError::Config`] pointing at `pulse setup-keys`, NEVER a panic. Like the
+//! [`LlmError::Config`] saying plainly that seeding this path is not yet
+//! supported, NEVER a panic (and never naming `pulse setup-keys`, a verb that
+//! does not exist — see `read_secret`). Like the
 //! resolver below, it returns an opaque [`ApiKey`](crate::domain::ApiKey) tagged
 //! [`CredentialSource::Keychain`](crate::domain::CredentialSource::Keychain) —
 //! the audit-trail control, so a `pulse llm-check` ledger row records where its
@@ -83,8 +85,8 @@ const GLM_API_KEY_ACCOUNT: &str = "glm_api_key";
 /// # Errors
 ///
 /// Returns [`LlmError::Config`] when the Keychain entry is absent or the platform
-/// store cannot be reached (e.g. the key was never seeded) — with a message
-/// pointing the operator at `pulse setup-keys`. Never panics.
+/// store cannot be reached (e.g. the key was never seeded) — with a message that
+/// says so plainly rather than naming an unbuilt provisioning verb. Never panics.
 pub fn glm_api_key() -> Result<ApiKey, LlmError> {
     read_secret(KEYCHAIN_SERVICE, GLM_API_KEY_ACCOUNT)
         .map(|value| ApiKey::new(value, CredentialSource::Keychain))
@@ -565,15 +567,27 @@ fn parse_dotenv(text: &str, var: &str) -> Option<String> {
 /// Parameterized on `service` / `account` so a test can target a
 /// guaranteed-absent name (the real `PulseTrader/glm_api_key` is seeded on the
 /// owner's machine, so it can NOT stand in for the missing-entry path).
+///
+/// **Neither message names `pulse setup-keys`**, for the same reason
+/// [`missing_credential_message`] does not: that verb does not exist and is not
+/// being built (the orphaned pointer `ADOPTION.md` §C2 records as a current-cut
+/// gap). Sending an operator to a command that answers "unrecognized" is worse
+/// than telling them plainly that this path cannot be provisioned yet — and these
+/// two functions are the only two credential-failure messages on this surface, so
+/// them disagreeing is a contradiction a user would hit in one sitting.
 fn read_secret(service: &str, account: &str) -> Result<String, LlmError> {
     let entry = Entry::new(service, account).map_err(|error| {
         LlmError::Config(format!(
-            "could not open the macOS Keychain entry {service}/{account}: {error} — run `pulse setup-keys`"
+            "could not open the macOS Keychain entry {service}/{account}: {error}. \
+             Seeding a Keychain credential from inside the app is not yet supported."
         ))
     })?;
     entry.get_password().map_err(|error| {
         LlmError::Config(format!(
-            "no GLM API key found in the macOS Keychain ({service}/{account}): {error} — run `pulse setup-keys`"
+            "no GLM API key found in the macOS Keychain ({service}/{account}): {error}. \
+             Seeding a Keychain credential from inside the app is not yet supported; \
+             the composer reads a `.env` credential instead — see the resolver's own \
+             message for the locations it searches."
         ))
     })
 }
@@ -590,7 +604,8 @@ mod tests {
         // key), so this test targets a DISTINCT, guaranteed-absent account. A
         // missing item resolves to `NoEntry` immediately with NO Keychain prompt
         // (there is no ACL to authorize on a nonexistent item). The accessor must
-        // surface a clear `Config` error pointing at `pulse setup-keys`, not panic.
+        // surface a clear `Config` error, not panic — and must NOT point at
+        // `pulse setup-keys`, a verb that does not exist (ADOPTION.md §C2).
         let err = read_secret(
             "PulseTrader",
             "glm_api_key_test_missing_9f3c1a7e_never_seed",
@@ -601,8 +616,14 @@ mod tests {
             "missing key must be a Config error, got {err:?}"
         );
         assert!(
-            err.to_string().contains("setup-keys"),
-            "config error should point at `pulse setup-keys`, got: {err}"
+            !err.to_string().contains("setup-keys"),
+            "the message must not send the operator to a command that does not \
+             exist, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("not yet supported"),
+            "the message must say plainly that this path cannot be provisioned \
+             yet, got: {err}"
         );
     }
 

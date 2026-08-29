@@ -295,7 +295,8 @@ where
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] on an absent db, a missing/unreadable Keychain key
-/// (pointing at `pulse setup-keys`), a provider/transport failure, or a ledger
+/// (whose message says seeding is not yet supported), a provider/transport
+/// failure, or a ledger
 /// persist failure — every path a clear message + non-zero exit, never a panic.
 pub async fn run_llm_check(db: Option<&Db>, args: &LlmArgs) -> anyhow::Result<()> {
     let db = db.ok_or_else(|| anyhow::anyhow!("internal: llm-check requires an open db"))?;
