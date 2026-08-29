@@ -77,7 +77,16 @@ through VS-1.3.3 (coach) as well. Re-open only if the coach's cross-session memo
 (a `pulsehive-db`-substrate feature) is judged worth the active-use cost at coach-design
 time (aligns with MASTER-SPEC's v2+ PulseDB coach-memory staging).
 
-**Concrete v1 backend (provider pivot, 2026-07-10):** the first backend behind this port
+**Concrete v1 backend (provider pivot, 2026-07-10)** — *superseded by
+[ADR-0023](0023-default-llm-provider-zai-glm-5-3.md) (2026-08-29). This paragraph, and
+only this paragraph, is out of date: the default is now z.ai `glm-5.3` over the very
+coding endpoint it rejects below, the Ollama Cloud subscription is dropped, and
+`https://ollama.com/v1` answers HTTP 402. ADR-0023 restates the licensing tradeoff
+weighed here, accepts it consciously for a single-operator v1, and records the
+distribution constraint that acceptance creates. Everything else in this ADR — the thin
+tools-carrying port, the deferral of `HiveMind`/`Lens`/`pulsehive-db` — still holds.*
+
+The first backend behind this port
 is **Ollama Cloud** (`https://ollama.com/v1`, OpenAI-compatible, `gpt-oss:120b`), consumed
 via `pulsehive_openai::OpenAICompatibleProvider` — NOT the GLM/Z.AI coding-plan endpoint
 (that endpoint is licensed for personal coding-agent use only; Ollama Cloud is a
