@@ -143,13 +143,17 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
         // `cwd-dotenv` / `app-data-dir`), or NULL when the caller recorded none.
         // Never the key — `CredentialSource` cannot hold a value to leak.
         let key_source = call.key_source.as_ref().map(enum_token).transpose()?;
+        // r1.s2.w2: the resolved-prompt content hash (audit C2), or NULL when the
+        // caller records none — composer rows stay NULL. A LABEL, never prompt text.
+        let prompt_version = call.prompt_version.clone();
         let schema_version = LLM_CALL_SCHEMA_VERSION;
 
         sqlx::query!(
             "INSERT INTO llm_call \
              (id, backend, model, prompt_messages, completion, input_tokens, output_tokens, \
-              cost, cost_currency, created_at, created_by, schema_version, key_source) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              cost, cost_currency, created_at, created_by, schema_version, key_source, \
+              prompt_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             id,
             backend,
             model,
@@ -163,6 +167,7 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
             created_by,
             schema_version,
             key_source,
+            prompt_version,
         )
         .execute(&self.pool)
         .await
@@ -187,7 +192,8 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
                  created_at       AS "created_at!: String",
                  created_by       AS "created_by!: String",
                  schema_version   AS "schema_version!: i64",
-                 key_source       AS "key_source?: String"
+                 key_source       AS "key_source?: String",
+                 prompt_version   AS "prompt_version?: String"
                FROM llm_call WHERE id = ?1"#,
             id_str,
         )
@@ -249,6 +255,10 @@ impl<C: Clock + Send + Sync> LlmCallRepository for SqliteLlmCallRepo<C> {
             created_at,
             created_by,
             key_source,
+            // A NULL `prompt_version` is a row written before migration `0005`, or
+            // one whose caller recorded none — `None`, not an error. It is an
+            // opaque content hash, so there is no vocabulary to fail closed on.
+            prompt_version: r.prompt_version,
         }))
     }
 }
@@ -305,6 +315,9 @@ mod tests {
             created_at: DateTime::from_timestamp_millis(now_ms).expect("clock in range"),
             created_by: CreatedBy::ComposerLlm,
             key_source: Some(CredentialSource::Env),
+            // r1.s2.w2: composer rows record no prompt version (audit C2 — the
+            // hash is the coach turn's, and `w3` computes it).
+            prompt_version: None,
         }
     }
 

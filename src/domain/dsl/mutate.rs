@@ -52,7 +52,12 @@ use super::value::{IndicatorSpec, ValueSource};
 /// periods and bar counts are [`ParamKind::Period`] (`u32`); thresholds, stop
 /// distances, R-multiples and risk fractions are [`ParamKind::Threshold`]
 /// (`Decimal`). No `f64` anywhere (NFR-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde-serializable (r1.s2.w2): it rides inside
+/// [`MutationError::TypeMismatch`], which a coaching session persists verbatim as
+/// a recorded failure reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParamKind {
     /// A `SweepableValue<u32>` leaf — an indicator period or a bar count.
     Period,
@@ -124,7 +129,14 @@ pub enum Mutation {
 /// Each variant carries the path it failed on plus its cause, so the whole error
 /// can be persisted verbatim as a coaching session's recorded failure reason
 /// (`r1.s2.w2`/`w3`) rather than collapsing into "something went wrong".
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+///
+/// **Serde-serializable (r1.s2.w2).** `CoachFailure::InapplicableMutation` carries
+/// this error verbatim and a coaching session persists it, so the typed reason
+/// survives into the record and back out of it rather than being flattened to a
+/// `Display` string. Internally tagged with struct variants only — the DSL-wide
+/// serde invariant (`dsl/mod.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum MutationError {
     /// The path addresses no sweepable numeric leaf of this strategy — a typo, a
     /// structural node (`entry`, `exits[0]`), a non-parameter field (`name`), or

@@ -337,6 +337,10 @@ where
             created_at,
             created_by: self.created_by,
             key_source: self.key_source,
+            // r1.s2.w2: this decorator serves the composer, whose ledger rows record
+            // no prompt version (audit C2). `w3` supplies the resolved-prompt content
+            // hash on the coach's own calls.
+            prompt_version: None,
         };
 
         self.repo

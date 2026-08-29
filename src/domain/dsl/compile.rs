@@ -72,7 +72,13 @@ use super::value::{IndicatorSpec, PriceField, ValueSource};
 /// document only ever carries `Fixed` leaves. The variant exists so Fixed
 /// extraction stays panic-free under the crate's `unwrap_used`/`expect_used`
 /// lints.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Serde-serializable (r1.s2.w2): it rides inside
+/// [`MutationError::CompileFailed`](super::mutate::MutationError::CompileFailed),
+/// which a coaching session persists verbatim as a recorded failure reason.
+/// Internally tagged with a struct variant — the DSL-wide serde invariant.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum CompileError {
     /// A [`SweepableValue::Sweep`] was encountered in a validated document.
     /// Unreachable in v1 — validation rejects sweeps — but represented so

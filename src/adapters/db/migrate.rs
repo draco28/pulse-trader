@@ -802,7 +802,7 @@ mod reserved_number_tests {
     use super::{MigrationOutcome, applied_max_version, run_migrations_with_backup_using};
     use crate::adapters::db::Db;
     use sqlx::migrate::Migrator;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     /// Copy the shipped `migrations/` set into `dir`.
@@ -811,6 +811,38 @@ mod reserved_number_tests {
         for entry in std::fs::read_dir(&shipped).unwrap() {
             let path = entry.unwrap().path();
             std::fs::copy(&path, dir.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+
+    /// Move the real `0005_*` files OUT of `dir` (into a sibling holding pen),
+    /// leaving the set as it stood while `0005` was a reserved gap. Returns the
+    /// holding pen for [`restore_0005`].
+    fn withhold_0005(dir: &Path) -> PathBuf {
+        let pen = dir.with_extension("withheld");
+        std::fs::create_dir_all(&pen).unwrap();
+        let mut moved = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with("0005_") {
+                std::fs::rename(&path, pen.join(&name)).unwrap();
+                moved += 1;
+            }
+        }
+        assert_eq!(
+            moved, 2,
+            "expected the real 0005 up+down pair to withhold, moved {moved}"
+        );
+        pen
+    }
+
+    /// Put the withheld `0005_*` files back — the binary that ships the reserved
+    /// migration opening the same database.
+    fn restore_0005(dir: &Path, pen: &Path) {
+        for entry in std::fs::read_dir(pen).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::rename(&path, dir.join(&name)).unwrap();
         }
     }
 
@@ -856,6 +888,14 @@ mod reserved_number_tests {
     /// `0005` would have been silently skipped while startup reported success —
     /// schema divergence on a real installation, reached by a different route than
     /// the one first claimed. The gate compares version SETS now.
+    ///
+    /// **r1.s2.w2:** this used to write a SYNTHETIC `0005_reserved_spine_r1s2`
+    /// probe into the copied set. `r1.s2` has since shipped the real
+    /// `0005_coaching`, so a synthetic 0005 would collide with it — and picking
+    /// another free low number would only move the collision to whichever spine
+    /// ships next. The test now withholds and then restores the REAL `0005`
+    /// instead, which cannot collide with anything and exercises the shipped
+    /// migration rather than a stand-in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_later_lower_numbered_migration_applies_through_the_startup_path() {
         let tmp = TempDir::new().unwrap();
@@ -863,12 +903,16 @@ mod reserved_number_tests {
         std::fs::create_dir_all(&dir).unwrap();
         copy_shipped_set(&dir);
 
-        let db_path = tmp.path().join("pulse.db");
-        let shipped = Migrator::new(dir.as_path()).await.unwrap();
+        // The "older binary": the shipped set as it stood while `0005` was still a
+        // reserved gap and `0007` had already shipped. Withhold the real 0005.
+        let withheld = withhold_0005(&dir);
 
-        let first = run_migrations_with_backup_using(&db_path, &shipped)
+        let db_path = tmp.path().join("pulse.db");
+        let older = Migrator::new(dir.as_path()).await.unwrap();
+
+        let first = run_migrations_with_backup_using(&db_path, &older)
             .await
-            .expect("the shipped set applies");
+            .expect("the older set applies");
         assert!(matches!(first, MigrationOutcome::Migrated { .. }));
         {
             let db = Db::with_path(&db_path).await.unwrap();
@@ -876,7 +920,7 @@ mod reserved_number_tests {
         }
 
         // An unchanged set is still a genuine no-op — the short-circuit must survive.
-        let again = run_migrations_with_backup_using(&db_path, &shipped)
+        let again = run_migrations_with_backup_using(&db_path, &older)
             .await
             .expect("re-running an unchanged set is current");
         assert!(
@@ -886,7 +930,7 @@ mod reserved_number_tests {
 
         // r1.s2 lands its reserved 0005 — BELOW the database's current maximum, so
         // the max is unchanged and a max-based gate would call this current.
-        write_probe(&dir, "0005_reserved_spine_r1s2", "reserved_0005_probe");
+        restore_0005(&dir, &withheld);
         let gapped = Migrator::new(dir.as_path()).await.unwrap();
 
         let filled = run_migrations_with_backup_using(&db_path, &gapped)
@@ -899,7 +943,7 @@ mod reserved_number_tests {
 
         let db = Db::with_path(&db_path).await.unwrap();
         assert!(
-            table_present(&db, "reserved_0005_probe").await,
+            table_present(&db, "coaching_sessions").await,
             "0005 was applied out of numeric order, as the reserved-number scheme needs"
         );
         assert_eq!(
