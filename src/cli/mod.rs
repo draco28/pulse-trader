@@ -61,7 +61,7 @@ pub enum Command {
     Backtest(BacktestArgs),
     /// List / show persisted backtest runs (FR-6 read verb, VS-1.2.4 work-4.05).
     Runs(RunsArgs),
-    /// Round-trip a GLM 5.2 chat through `PulseHive` + log a redacted `LlmCall`
+    /// Round-trip a GLM chat through `PulseHive` + log a redacted `LlmCall`
     /// (the VS-1.3.1 composition-root demo, FR-23/FR-24/NFR-6).
     LlmCheck(LlmArgs),
     /// Compose a natural-language target into a persisted, attributable

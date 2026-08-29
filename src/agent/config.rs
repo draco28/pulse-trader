@@ -123,10 +123,11 @@ struct PricesConfig {
 /// missing `[llm]` table or a missing field yields `None`, and the composition
 /// root falls back to its documented `const` — never an error.
 pub(crate) struct LlmTransport {
-    /// The OpenAI-compatible base URL override (e.g. `https://ollama.com/v1`), or
+    /// The OpenAI-compatible base URL override (e.g.
+    /// `https://api.z.ai/api/coding/paas/v4`), or
     /// `None` to use the provider's `const` default.
     pub(crate) base_url: Option<String>,
-    /// The model id override (e.g. `glm-5.2`), or `None` to use the compose
+    /// The model id override (e.g. `glm-5.3`), or `None` to use the compose
     /// `const` default.
     pub(crate) model: Option<String>,
 }
@@ -367,7 +368,7 @@ mod tests {
     fn load_llm_transport_from_missing_file_uses_the_shipped_default() {
         let dir = tempfile::tempdir().unwrap();
         let transport = load_llm_transport_from(dir.path()).expect("absent file falls back");
-        assert_eq!(transport.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(transport.model.as_deref(), Some("glm-5.3"));
     }
 
     /// Malformed TOML is a clear [`ConfigError::Parse`], never a panic.

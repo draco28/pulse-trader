@@ -4,7 +4,7 @@
 //! OpenAI-compatible transport (ADR-0012 thin transport).
 //!
 //! [`OpenAiCompatProvider`] (generalized from VS-1.3.1's `GlmProvider`, now
-//! pointed at Ollama Cloud) wraps an `OpenAICompatibleProvider` and translates
+//! pointed at Z.AI's coding endpoint) wraps an `OpenAICompatibleProvider` and translates
 //! EVERY `PulseHive` LLM type to/from the PulseTrader-owned domain types, so
 //! `PulseHive`'s evolving 2.x API cannot ripple inward. **This is the ONLY module
 //! in the crate that imports the `PulseHive` SDK crate (AC-9).**
@@ -39,22 +39,28 @@ use crate::domain::{
     LlmConfig, LlmError, LlmProvider, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
 };
 
-/// The DEFAULT Ollama Cloud OpenAI-compatible base URL (provider pivot 2026-07-10 —
-/// spike-verified `/v1` tool-calling). The `const` fallback when the config
+/// The DEFAULT OpenAI-compatible base URL — Z.AI's coding endpoint (provider
+/// default flip 2026-08-29; the prior Ollama Cloud default was unusable, that
+/// subscription is dropped). The `const` fallback when the config
 /// `[llm].base_url` is absent; [`OpenAiCompatProvider::with_base_url`] accepts a
 /// config override (slice-close FIX A).
 ///
+/// The `OLLAMA_` prefix on this and the sibling consts is RETAINED naming debt,
+/// deliberately not renamed with the default flip so it stays one tracked item
+/// alongside the `OLLAMA_API_KEY` credential env var (which the resolver chain
+/// still reads first) — the names say Ollama, the values are Z.AI.
+///
 /// `PulseHive`'s `chat_completions_url()` trims a trailing `/` and appends
-/// `/chat/completions`, yielding `https://ollama.com/v1/chat/completions`.
-const OLLAMA_BASE_URL: &str = "https://ollama.com/v1";
+/// `/chat/completions`, yielding
+/// `https://api.z.ai/api/coding/paas/v4/chat/completions`.
+const OLLAMA_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
-/// The default Ollama Cloud model id — the `OpenAIConfig` fallback carried by the
-/// provider. The per-request model actually flows from [`LlmConfig::model`] (the
-/// composition root resolves it: config `[llm].model` → const), so this is only the
-/// transport-level default. `glm-5.2` is the tested main model (Ollama Cloud,
-/// OpenAI-compat, tool-capable) — slice-close FIX B retired the pre-subscription
-/// `gpt-oss:120b` placeholder.
-const OLLAMA_MODEL_ID: &str = "glm-5.2";
+/// The default model id — the `OpenAIConfig` fallback carried by the provider. The
+/// per-request model actually flows from [`LlmConfig::model`] (the composition root
+/// resolves it: config `[llm].model` → const), so this is only the transport-level
+/// default. `glm-5.3` is the shipped main model (Z.AI coding endpoint,
+/// OpenAI-compat, tool-capable), walked end-to-end on 2026-08-28.
+const OLLAMA_MODEL_ID: &str = "glm-5.3";
 
 /// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
 /// future coach loop forever; an unset/infinite timeout is a v1 reliability gap).
@@ -65,9 +71,9 @@ const OLLAMA_MAX_RETRIES: u32 = 2;
 
 /// The OpenAI-compatible transport adapter — implements `PulseTrader`'s
 /// [`LlmProvider`] port over the `PulseHive` OpenAI-compatible transport (README
-/// C2/C8), pointed at Ollama Cloud.
+/// C2/C8), pointed at Z.AI's coding endpoint.
 ///
-/// Holds a pre-built provider pinned to the Ollama Cloud config; its
+/// Holds a pre-built provider pinned to the default transport config; its
 /// [`chat`](OpenAiCompatProvider::chat) translates domain types (messages, tools,
 /// config, response) across the seam and never touches the network in tests
 /// (translation is exercised by pure unit tests; the live round-trip is a
@@ -87,7 +93,7 @@ impl OpenAiCompatProvider {
     /// which hands back an opaque `ApiKey` the composition root unwraps exactly
     /// once). Use [`with_base_url`](Self::with_base_url) to override the
     /// endpoint from config (slice-close FIX A). The timeout / retry posture is
-    /// pinned to the Ollama Cloud config (README C2/C8, audit ch4).
+    /// pinned to the default transport config (README C2/C8, audit ch4).
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url(api_key, OLLAMA_BASE_URL)
@@ -265,14 +271,14 @@ mod tests {
 
     #[test]
     fn provider_constructs_with_pinned_ollama_config() {
-        // Smoke test: the adapter builds against the pinned Ollama Cloud config with
-        // NO network. The consts are the provider-pivot endpoint + default model id
-        // (README C2/C8); `glm-5.2` is the tested main model (slice-close FIX B).
+        // Smoke test: the adapter builds against the pinned default config with NO
+        // network. The consts are the shipped endpoint + default model id (README
+        // C2/C8); `glm-5.3` on Z.AI's coding endpoint is the shipped main model.
         let _provider = OpenAiCompatProvider::new("test-key");
         // FIX A: the config `[llm].base_url` override ctor also builds (NO network).
         let _override = OpenAiCompatProvider::with_base_url("test-key", "https://example.test/v1");
-        assert_eq!(OLLAMA_BASE_URL, "https://ollama.com/v1");
-        assert_eq!(OLLAMA_MODEL_ID, "glm-5.2");
+        assert_eq!(OLLAMA_BASE_URL, "https://api.z.ai/api/coding/paas/v4");
+        assert_eq!(OLLAMA_MODEL_ID, "glm-5.3");
     }
 
     #[test]

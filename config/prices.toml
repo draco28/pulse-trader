@@ -1,11 +1,15 @@
 # PulseTrader — LLM price table (VS-1.3.2 work-2.03, the "moat in DATA" seam).
 #
-# NOMINAL ledger estimate — NOT a real per-token tariff. Ollama Cloud
-# (https://ollama.com/v1) is a flat-rate / subscription API, so `gpt-oss:120b`
-# has no true per-token price. The figures below are a documented nominal
-# per-Mtok estimate whose ONLY purpose is to populate each persisted `LlmCall`
-# row's cost with a data-tunable (not frozen-in-Rust) number. Real per-token
-# backends (v2) override this file via `$PULSE_CONFIG_DIR/prices.toml`.
+# NOMINAL ledger estimate — NOT the tariff this deployment is billed at. The
+# shipped `[llm]` endpoint below is Z.AI's GLM Coding Plan
+# (https://api.z.ai/api/coding/paas/v4), a flat monthly subscription with a
+# prompt quota, so no per-token charge is levied per call. The `glm-5.3` figures
+# are Z.AI's PUBLISHED per-token rate for the same model on its standard API
+# ($1.40 in / $4.40 out per 1M tokens, https://docs.z.ai/guides/overview/pricing,
+# retrieved 2026-08-29) — a real, sourced number used as the nominal, so each
+# persisted `LlmCall` row's cost is data-tunable (not frozen-in-Rust) and is a
+# defensible estimate of what the same traffic would cost per token. A true
+# per-token backend (v2) overrides this file via `$PULSE_CONFIG_DIR/prices.toml`.
 #
 # Moat discipline (VS-1.3.1 decision 4): price VALUES live HERE, as data —
 # never as a public Rust literal. The loader (`src/agent/config.rs`) carries
@@ -23,13 +27,19 @@ currency = "USD"
 # ADR-0013's one-line model swap). A missing field falls back to the compiled-in
 # `openai_compat.rs` / `compose.rs` const. Change the model or endpoint HERE.
 [llm]
-base_url = "https://ollama.com/v1"
-model = "glm-5.2"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+model = "glm-5.3"
 
 # Per-model nominal prices, per 1,000,000 tokens, in `currency`.
-# glm-5.2 is the tested main model (Ollama Cloud, OpenAI-compat, tool-capable);
-# gpt-oss:120b is retained as a nominal alternate (it returned reproducible
-# HTTP 500s under multi-turn tool-calling at VS-1.3.2 slice-close).
+# glm-5.3 is the SHIPPED main model (Z.AI coding endpoint, OpenAI-compat,
+# tool-capable) — walked end-to-end against this endpoint on 2026-08-28.
+# glm-5.2 (Ollama Cloud) and gpt-oss:120b are retained as nominal alternates for
+# operators who still point `[llm]` at that endpoint; gpt-oss:120b returned
+# reproducible HTTP 500s under multi-turn tool-calling at VS-1.3.2 slice-close.
+[models."glm-5.3"]
+input_per_mtok = "1.40"
+output_per_mtok = "4.40"
+
 [models."glm-5.2"]
 input_per_mtok = "0.60"
 output_per_mtok = "2.20"
