@@ -74,9 +74,9 @@ use super::llm::CapturingRepo;
 /// `src/cli/` only for price VALUE field names. `glm-5.3` on Z.AI's coding endpoint
 /// is the DEVELOPMENT-CYCLE default (OpenAI-compat, tool-capable), walked
 /// end-to-end on 2026-08-28 — current default pending evaluation, not a final
-/// model selection, and not what a distributed build inherits (ADR-0023). The live model is config-driven per ADR-0013
-/// (`config/prices.toml` `[llm].model`); this const is only the documented fallback
-/// (slice-close FIX A).
+/// model selection, and not what a distributed build inherits (ADR-0023). The live
+/// model is config-driven per ADR-0013 (`config/prices.toml` `[llm].model`); this
+/// const is only the documented fallback (slice-close FIX A).
 const COMPOSE_MODEL: &str = "glm-5.3";
 
 /// A conservative sampling temperature for the compose run (wire-level `f32`, never
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_config_targets_the_pinned_ollama_model() {
+    fn compose_config_targets_the_pinned_fallback_model() {
         // No config override → the COMPOSE_MODEL const fallback (FIX A).
         let config = compose_config(None);
         assert_eq!(config.backend, LlmBackend::Ollama);

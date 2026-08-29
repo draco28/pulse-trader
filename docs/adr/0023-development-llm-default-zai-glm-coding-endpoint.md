@@ -61,19 +61,42 @@ Reading this ADR as "PulseTrader ships on the coding plan" is reading it backwar
 ### The licensing consideration, stated plainly
 
 ADR-0013 rejected this endpoint on licensing grounds, and this ADR uses it anyway
-for the development cycle. That is a conscious acceptance of a weighed tradeoff, not
-an oversight, and the terms belong in writing:
+for the development cycle. That is a conscious acceptance of a real risk, not an
+oversight and not a reading under which the risk disappears. The terms belong in
+writing, in the order that matters:
 
-- The GLM Coding Plan is a **flat monthly subscription with a prompt quota**, sold
-  for use inside coding-agent tooling. It is not a per-token programmatic API tier.
-- Through the development cycle, the subscription is the operator's own, the binary
-  runs on the operator's machine, and the credential is the operator's personal one.
-  The exposure ADR-0013 guarded against — a *product* running on a personal-use
-  plan — does not exist while there is exactly one user and that user is the plan
-  holder.
-- **It would exist the moment PulseTrader is distributed**, which is exactly why
-  distribution does not inherit this default. The deployment provider is a separate,
-  already-scheduled choice, not an oversight to be caught later.
+- **The restriction is on the shape of the usage, not on how many people do it.**
+  z.ai's subscription terms and usage policy limit Coding Plan quota to officially
+  supported coding tools — the published list is coding agents and IDE plugins
+  (ZCode, Claude Code, OpenCode, Roo Code and similar) — and prohibit spending that
+  quota by invoking the model API directly from a custom application, bot, website
+  or SaaS product, absent a separate written agreement. Detected use through an
+  unsupported path may have the subscription's benefits restricted or terminated.
+  (`docs.z.ai/legal-agreement/subscription-terms`, and the usage policy alongside
+  it.)
+- **PulseTrader is such a custom application, and this is such a direct call.** The
+  composer opens its own HTTP connection to `/api/coding/paas/v4` through
+  `pulsehive-openai`. It is not a supported coding tool and it is not running inside
+  one. That places this configuration outside the plan's letter **during
+  development**, on the operator's own machine, with the operator's own credential —
+  being the plan holder does not bring it back inside, because the terms do not turn
+  on identity.
+- **The accepted risk is therefore concrete and immediate:** if z.ai detects this
+  usage, it may restrict or terminate the operator's own subscription. Not a
+  hypothetical that starts at distribution — a live exposure for as long as the
+  development default points here. The operator has weighed that against the cost
+  and friction of the alternatives and accepted it for the development cycle.
+- **Distribution is a different and harder line**, and nothing above softens it. A
+  distributed build multiplies this from one operator's own risk into shipping a
+  product that runs on a plan whose terms forbid exactly that. Which is why
+  distribution does not inherit this default: the deployment provider is a separate,
+  already-scheduled choice, and the per-token exit below is what it exists for.
+
+An earlier revision of this ADR argued the exposure "does not exist while there is
+exactly one user and that user is the plan holder." That was wrong on the terms as
+published, and is recorded here as corrected rather than quietly deleted — the
+mistake was reading a usage-shape restriction as a user-count one, which is the kind
+of error an ADR exists to stop the next reader from repeating.
 
 ## Decision
 
@@ -153,11 +176,20 @@ for the most likely deployment provider.
 code change. The seam that makes a provider-specific dev default safe is the same
 seam that makes the later decision cheap.
 
+**(−) The operator's z.ai subscription is at risk for as long as this default
+stands.** This is the cost of the decision, not a footnote to it. The terms permit
+Coding Plan quota to be spent only inside supported coding tools; PulseTrader spends
+it by calling the API directly, so detection may cost the operator the subscription —
+including the capacity that powers their other tooling on the same plan. Accepted
+knowingly, reversible in one config line (deployment candidate 1), and worth
+revisiting at the first sign it is being noticed.
+
 **(−) The deployment provider becomes a required decision before first
 distribution.** It cannot slide past that point: shipping a build pointed at the
-coding endpoint is the thing the licence forbids. Scheduled work rather than a
-discovered blocker — but a hard gate on distribution, recorded here so it is not
-rediscovered at the notarization step.
+coding endpoint takes a risk the operator carries personally and turns it into a
+product that violates the terms for every user it reaches. Scheduled work rather
+than a discovered blocker — but a hard gate on distribution, recorded here so it is
+not rediscovered at the notarization step.
 
 **(−) The model variant is unresolved and is shipping as a default anyway.**
 `glm-5.3` sits in `prices.toml` because something has to, not because it beat
@@ -191,13 +223,17 @@ Tracked as an issue, not blocked on here.
 subscription is being dropped, not renewed. Keeping a default alive purely so an ADR
 need not be rewritten inverts the purpose of the record.
 
-**Use z.ai's per-token API for development too.** Rejected *for now*, and it is the
-strongest alternative — it removes the licensing tension entirely and needs the same
-one-line config change. Not taken because the operator's paid capacity **is** the
-coding plan: routing iteration traffic through the per-token tier would bill twice
-for the same work, on a proof-of-concept whose only user already holds a quota that
-covers it. This is not a rejection of the endpoint, only of using it during
-development — it is deployment candidate 1 above.
+**Use z.ai's per-token API for development too.** Rejected *for now*, and it is by
+some distance the strongest alternative: it is the only option that removes the
+licensing exposure instead of accepting it, and it needs the same one-line config
+change. Not taken because the operator's paid capacity is already committed to the
+coding plan, so routing iteration traffic through the per-token tier means paying
+again, in cash, for work a quota already paid for — even though the terms do not
+permit that quota to be spent this way. That is the trade being made, stated without
+dressing it up: money saved against a subscription the operator could lose. Revisit
+the moment the balance shifts — heavier iteration volume, or any signal that z.ai
+has noticed. This is not a rejection of the endpoint, only of using it during
+development; it is deployment candidate 1 above.
 
 **Decide the deployment provider in this ADR.** Rejected as premature. Both
 candidates are viable and the choice turns on facts not yet in hand: what deployment

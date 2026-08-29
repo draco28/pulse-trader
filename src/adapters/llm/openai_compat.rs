@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_constructs_with_pinned_ollama_config() {
+    fn provider_constructs_with_the_pinned_default_config() {
         // Smoke test: the adapter builds against the pinned default config with NO
         // network. The consts are the shipped endpoint + default model id (README
         // C2/C8); `glm-5.3` on Z.AI's coding endpoint is the dev-cycle default.
