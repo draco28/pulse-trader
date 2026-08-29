@@ -14,7 +14,7 @@
 # the Rust targets means clippy and the tests compile against the REAL bundle
 # rather than build.rs's placeholder.
 
-# The aggregate gate: frontend + Rust + the desktop shell's eight check scripts.
+# The aggregate gate: frontend + Rust + the nine content check scripts.
 check: ui fmt clippy test gates
 
 # --- frontend ---------------------------------------------------------------
@@ -55,9 +55,9 @@ clippy:
 test:
     cargo nextest run
 
-# --- desktop shell gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2) --
+# --- content gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2, r1.s2.w1) --
 
-# The eight content gates for the shell. Each asserts a property that review
+# The nine content gates. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
 # frontend; the window stays 1440x900 non-resizable with no scale-transform; the
@@ -69,9 +69,13 @@ test:
 # content is intact and the ADR-0019 class sweep it requires has landed
 # (r1.s5.w1, AC-2); and the specta/tauri-specta generator workaround
 # (`post_process_bindings`, a post-write transform of `bindings.ts`, or a
-# re-pin to the pre-bump rc.21/rc.22 versions) has not come back (r1.s5, d5).
+# re-pin to the pre-bump rc.21/rc.22 versions) has not come back (r1.s5, d5);
+# and ADR-0021 records the six coach decisions r1.s2's later work items implement
+# against, still `Proposed` (r1.s2.w1, AC-1). NOTE, on the check-adr-0020.sh
+# precedent: r1.s2's close flips ADR-0021 to `Accepted`, and it must update
+# check-adr-0021.sh's Status assertion in the SAME act or this gate reds.
 
-# Run the eight desktop-shell content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround).
+# Run the nine content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround, ADR-0021).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
@@ -80,6 +84,7 @@ gates:
     bash scripts/check-design-system.sh
     bash scripts/check-shell-navigation.sh
     bash scripts/check-adr-0022.sh
+    bash scripts/check-adr-0021.sh
     bash scripts/check-no-specta-workaround.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache

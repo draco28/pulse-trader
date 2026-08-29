@@ -34,6 +34,7 @@ mod compile;
 mod condition;
 mod exit;
 mod migrate;
+mod mutate;
 mod risk;
 mod schema_version;
 mod strategy;
@@ -49,6 +50,11 @@ pub use compile::{
 pub use condition::{Comparator, Condition};
 pub use exit::ExitRule;
 pub use migrate::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
+// r1.s2.w1 (ADR-0021): the one-mutation framework — a typed `Mutation` that
+// applies to a strategy's DSL and is validated by construction.
+pub use mutate::{
+    CandidateDsl, Mutation, MutationError, ParamKind, ParamValue, apply, sweepable_paths,
+};
 pub use risk::{Direction, RiskParams};
 pub use schema_version::{SchemaVersion, SchemaVersionParseError};
 pub use strategy::StrategyDsl;
