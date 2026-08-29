@@ -26,10 +26,11 @@
 // One thing the mock's traffic lights never needed that this file now does: they are
 // wired to real Tauri window APIs (`getCurrentWindow().close()` / `.minimize()`),
 // because `decorations: false` makes this titlebar the window's only chrome -- inert
-// lights would leave the window both unclosable and unmovable (the `.titlebar` and
-// `.title-block` carry `data-tauri-drag-region` for the same reason). The zoom light
-// is rendered `disabled` instead of wired: `tauri.conf.json` sets `resizable: false`,
-// so maximizing a fixed 1440x900 canvas is the same contradiction
+// lights would leave the window both unclosable and unmovable (the `.titlebar` carries
+// `data-tauri-drag-region="deep"` for the same reason -- see the comment at that
+// element for why `deep` and not the plain boolean form). The zoom light is rendered
+// `disabled` instead of wired: `tauri.conf.json` sets `resizable: false`, so
+// maximizing a fixed 1440x900 canvas is the same contradiction
 // `check-window-config.sh` already polices for `fullscreen`/`maximized`.
 
 import { useEffect, useState } from "react";
@@ -441,7 +442,17 @@ export function WindowChrome({ docTitle, children }: WindowChromeProps) {
   const { mode, theme, cycle } = useTheme();
   return (
     <div className="window" data-theme={theme}>
-      <div className="titlebar" data-tauri-drag-region>
+      {/* `deep` (Tauri 2.11+, resolved here at 2.11.5) makes every non-interactive
+          descendant a drag target too, not just the elements literally carrying the
+          attribute -- Tauri's drag handler tests the EVENT TARGET, not its ancestors,
+          so the plain boolean form only dragged from the bare padding of `.titlebar`
+          and `.title-block` themselves, missing the `.title-app`/`.title-doc` spans a
+          user actually clicks on. Interactive descendants (the traffic-light buttons,
+          the theme `icon-btn`) are excluded automatically and stay clickable, so
+          `.title-block` no longer needs its own `data-tauri-drag-region` -- `deep` on
+          this parent already covers it, and a second overlapping declaration would
+          just be one more thing to keep in sync. */}
+      <div className="titlebar" data-tauri-drag-region="deep">
         <div className="traffic">
           <button
             type="button"
@@ -477,7 +488,7 @@ export function WindowChrome({ docTitle, children }: WindowChromeProps) {
             disabled
           />
         </div>
-        <div className="title-block" data-tauri-drag-region>
+        <div className="title-block">
           <span className="title-app">PulseTrader</span>
           {docTitle !== undefined && (
             <>

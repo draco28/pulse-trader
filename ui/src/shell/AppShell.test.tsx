@@ -36,12 +36,12 @@ describe("WindowChrome traffic lights", () => {
     minimizeMock.mockClear();
   });
 
-  it("marks the titlebar (and its title block) as drag regions", () => {
+  it("marks the titlebar a deep drag region, and its title block no longer redundantly", () => {
     const { container } = render(<WindowChrome />);
     const titlebar = container.querySelector(".titlebar");
     const titleBlock = container.querySelector(".title-block");
-    expect(titlebar?.hasAttribute("data-tauri-drag-region")).toBe(true);
-    expect(titleBlock?.hasAttribute("data-tauri-drag-region")).toBe(true);
+    expect(titlebar?.getAttribute("data-tauri-drag-region")).toBe("deep");
+    expect(titleBlock?.hasAttribute("data-tauri-drag-region")).toBe(false);
   });
 
   it("renders close and minimize as real buttons that call the mocked window API", () => {
