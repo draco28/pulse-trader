@@ -367,7 +367,7 @@ mod tests {
     fn load_llm_transport_from_missing_file_uses_the_shipped_default() {
         let dir = tempfile::tempdir().unwrap();
         let transport = load_llm_transport_from(dir.path()).expect("absent file falls back");
-        assert_eq!(transport.model.as_deref(), Some("glm-5.2"));
+        assert_eq!(transport.model.as_deref(), Some("glm-5.3-flash"));
     }
 
     /// Malformed TOML is a clear [`ConfigError::Parse`], never a panic.

@@ -1,8 +1,8 @@
 # PulseTrader — LLM price table (VS-1.3.2 work-2.03, the "moat in DATA" seam).
 #
 # NOMINAL ledger estimate — NOT a real per-token tariff. Ollama Cloud
-# (https://ollama.com/v1) is a flat-rate / subscription API, so `gpt-oss:120b`
-# has no true per-token price. The figures below are a documented nominal
+# (https://ollama.com/v1) is a flat-rate / subscription API, so none of the
+# models below has a true per-token price. The figures below are a documented nominal
 # per-Mtok estimate whose ONLY purpose is to populate each persisted `LlmCall`
 # row's cost with a data-tunable (not frozen-in-Rust) number. Real per-token
 # backends (v2) override this file via `$PULSE_CONFIG_DIR/prices.toml`.
@@ -24,12 +24,37 @@ currency = "USD"
 # `openai_compat.rs` / `compose.rs` const. Change the model or endpoint HERE.
 [llm]
 base_url = "https://ollama.com/v1"
-model = "glm-5.2"
+model = "glm-5.3-flash"
 
 # Per-model nominal prices, per 1,000,000 tokens, in `currency`.
-# glm-5.2 is the tested main model (Ollama Cloud, OpenAI-compat, tool-capable);
-# gpt-oss:120b is retained as a nominal alternate (it returned reproducible
-# HTTP 500s under multi-turn tool-calling at VS-1.3.2 slice-close).
+#
+# glm-5.3-flash is the default model (ADR-0023, 2026-08-29). The id is written
+# BARE, with no `:cloud` tag, and that is verified rather than assumed: a live
+# probe against https://ollama.com/v1 on 2026-08-29 returned HTTP 200 for the bare
+# id, including a clean tool-call round trip. Ollama's library page publishes only
+# a `cloud` tag for this model and its docs examples show `glm-5.3-flash:cloud`, so
+# the endpoint evidently resolves the bare name — the bare form is used because it
+# is what was actually exercised, and because it matches how `glm-5.2` was written
+# when it worked in VS-1.3.2.
+#
+# The z.ai model tiering (glm-5.3 for harder tasks, gpt-oss:120b for light ones)
+# is PLANNED work, not wired: nothing reads more than `[llm].model`.
+#
+# glm-5.2 and gpt-oss:120b are retained as priced alternates for an operator who
+# pins `[llm].model` back to them. gpt-oss:120b returned reproducible HTTP 500s
+# under multi-turn tool-calling at VS-1.3.2 slice-close.
+#
+# glm-5.3-flash prices are Z.AI's PUBLISHED LIST tariff for the model
+# ($0.15 / 1M input, $0.50 / 1M output —
+# https://docs.z.ai/guides/overview/pricing, retrieved 2026-08-29), used as the
+# nominal because Ollama Cloud is flat-rate and levies no per-token charge. The
+# LIST figure is deliberate: z.ai is running a 50% promotion ($0.075 / $0.25)
+# that ends 2026-09-09, and pinning the ledger to a rate that expires in days
+# would make every row written after it wrong.
+[models."glm-5.3-flash"]
+input_per_mtok = "0.15"
+output_per_mtok = "0.50"
+
 [models."glm-5.2"]
 input_per_mtok = "0.60"
 output_per_mtok = "2.20"

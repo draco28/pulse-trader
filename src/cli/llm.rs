@@ -50,10 +50,12 @@ use crate::domain::{
     LlmConfig, LlmProvider, LlmResponse, Message, PriceTable,
 };
 
-/// The demo model id — `glm-5.2` via Ollama Cloud (the tested main model; mirrors
-/// the `openai_compat.rs` `OLLAMA_MODEL_ID` default + the shipped price-table key so
-/// `cost` resolves). Slice-close FIX B retired the `gpt-oss:120b` placeholder.
-const DEMO_MODEL: &str = "glm-5.2";
+/// The demo model id — `glm-5.3-flash` via Ollama Cloud (ADR-0023, bumped
+/// from `glm-5.2`; the id is bare, no `:cloud` tag). Mirrors the `openai_compat.rs`
+/// `OLLAMA_MODEL_ID` default + the shipped price-table key so `cost` resolves —
+/// all three have to move together, which is the duplication tracked on the ossify
+/// feature map.
+const DEMO_MODEL: &str = "glm-5.3-flash";
 
 /// A conservative sampling temperature for the demo round-trip (wire-level `f32`,
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
