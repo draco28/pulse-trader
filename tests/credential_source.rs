@@ -199,6 +199,64 @@ fn refuses_group_or_world_readable_credential_file() {
     }
 }
 
+// ---- Codex P2 (src/adapters/secrets.rs read_credential_file): the permission ----
+// ---- checks follow a symlink to its TARGET's inode, not its own -----------------
+
+/// The fix opens the candidate path once and validates the OPEN HANDLE
+/// (`File::metadata`, an `fstat`) rather than the path. `File::open` follows a
+/// symlink to its target, so the owner/mode checked are the TARGET's — meaning a
+/// symlink whose target is group- or world-readable must be refused exactly as a
+/// directly loose file would be. This is what proves the fix closes the TOCTOU: a
+/// weaker check (e.g. `symlink_metadata`/`lstat` on the path) would validate the
+/// link itself, which is typically `0777` and owned by whoever created it, and would
+/// never see the exposed target underneath.
+#[test]
+fn refuses_a_symlink_whose_target_is_group_or_world_readable() {
+    let config_dir = tempfile::tempdir().expect("config tempdir");
+    let fallback_dir = tempfile::tempdir().expect("fallback tempdir");
+    let target_dir = tempfile::tempdir().expect("target tempdir");
+
+    let target = target_dir.path().join("real-credential");
+    let secret = "sk-SYMLINKTARGET1234abcd5678efgh9012i";
+    std::fs::write(&target, format!("OLLAMA_API_KEY={secret}\n")).expect("write target");
+    chmod(&target, 0o644);
+
+    let link = config_dir.path().join(".env");
+    std::os::unix::fs::symlink(&target, &link).expect("create the symlink");
+
+    // A perfectly good lower-priority credential sits underneath, so a refusal that
+    // "falls through" would look like a success. It must NOT.
+    write_dotenv(fallback_dir.path(), "sk-FALLBACK1234abcd5678efgh9012ijklm");
+
+    let search = CredentialSearch::empty()
+        .with_config_dir(Some(config_dir.path().to_path_buf()))
+        .with_app_data_dir(Some(fallback_dir.path().to_path_buf()));
+
+    let err = resolve_llm_api_key_in(&search)
+        .expect_err("a symlink to a group/world-readable target must be refused");
+    let message = err.to_string();
+
+    assert!(
+        message.contains(&link.display().to_string()),
+        "the refusal names the searched (symlink) path; got: {message}"
+    );
+    assert!(
+        message.contains("0644") && message.contains("chmod 0600"),
+        "the refusal names the target's failing mode and the fix; got: {message}"
+    );
+    assert!(
+        !message.contains(secret),
+        "a refusal must never contain the value — the file is never read"
+    );
+
+    // Fail-closed, not fall-through: the readable lower-priority location must not
+    // rescue a run whose higher-priority credential is an exposed symlink target.
+    assert!(
+        resolve_llm_api_key_in(&search).is_err(),
+        "an exposed symlink target must abort resolution, never silently downgrade"
+    );
+}
+
 // ---- AC-5: least privilege, part 2 — the ownership check, fail-closed ----------
 
 #[test]

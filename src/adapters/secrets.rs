@@ -342,47 +342,85 @@ const GROUP_AND_WORLD_BITS: u32 = 0o077;
 /// `OLLAMA_API_KEY` out of it.
 ///
 /// `Ok(None)` means "this location does not answer" — the file genuinely does not
-/// exist (`metadata` fails with [`std::io::ErrorKind::NotFound`]), or it exists but
+/// exist (`File::open` fails with [`std::io::ErrorKind::NotFound`]), or it exists but
 /// carries no `OLLAMA_API_KEY` line, or it is a directory rather than a file. All
 /// three are ordinary misses that fall through to the next location.
 ///
-/// `Err` means the file was found and **REFUSED** — including when its metadata
-/// could not even be determined (`EACCES` on a parent directory, `EIO`, `ELOOP`,
-/// `ENOTDIR`, …). A metadata failure that is NOT `NotFound` is deliberately treated
-/// as a refusal rather than an ordinary miss: `Ok(None)` there would silently
-/// downgrade to a lower-priority credential, which is exactly the "the file is
-/// absent" lie this function exists to never tell. A refusal aborts the whole
-/// resolution rather than falling through to the next location: silently
+/// `Err` means the file was found and **REFUSED** — including when it could not even
+/// be opened, or its metadata could not be determined (`EACCES` on a parent
+/// directory, `EIO`, `ELOOP`, `ENOTDIR`, …). A failure that is NOT `NotFound` is
+/// deliberately treated as a refusal rather than an ordinary miss: `Ok(None)` there
+/// would silently downgrade to a lower-priority credential, which is exactly the
+/// "the file is absent" lie this function exists to never tell. A refusal aborts the
+/// whole resolution rather than falling through to the next location: silently
 /// downgrading to a lower-priority credential would leave the operator with a
 /// working `pulse` and an exposed key file they were never told about. That is the
 /// "never read, never silently downgraded" half of the least-privilege control.
 ///
 /// The value is never read before the checks pass, so no refusal message can contain
 /// it — the file's bytes have not been touched at that point.
+///
+/// # Open once, validate the handle, read the handle (closes a TOCTOU)
+///
+/// The file is opened exactly ONCE, with [`std::fs::File::open`]. Its owner and mode
+/// are checked with [`File::metadata`](std::fs::File::metadata) — an `fstat` on the
+/// already-open descriptor — and the credential is then read through that SAME
+/// handle. A path-based `std::fs::metadata(path)` followed by a separate
+/// `std::fs::read_to_string(path)` resolves `path` TWICE, and anyone able to modify
+/// the file's containing directory (a shared working directory, a configured
+/// overlay) can repoint `path` at a different inode in the gap between the two
+/// resolutions — the checks would then validate one file while the read pulls bytes
+/// from another, never-validated one, defeating this function's fail-closed
+/// contract. Validating the open handle instead of the path closes that window: the
+/// owner and mode checked are, by construction, the owner and mode of the exact
+/// inode [`read_to_string`](std::io::Read::read_to_string) is about to read, because
+/// there is only one open of the file, not two independent resolutions of its path.
+///
+/// This deliberately does NOT reject symlinks. `File::open` follows a symlink to its
+/// target, and the `fstat` above reports the TARGET's owner and mode, not the
+/// link's — so a symlink whose target is owned by someone else, or has group/world
+/// bits set, is refused by the very same ownership/mode checks below that a direct
+/// file in that state would be refused by. Rejecting symlinks outright (or checking
+/// them with `symlink_metadata`/`lstat`, which reports the LINK's own owner and mode
+/// rather than the target's) would be a weaker check than this one, not a stronger
+/// one: it would validate the wrong inode instead of the one actually read.
 fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>, LlmError> {
+    use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         // A genuine absence is the ordinary miss the fall-through exists for.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        // Every OTHER metadata failure (an inaccessible parent directory, an I/O
-        // error, a symlink loop, ...) is NOT the same as "this location does not
-        // answer" — silently falling through would hide the exposed/broken
-        // location from the operator entirely. Refuse instead, in the same voice
-        // as the two checks below: name the path, say plainly what was wrong, say
-        // the file was never read, and give a "Fix:" clause.
+        // Every OTHER open failure (an inaccessible parent directory, an I/O error,
+        // a symlink loop, ...) is NOT the same as "this location does not answer" —
+        // silently falling through would hide the exposed/broken location from the
+        // operator entirely. Refuse instead, in the same voice as the two checks
+        // below: name the path, say plainly what was wrong, say the file was never
+        // read, and give a "Fix:" clause.
         Err(error) => {
             return Err(LlmError::Config(format!(
-                "refusing to fall through past the credential file {}: its metadata could \
-                 not be read ({error}) — a credential location that errors is not the same \
-                 as one that is absent, and silently using a lower-priority key would hide \
-                 it. Fix: make {} readable, or remove it.",
+                "refusing to fall through past the credential file {}: it could not be \
+                 opened ({error}) — a credential location that errors is not the same as \
+                 one that is absent, and silently using a lower-priority key would hide it. \
+                 The file was never read. Fix: make {} readable, or remove it.",
                 path.display(),
                 path.display(),
             )));
         }
     };
+
+    // `fstat` on the handle we already hold — the owner and mode below describe the
+    // exact inode `file` will be read from, never a second, separately-resolved path.
+    let metadata = file.metadata().map_err(|error| {
+        LlmError::Config(format!(
+            "refusing to read the credential file {}: its metadata could not be read after \
+             opening it ({error}) — the file was opened but never read. Fix: make {} \
+             accessible, or remove it.",
+            path.display(),
+            path.display(),
+        ))
+    })?;
     if !metadata.is_file() {
         return Ok(None);
     }
@@ -409,7 +447,8 @@ fn read_credential_file(path: &Path, running_uid: u32) -> Result<Option<String>,
         )));
     }
 
-    let text = std::fs::read_to_string(path).map_err(|error| {
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| {
         LlmError::Config(format!(
             "the credential file {} passed its permission checks but could not be read: {error}",
             path.display(),
@@ -508,7 +547,7 @@ fn read_secret(service: &str, account: &str) -> Result<String, LlmError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{CredentialSearch, parse_dotenv, read_secret, resolve_llm_api_key_in};
+    use super::{CredentialSearch, DOTENV_FILE, parse_dotenv, read_secret, resolve_llm_api_key_in};
     use crate::domain::{CredentialSource, LlmError};
 
     #[test]
@@ -570,5 +609,36 @@ mod tests {
     fn an_empty_env_var_is_not_a_credential() {
         let search = CredentialSearch::empty().with_env_key(Some(String::new()));
         assert!(resolve_llm_api_key_in(&search).is_err());
+    }
+
+    // ---- Codex P2 (`read_credential_file` TOCTOU): open-once/validate-handle/ ----
+    // ---- read-handle must not break the ordinary, happy-path read ---------------
+
+    /// `tests/credential_source.rs` cannot assert on a resolved key's VALUE
+    /// (`expose()` is `pub(crate)`), so the guard that the open-once restructuring
+    /// still reads the right BYTES off a normal, owned, `0600` file lives here,
+    /// in-crate, alongside [`resolver_returns_the_value_the_winning_location_held`]
+    /// (which covers the env-sourced case). Together they cover both branches of
+    /// [`resolve_llm_api_key_in`]: a value handed straight through, and a value read
+    /// off disk via [`read_credential_file`].
+    #[test]
+    fn a_normal_owned_0600_file_still_resolves_its_value() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DOTENV_FILE);
+        std::fs::write(
+            &path,
+            "OLLAMA_API_KEY=sk-HANDLEFIX1234abcd5678efgh9012ijkl\n",
+        )
+        .expect("write .env");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 the .env");
+
+        let search = CredentialSearch::empty().with_config_dir(Some(dir.path().to_path_buf()));
+        let key = resolve_llm_api_key_in(&search)
+            .expect("a normal owned 0600 file must still resolve after the restructuring");
+        assert_eq!(key.source(), CredentialSource::ConfigDir);
+        assert_eq!(key.expose(), "sk-HANDLEFIX1234abcd5678efgh9012ijkl");
     }
 }
