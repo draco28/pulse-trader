@@ -151,7 +151,20 @@ fn main() {
 /// or present but carrying the sentinel -- AND Cargo reports `PROFILE=release`, this panics
 /// instead of writing or leaving the stub, unless `PULSE_ALLOW_PLACEHOLDER_DIST=1` is set (for
 /// a Rust-only release build -- e.g. a CI determinism job -- that is never distributed).
-/// Debug/test builds are unaffected: they keep writing the placeholder exactly as before.
+///
+/// **The guard keys off `PROFILE`, so it covers EVERY release-profile invocation**, not
+/// only `cargo build --release`: `cargo test --release` and `cargo clippy --release` set
+/// `PROFILE=release` too, and on a checkout with no real bundle they panic here just the
+/// same. That is deliberate rather than an oversight -- `PROFILE` is the only signal Cargo
+/// gives a build script, and it cannot tell a test run from a shippable one, so the
+/// alternative is a guard that trusts the caller's intent and therefore does not guard. A
+/// release-profile run that ships nothing declares itself with
+/// `PULSE_ALLOW_PLACEHOLDER_DIST=1`; CI's determinism jobs -- the only ones this project
+/// runs in release without a frontend -- set it in the workflow. Do NOT set it globally in
+/// `.cargo/config.toml`: that switches the guard off for every local build, which is
+/// exactly the state it exists to catch.
+///
+/// DEBUG builds are unaffected: they keep writing and reusing the placeholder as before.
 fn ensure_frontend_dist(manifest_dir: &Path) {
     let dist = manifest_dir.join("ui").join("dist");
     let index = dist.join("index.html");
