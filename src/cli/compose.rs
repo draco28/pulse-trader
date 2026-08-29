@@ -48,6 +48,7 @@
 //! model swap is DATA (edit the toml), not a Rust edit — the ADR-0013 promise.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -143,6 +144,15 @@ pub struct ComposeCliOutcome {
     pub events: Vec<ComposerEvent>,
 }
 
+/// The refusal message a cancelled compose run carries. A LABEL, never a payload —
+/// it names the condition, not anything about the run's data.
+///
+/// Both cancellation signals end here: a dead sink (which trips the provider guard
+/// in `src/tauri/commands.rs`) and an explicit `compose_cancel`. The desktop core
+/// decides "cancelled vs failed" from the LATCH rather than from this string, so
+/// the text is for humans; it is shared so the two sites cannot drift.
+pub const COMPOSE_CANCELLED: &str = "compose run cancelled: the destination channel closed";
+
 /// The injectable, fixture-doubleable core (mirror `run_llm_check_with`): assemble
 /// the redacting + cost-logging decorator over `wiring`'s provider + ledger repo
 /// (sharing ONE `LlmCallCapture` buffer + ONE clock), run [`Composer::compose`] over
@@ -161,6 +171,7 @@ pub async fn run_compose_with<P, R, S, C>(
     strategy_repo: &S,
     nl_target: &str,
     on_event: &mut (dyn FnMut(ComposerEvent) + Send),
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<ComposeCliOutcome>
 where
     P: LlmProvider + Send + Sync,
@@ -211,6 +222,18 @@ where
         .compose(nl_target, on_event)
         .await
         .context("compose run failed")?;
+
+    // The last point a cancellation can still be honoured, and the reason this
+    // check is HERE rather than only in the provider guard: that guard runs
+    // BEFORE each model turn, so a cancel arriving while the final turn is
+    // already in flight misses it — the response comes back `Ok`, the composer
+    // finalizes, and the two writes below persist a strategy the user cancelled
+    // seconds earlier. Refusing between the last turn and the first write closes
+    // that window. `COMPOSE_CANCELLED` is what `compose_strategy_core` matches to
+    // report the run as cancelled rather than failed.
+    if cancelled.load(Ordering::SeqCst) {
+        anyhow::bail!(COMPOSE_CANCELLED);
+    }
 
     // Persist the finalized StrategyVersion as a NEW strategy + its initial version
     // (parent_version_id = None); the repo mints id / strategy_id / version_hash /
@@ -298,7 +321,18 @@ pub async fn run_compose(db: Option<&Db>, args: &ComposeArgs) -> anyhow::Result<
     };
 
     let mut on_event = |event: ComposerEvent| println!("{}", render_event(&event));
-    let outcome = run_compose_with(wiring, &strategy_repo, &args.nl_target, &mut on_event).await?;
+    // The CLI has no cancellation channel: a `pulse compose` run ends when it
+    // ends, or when the operator kills the process. A never-tripped latch keeps
+    // one signature for both surfaces rather than two compose cores.
+    let never_cancelled = AtomicBool::new(false);
+    let outcome = run_compose_with(
+        wiring,
+        &strategy_repo,
+        &args.nl_target,
+        &mut on_event,
+        &never_cancelled,
+    )
+    .await?;
     print_outcome(&outcome);
     Ok(())
 }

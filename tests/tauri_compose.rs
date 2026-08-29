@@ -233,6 +233,30 @@ impl LlmProvider for FailingProvider {
     }
 }
 
+/// A provider that trips the run's latch as it answers turn `trip_on_turn` —
+/// standing in for `compose_cancel` arriving while that response is in flight.
+struct LatchTrippingProvider {
+    inner: FakeComposerProvider,
+    latch: Arc<AtomicBool>,
+    trip_on_turn: usize,
+    turns: AtomicUsize,
+}
+
+impl LlmProvider for LatchTrippingProvider {
+    fn chat(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        config: &LlmConfig,
+    ) -> impl Future<Output = Result<LlmResponse, pulse::LlmError>> {
+        let n = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= self.trip_on_turn {
+            self.latch.store(true, Ordering::SeqCst);
+        }
+        self.inner.chat(messages, tools, config)
+    }
+}
+
 /// A **healthy** sink that trips the run's cancellation latch after `trip_after`
 /// events — standing in for the `compose_cancel` command arriving mid-run.
 ///
@@ -587,6 +611,54 @@ async fn a_sink_that_dies_mid_run_cancels_the_compose_rather_than_erroring() {
     assert!(
         strategies.is_empty(),
         "a cancelled run must not persist a strategy"
+    );
+}
+
+/// A cancel that lands DURING the final model turn still stops before persisting.
+///
+/// The provider guard checks the latch BEFORE each turn, so a cancel arriving while
+/// the last turn is already in flight misses it: the response comes back `Ok`, the
+/// composer finalizes, and without a second check the two repository writes would
+/// persist a strategy the user cancelled seconds earlier. `run_compose_with` checks
+/// the latch between the composer returning and the first write.
+///
+/// The sink here stays HEALTHY and the latch is tripped by the LAST scripted
+/// provider turn — the closest a test can get to `compose_cancel` arriving while
+/// the final response is in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_the_final_turn_stops_before_persisting() {
+    let (_tmp, db) = migrated_db().await;
+    let latch = new_latch();
+    let deps = deps_with_provider(
+        &db,
+        LatchTrippingProvider {
+            inner: FakeComposerProvider::new(happy_path_script()),
+            latch: Arc::clone(&latch),
+            trip_on_turn: 6,
+            turns: AtomicUsize::new(0),
+        },
+    );
+
+    let sink = Collector {
+        events: Mutex::new(Vec::new()),
+    };
+    let outcome = compose_strategy_core(&RunId::new(), deps, "RSI oversold on BTC", &sink, latch)
+        .await
+        .expect("a cancel is cancellation, not a bus error");
+
+    assert!(
+        outcome.cancelled,
+        "the tripped latch must read as cancellation"
+    );
+    assert!(outcome.strategy.is_none());
+
+    let strategies = SqliteStrategyRepo::new(db.pool().clone())
+        .list_strategies(true)
+        .await
+        .expect("list_strategies");
+    assert!(
+        strategies.is_empty(),
+        "a run cancelled during its final turn must not persist a strategy"
     );
 }
 

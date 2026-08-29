@@ -25,6 +25,12 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use tempfile::TempDir;
 
+/// A latch nobody trips — the CLI surface has no cancellation channel, so these
+/// e2es exercise the uncancelled path.
+fn never_cancelled() -> std::sync::atomic::AtomicBool {
+    std::sync::atomic::AtomicBool::new(false)
+}
+
 /// An API-key-shaped literal the composer (compose-time) + the decorator (at rest)
 /// must both strip from every persisted `LlmCall` prompt. NOT a real key.
 const FAKE_KEY: &str = "sk-COMPOSE1234abcd5678efgh9012ijkl3456";
@@ -198,12 +204,17 @@ async fn composes_and_persists_strategy_version_over_fake_provider() {
     let nl_target = format!("RSI oversold bounce on BTC; my api key {FAKE_KEY} do not leak it");
 
     let mut streamed: Vec<ComposerEvent> = Vec::new();
-    let outcome: ComposeCliOutcome =
-        run_compose_with(wiring, &strategy_repo, &nl_target, &mut |event| {
+    let outcome: ComposeCliOutcome = run_compose_with(
+        wiring,
+        &strategy_repo,
+        &nl_target,
+        &mut |event| {
             streamed.push(event);
-        })
-        .await
-        .expect("the scripted tool sequence composes + persists a strategy version");
+        },
+        &never_cancelled(),
+    )
+    .await
+    .expect("the scripted tool sequence composes + persists a strategy version");
 
     // (a) a finalized, schema-valid StrategyVersion is persisted (repo-minted ids).
     let version = &outcome.version;
@@ -394,6 +405,7 @@ async fn invalid_tool_input_surfaces_correctable_error_then_finalizes() {
         &mut |event| {
             streamed.push(event);
         },
+        &never_cancelled(),
     )
     .await
     .expect("recovers from the correctable error and still finalizes");

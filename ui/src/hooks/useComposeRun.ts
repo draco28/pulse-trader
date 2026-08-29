@@ -99,24 +99,38 @@ function applyEvent(turn: AgentTurn, payload: BusEvent["payload"]): AgentTurn {
   return turn;
 }
 
-/** The run currently streaming: which turn it owns, and where its stream is. */
+/**
+ * The highest `seq` a run's FIRST event may carry.
+ *
+ * The backend numbers a run's events contiguously from 0, where 0 is `Started`.
+ * `Started` mutates no step, so losing only it is survivable and 1 is accepted as
+ * a baseline. Anything higher means events were already dropped before the first
+ * one arrived, and a baseline taken there would silently swallow that prefix —
+ * a `toolCallResult` at seq 2 seen first would discard its unmatched outcome and
+ * the run would still render as completed.
+ */
+const MAX_FIRST_SEQ = 1;
+
+/** One submitted run: which turn it owns, and where its stream is. */
 interface InFlight {
   /** The index of this run's agent turn in `messages` — fixed at submit. */
   index: number;
   /** The run id, bound from the first event that arrives (`null` until then). */
   runId: string | null;
-  /**
-   * The `seq` the next accepted event must carry, or `null` before the first one.
-   *
-   * The backend numbers a run's events contiguously from 0 (`Started`), but the
-   * BASELINE is taken from whatever arrives first rather than asserted to be 0.
-   * A dropped `Started` costs nothing — it carries no step-list mutation — and
-   * hard-coding the origin would couple this fold to the backend's numbering
-   * choice for no gain. Every gap after the first observed event is caught.
-   */
+  /** The `seq` the next accepted event must carry, or `null` before the first. */
   nextSeq: number | null;
   /** Set once a gap is seen: the step list is no longer a faithful history. */
   broken: boolean;
+  /**
+   * Set when the screen unmounted while this run had no id yet.
+   *
+   * The unmount cleanup can only cancel a run it can NAME, and the id is minted
+   * backend-side and first observable on the `Started` event. Leaving immediately
+   * after submitting therefore beats the id: the cleanup has nothing to send, and
+   * without this flag the run would go on burning billable calls and persist a
+   * strategy. The flag makes the cancel fire the moment the id arrives instead.
+   */
+  abandoned: boolean;
 }
 
 export function useComposeRun() {
@@ -124,30 +138,46 @@ export function useComposeRun() {
   const [target, setTarget] = useState("");
   const [running, setRunning] = useState(false);
 
-  // Refs, not state: the event callback is registered on a `Channel` at submit
-  // and must read the CURRENT run without re-registering, and none of this is
-  // rendered.
+  // Refs, not state: a `Channel`'s callback is registered once at submit and must
+  // keep working across renders, and none of this is rendered.
   const inFlight = useRef<InFlight | null>(null);
   const unmounted = useRef(false);
 
-  // Cancellation-on-unmount, for real. The run id is known from the first event
-  // (`Started`, seq 0, sent before the composer is invoked), so any unmount a
-  // user can actually perform has one to send. A cancel that loses the race to
-  // the last event is reported by the backend as a completed run, which is
-  // honest: the strategy was persisted.
-  useEffect(
-    () => () => {
+  /** Ask the backend to stop a run. Fire-and-forget: the screen may be gone. */
+  const cancelRun = (runId: string) => {
+    void commands.composeCancel(runId).catch(() => {
+      // Nothing to render, and nothing to retry — the run also ends on its own
+      // guard if this never lands.
+    });
+  };
+
+  // Cancellation-on-unmount, for real. A `Channel`'s callback stays registered
+  // with Tauri for the life of the WEBVIEW, so an SPA navigation makes no send
+  // fail and the failed-send guard never trips: without an explicit cancel the
+  // run keeps making billable calls and persists a strategy nobody awaits.
+  useEffect(() => {
+    // Reset on SETUP, not only on cleanup. React StrictMode runs setup/cleanup
+    // twice on mount in development; without this the first cleanup would latch
+    // `unmounted` true forever and the second setup would leave it there, so
+    // every event and every terminal result would be dropped by `patchTurn` —
+    // the backend work would still happen while the UI sat frozen on
+    // "streaming".
+    unmounted.current = false;
+    return () => {
       unmounted.current = true;
       const run = inFlight.current;
-      if (run !== null && run.runId !== null) {
-        void commands.composeCancel(run.runId).catch(() => {
-          // Nothing to render — the screen is already gone. The backend run
-          // ends on its own guard either way.
-        });
+      if (run === null) {
+        return;
       }
-    },
-    [],
-  );
+      if (run.runId === null) {
+        // Left before the id was knowable. `handleEvent` fires the cancel the
+        // moment the first event names the run.
+        run.abandoned = true;
+        return;
+      }
+      cancelRun(run.runId);
+    };
+  }, []);
 
   /** Patch the turn at `index`, leaving every other run untouched. */
   const patchTurn = (index: number, patch: (turn: AgentTurn) => AgentTurn) => {
@@ -165,31 +195,48 @@ export function useComposeRun() {
     });
   };
 
-  /** Fold one streamed event into the run it belongs to — or drop it. */
-  const handleEvent = (event: BusEvent) => {
-    const run = inFlight.current;
-    if (run === null) {
-      return;
-    }
+  /**
+   * Fold one streamed event into the run it belongs to — or drop it.
+   *
+   * Takes the run's OWN record rather than reading `inFlight.current`. A channel
+   * outlives the run that made it, so a straggler from a settled run A can arrive
+   * after run B has started; reading the current record would let A's event bind
+   * B's `runId` to A's, after which every genuine B event is rejected as foreign
+   * and B finalizes with an empty step list.
+   */
+  const handleEvent = (run: InFlight, event: BusEvent) => {
     if (run.runId === null) {
       run.runId = event.runId;
+      if (run.abandoned) {
+        // The screen left before this id existed; this is the first moment the
+        // run can be named, so cancel it now and fold nothing.
+        cancelRun(run.runId);
+        return;
+      }
     } else if (run.runId !== event.runId) {
-      // A straggler from an earlier run. Dropping it is the whole point: it
-      // would otherwise append a step to a run that never made that tool call.
       return;
     }
-    if (run.nextSeq !== null && event.seq !== run.nextSeq) {
-      // A gap. The steps rendered so far are a partial history, and nothing
-      // downstream can tell which ones are missing, so the run ends as an
-      // error rather than presenting an incomplete list as the whole story.
-      if (!run.broken) {
-        const expected = run.nextSeq;
-        run.broken = true;
-        patchTurn(run.index, (turn) => ({
-          ...turn,
-          status: "error",
-          error: `stream error: expected event ${expected}, received ${event.seq} — the step list below is incomplete`,
-        }));
+    if (run.abandoned || run.broken) {
+      return;
+    }
+
+    // A gap. The steps rendered so far are a partial history and nothing
+    // downstream can say which are missing, so the run ends as a stream error
+    // rather than presenting an incomplete list as the whole story — and the
+    // backend is cancelled, because a user who sees only the error will retry,
+    // and an uncancelled run would persist a duplicate strategy behind it.
+    const expected = run.nextSeq ?? 0;
+    const gapped =
+      run.nextSeq === null ? event.seq > MAX_FIRST_SEQ : event.seq !== run.nextSeq;
+    if (gapped) {
+      run.broken = true;
+      patchTurn(run.index, (turn) => ({
+        ...turn,
+        status: "error",
+        error: `stream error: expected event ${expected}, received ${event.seq} — the step list below is incomplete`,
+      }));
+      if (run.runId !== null) {
+        cancelRun(run.runId);
       }
       return;
     }
@@ -209,10 +256,21 @@ export function useComposeRun() {
     // appends, it appends the user message then the agent message, and the
     // `running` guard means no other run is in flight to move them.
     const index = messages.length + 1;
-    inFlight.current = { index, runId: null, nextSeq: null, broken: false };
+    const run: InFlight = {
+      index,
+      runId: null,
+      nextSeq: null,
+      broken: false,
+      abandoned: false,
+    };
+    inFlight.current = run;
 
+    // The channel's callback closes over THIS run's record, so a straggler
+    // arriving after the run settles can never be mistaken for the next one's.
     const channel = new Channel<BusEvent>();
-    channel.onmessage = handleEvent;
+    channel.onmessage = (event) => {
+      handleEvent(run, event);
+    };
 
     const when = clockLabel();
     setMessages((current) => [
@@ -227,7 +285,7 @@ export function useComposeRun() {
         // A run whose stream broke keeps its stream error: the command's return
         // value describes work the rendered step list cannot account for, so
         // overwriting the error with `✓ completed` would hide the gap.
-        if (inFlight.current?.index === index && inFlight.current.broken) {
+        if (run.broken) {
           return;
         }
         if (result.status === "ok") {
@@ -255,7 +313,7 @@ export function useComposeRun() {
       })
       .finally(() => {
         setRunning(false);
-        if (inFlight.current?.index === index) {
+        if (inFlight.current === run) {
           inFlight.current = null;
         }
       });

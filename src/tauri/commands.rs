@@ -65,7 +65,7 @@ use crate::adapters::llm::redacting_logging::Redactor;
 use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
 use crate::agent::ComposerEvent;
 use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
-use crate::cli::compose::{ComposeWiring, compose_config, run_compose_with};
+use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus, DataError, Direction,
@@ -542,11 +542,6 @@ pub struct ComposeDeps<P, R, S, C> {
     pub strategy_repo: S,
 }
 
-/// The refusal message the cancellation guard returns once tripped. A LABEL,
-/// never a payload — it names the condition (the destination channel closed),
-/// not anything about the run's data.
-const COMPOSE_CANCELLED: &str = "compose run cancelled: the destination channel closed";
-
 /// A provider wrapper that ends the run when the far end goes away.
 ///
 /// `run_compose_with`'s `on_event` callback returns `()` — it **cannot abort
@@ -919,7 +914,15 @@ where
         seq += 1;
     };
 
-    match run_compose_with(wiring, &deps.strategy_repo, nl_target, &mut on_event).await {
+    match run_compose_with(
+        wiring,
+        &deps.strategy_repo,
+        nl_target,
+        &mut on_event,
+        &cancelled,
+    )
+    .await
+    {
         Ok(outcome) => Ok(ComposeResult {
             run_id: run_id.clone(),
             emitted,

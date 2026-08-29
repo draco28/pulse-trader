@@ -347,6 +347,93 @@ describe("useComposeRun", () => {
     expect(composeCancelMock.mock.calls[0][0]).toBe("run-1");
   });
 
+  it("unmounting BEFORE the first event still cancels, once the id arrives", async () => {
+    // The id is minted backend-side and first observable on `Started`, so leaving
+    // straight after submitting beats it. The cleanup has nothing to name yet; the
+    // cancel has to fire when the id finally arrives, or the run bills on.
+    const { result, unmount } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    unmount();
+    expect(composeCancelMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+
+    expect(composeCancelMock).toHaveBeenCalledTimes(1);
+    expect(composeCancelMock.mock.calls[0][0]).toBe("run-1");
+  });
+
+  it("a straggler from a settled run cannot capture the next run", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "first");
+    const channelA = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+    await act(async () => {
+      channelA.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      resolveInvoke({ status: "ok", data: finalizeResult() });
+    });
+
+    // Run B starts; A's delayed event lands BEFORE B's first. Reading the current
+    // record here would bind B to A's runId and then reject every real B event.
+    submitTarget(result, "second");
+    const channelB = composeStrategyMock.mock.calls[1][1] as Channel<BusEvent>;
+    await act(async () => {
+      channelA.onmessage?.(event(9, started("add_filter", "stale")));
+    });
+    await act(async () => {
+      channelB.onmessage?.(otherRunEvent(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channelB.onmessage?.(otherRunEvent(1, started("add_entry_signal", "rsi(14) < 30")));
+    });
+
+    const turn = lastTurn(result);
+    expect(turn.status).toBe("streaming");
+    expect(turn.steps).toHaveLength(1);
+    expect(turn.steps[0]?.preview).toBe("rsi(14) < 30");
+  });
+
+  it("a first event past the tolerated baseline is a gap, not a new baseline", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    // seq 2 first: `Started` AND a `toolCallStarted` were dropped. Taking 2 as the
+    // baseline would silently swallow that prefix and let the run render complete.
+    await act(async () => {
+      channel.onmessage?.(
+        event(2, { kind: "toolCallResult", name: "add_filter", outcome: "filter added" }),
+      );
+    });
+
+    const turn = lastTurn(result);
+    expect(turn.status).toBe("error");
+    expect(turn.error).toContain("received 2");
+  });
+
+  it("declaring a stream gap also cancels the backend run", async () => {
+    const { result } = renderHook(() => useComposeRun());
+    submitTarget(result, "t");
+    const channel = composeStrategyMock.mock.calls[0][1] as Channel<BusEvent>;
+
+    await act(async () => {
+      channel.onmessage?.(event(0, { kind: "started" }));
+    });
+    await act(async () => {
+      channel.onmessage?.(event(4, started("add_filter", "close > ema(200)")));
+    });
+
+    // Without this the user sees only a stream error, retries, and the abandoned
+    // run persists a duplicate strategy behind their back.
+    expect(lastTurn(result).status).toBe("error");
+    expect(composeCancelMock).toHaveBeenCalledTimes(1);
+    expect(composeCancelMock.mock.calls[0][0]).toBe("run-1");
+  });
+
   it("unmounting with no run in flight cancels nothing", () => {
     const { unmount } = renderHook(() => useComposeRun());
     unmount();
