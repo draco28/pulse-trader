@@ -236,6 +236,7 @@ pub struct RedactingLoggingProvider<P, R, C> {
     prices: PriceTable,
     created_by: CreatedBy,
     key_source: Option<CredentialSource>,
+    prompt_version: Option<String>,
 }
 
 impl<P, R, C> RedactingLoggingProvider<P, R, C> {
@@ -253,6 +254,7 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
             prices,
             created_by: CreatedBy::Human,
             key_source: None,
+            prompt_version: None,
         }
     }
 
@@ -284,6 +286,25 @@ impl<P, R, C> RedactingLoggingProvider<P, R, C> {
     #[must_use]
     pub fn with_key_source(mut self, key_source: Option<CredentialSource>) -> Self {
         self.key_source = key_source;
+        self
+    }
+
+    /// Record WHICH version of the agent prompt drove every persisted
+    /// [`LlmCall`] — the SHA-256 hex of the RESOLVED prompt file, whichever of the
+    /// compiled-in default or the `$PULSE_PROMPT_DIR` overlay won (r1.s2 audit C2).
+    ///
+    /// A builder rather than a `new` parameter, mirroring
+    /// [`with_key_source`](Self::with_key_source) exactly: every existing call site
+    /// keeps compiling and keeps recording `None`, so **the composer path is
+    /// unchanged**. It has to be stamped here rather than after the fact, because
+    /// `llm_call` is UPDATE-trigger-immutable (migration `0004`) — a row written
+    /// without its prompt version can never gain one.
+    ///
+    /// A hash, never prompt text: the value is incapable of carrying prompt or
+    /// credential content.
+    #[must_use]
+    pub fn with_prompt_version(mut self, prompt_version: Option<String>) -> Self {
+        self.prompt_version = prompt_version;
         self
     }
 }
@@ -337,10 +358,10 @@ where
             created_at,
             created_by: self.created_by,
             key_source: self.key_source,
-            // r1.s2.w2: this decorator serves the composer, whose ledger rows record
-            // no prompt version (audit C2). `w3` supplies the resolved-prompt content
-            // hash on the coach's own calls.
-            prompt_version: None,
+            // r1.s2.w3: the resolved-prompt content hash the composition root
+            // stamped, or `None` (the composer's rows, and any caller that records
+            // none) — audit C2.
+            prompt_version: self.prompt_version.clone(),
         };
 
         self.repo

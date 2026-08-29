@@ -101,8 +101,8 @@ pub use dsl::{
 // curate the crate surface — an un-re-exported public domain type is a `dead_code`
 // BUILD error under `deny(warnings)`.
 pub use coaching::{
-    CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition, DispositionKind,
-    Hypothesis, Proposal, SessionOutcome,
+    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
+    DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
 };
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3). `compile`
 // turns a `ValidatedDsl` into a `CompiledStrategy` the backtester walks; the

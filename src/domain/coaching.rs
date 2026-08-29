@@ -28,11 +28,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fmt::Write as _;
 use thiserror::Error;
 
-use super::backtest::BacktestRunId;
-use super::dsl::{Mutation, MutationError};
+use rust_decimal::Decimal;
+
+use super::backtest::{BacktestRunId, PersistedRun, RegimeBreakdown, SummaryStats, Trade};
+use super::dsl::{Mutation, MutationError, StrategyDsl};
 use super::llm_call::LlmCallId;
+use super::sizing::SkippedEntryCounts;
 use super::strategy::VersionId;
 
 /// Identifier of a [`CoachingSession`] — a `#[serde(transparent)]` `String`
@@ -337,4 +341,216 @@ pub struct CoachingSession {
     pub llm_call_id: Option<LlmCallId>,
     /// What the turn produced — a proposal or a typed failure, never neither.
     pub outcome: SessionOutcome,
+}
+
+/// Fixed-size MFE/MAE aggregates over a run's trades.
+///
+/// A **projection** of persisted per-trade `mfe_r` / `mae_r`, not a recomputation
+/// of the backtest: the numbers being summarized were computed by the engine and
+/// stored. Aggregating them is what keeps the raw trade log out of the coach's
+/// context while leaving the "how much did trades run in my favour before they
+/// turned" signal intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MfeMaeAggregates {
+    /// How many trades the aggregates cover.
+    pub trade_count: usize,
+    /// Mean maximum favourable excursion, in R.
+    pub avg_mfe_r: Decimal,
+    /// Mean maximum adverse excursion, in R (`<= 0` by construction).
+    pub avg_mae_r: Decimal,
+    /// The single best MFE in the run, in R.
+    pub max_mfe_r: Decimal,
+    /// The single worst MAE in the run, in R.
+    pub worst_mae_r: Decimal,
+}
+
+impl MfeMaeAggregates {
+    /// Aggregate a run's trades. An empty trade log yields all-zero aggregates
+    /// rather than an error — a run with no trades is a legitimate thing to coach
+    /// on, and it is exactly the case where the skipped-entry counts matter.
+    #[must_use]
+    pub fn from_trades(trades: &[Trade]) -> Self {
+        let count = trades.len();
+        let mut favourable_sum = Decimal::ZERO;
+        let mut adverse_sum = Decimal::ZERO;
+        let mut best_favourable = Decimal::ZERO;
+        let mut worst_adverse = Decimal::ZERO;
+        for trade in trades {
+            favourable_sum += trade.mfe_r;
+            adverse_sum += trade.mae_r;
+            if trade.mfe_r > best_favourable {
+                best_favourable = trade.mfe_r;
+            }
+            if trade.mae_r < worst_adverse {
+                worst_adverse = trade.mae_r;
+            }
+        }
+        let divisor = Decimal::from(u64::try_from(count).unwrap_or(u64::MAX));
+        let (favourable_mean, adverse_mean) = if divisor.is_zero() {
+            (Decimal::ZERO, Decimal::ZERO)
+        } else {
+            (favourable_sum / divisor, adverse_sum / divisor)
+        };
+        Self {
+            trade_count: count,
+            avg_mfe_r: favourable_mean,
+            avg_mae_r: adverse_mean,
+            max_mfe_r: best_favourable,
+            worst_mae_r: worst_adverse,
+        }
+    }
+}
+
+/// The bounded projection the coach is allowed to see (ADR-0021 decision 8,
+/// grill L4 as amended by audit C1).
+///
+/// **Least privilege, made structural.** The raw trade log and the equity curve
+/// are not fields here, so they cannot reach a prompt by accident. Neither can the
+/// run's config header: it is #110's column set landing in `r1.s3`, and including
+/// it would recreate the `S2 → S3` edge the release record rebutted. Everything
+/// present is drawn from the persisted [`PersistedRun`] and the version's DSL.
+///
+/// **Every field is fixed-size except the DSL**, which is why context overflow
+/// collapses into one pre-call checkable condition ([`CoachContext::build`]) and
+/// is recorded as [`CoachFailure::ContextOverflow`] rather than discovered as a
+/// provider error mid-turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoachContext {
+    /// The run's derived summary statistics, as persisted.
+    pub summary: SummaryStats,
+    /// The per-regime trade-count / net-P&L split, as persisted.
+    pub regime_breakdown: RegimeBreakdown,
+    /// Fixed-size MFE/MAE aggregates over the persisted trade log.
+    pub mfe_mae: MfeMaeAggregates,
+    /// The counts of entries the sizer skipped, as persisted.
+    pub skipped_entries: SkippedEntryCounts,
+    /// The recording engine's fingerprint — the cohort key for "is this run
+    /// comparable to that one".
+    pub engine_fingerprint: String,
+    /// The strategy version's DSL: the only variable-length field, and the thing
+    /// a mutation addresses.
+    pub dsl: StrategyDsl,
+}
+
+impl CoachContext {
+    /// Build the projection, refusing pre-call when the DSL does not fit the
+    /// budget.
+    ///
+    /// The size check is on the **serialized DSL**, because that is what actually
+    /// occupies the model's window, and it happens BEFORE any provider call — so
+    /// an oversized strategy costs nothing and is recorded as a session with
+    /// `llm_call_id` NULL (audit C3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoachFailure::ContextOverflow`] when the serialized DSL exceeds
+    /// `max_dsl_bytes`.
+    pub fn build(
+        run: &PersistedRun,
+        trades: &[Trade],
+        dsl: &StrategyDsl,
+        max_dsl_bytes: usize,
+    ) -> Result<Self, CoachFailure> {
+        let rendered_dsl =
+            serde_json::to_string(dsl).map_err(|e| CoachFailure::ContextOverflow {
+                detail: format!("the version's DSL could not be rendered: {e}"),
+            })?;
+        let size = rendered_dsl.len();
+        if size > max_dsl_bytes {
+            return Err(CoachFailure::ContextOverflow {
+                detail: format!(
+                    "the version's DSL is {size} bytes against a {max_dsl_bytes}-byte budget"
+                ),
+            });
+        }
+
+        Ok(Self {
+            summary: run.summary.clone(),
+            regime_breakdown: run.regime_breakdown,
+            mfe_mae: MfeMaeAggregates::from_trades(trades),
+            skipped_entries: run.skipped_entries,
+            engine_fingerprint: run.engine_fingerprint.clone(),
+            dsl: dsl.clone(),
+        })
+    }
+
+    /// Render the projection as the turn's user message.
+    ///
+    /// Deterministic and total: fixed field order, no map iteration, no `f64`
+    /// (the `SummaryStats` Sharpe/Sortino pair is f64-derived and is deliberately
+    /// NOT rendered — a parameter mutation does not need it, and NFR-2 keeps
+    /// binary floats out of anything reproducible).
+    #[must_use]
+    pub fn render(&self) -> String {
+        let s = &self.summary;
+        let r = &self.regime_breakdown;
+        let m = &self.mfe_mae;
+        let k = &self.skipped_entries;
+        let dsl =
+            serde_json::to_string_pretty(&self.dsl).unwrap_or_else(|_| "<unrenderable>".to_owned());
+        // `write!` into a `String` cannot fail; `let _ =` says so without an
+        // `unwrap` (the crate denies `unwrap_used` in library paths).
+        let mut out = String::new();
+        let _ = writeln!(out, "## Backtest result (persisted; do not recompute)");
+        let _ = writeln!(out, "engine_fingerprint: {}", self.engine_fingerprint);
+        let _ = writeln!(
+            out,
+            "trades: {} (wins {}, losses {})",
+            s.trade_count, s.win_count, s.loss_count
+        );
+        let _ = writeln!(
+            out,
+            "win_rate: {} · expectancy: {} · net_pnl: {}",
+            s.win_rate, s.expectancy, s.net_pnl
+        );
+        let _ = writeln!(
+            out,
+            "gross_profit: {} · gross_loss: {} · profit_factor: {}",
+            s.gross_profit,
+            s.gross_loss,
+            s.profit_factor
+                .map_or_else(|| "n/a".to_owned(), |v| v.to_string())
+        );
+        let _ = writeln!(
+            out,
+            "avg_win: {} · avg_loss: {} · max_drawdown: {}",
+            s.avg_win, s.avg_loss, s.max_drawdown
+        );
+        let _ = writeln!(
+            out,
+            "streaks: {} wins, {} losses",
+            s.max_win_streak, s.max_loss_streak
+        );
+        let _ = writeln!(out, "\n## Regime breakdown (trades / net P&L)");
+        for (label, cell) in [
+            ("trending_up", r.trending_up()),
+            ("trending_down", r.trending_down()),
+            ("ranging", r.ranging()),
+            ("unknown", r.unknown()),
+        ] {
+            let _ = writeln!(
+                out,
+                "{label}: {} trades, {} net",
+                cell.trade_count, cell.net_pnl
+            );
+        }
+        let _ = writeln!(out, "\n## MFE / MAE (R multiples, aggregated)");
+        let _ = writeln!(
+            out,
+            "over {} trades — avg_mfe {} · avg_mae {} · best_mfe {} · worst_mae {}",
+            m.trade_count, m.avg_mfe_r, m.avg_mae_r, m.max_mfe_r, m.worst_mae_r
+        );
+        let _ = writeln!(out, "\n## Skipped entries");
+        let _ = writeln!(
+            out,
+            "sub_lot: {} · sub_notional: {} · leverage_capped: {}",
+            k.sub_lot, k.sub_notional, k.leverage_capped
+        );
+        let _ = writeln!(
+            out,
+            "\n## Strategy DSL (the document your mutation addresses)"
+        );
+        let _ = writeln!(out, "{dsl}");
+        out
+    }
 }

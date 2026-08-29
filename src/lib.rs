@@ -140,8 +140,8 @@ pub use domain::{
 // disposition transition). Re-exported on the same curated-surface pattern —
 // REQUIRED under `deny(warnings)` + `pub(crate) mod domain`.
 pub use domain::{
-    CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition, DispositionKind,
-    Hypothesis, Proposal, SessionOutcome,
+    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
+    DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
 };
 
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
@@ -202,6 +202,19 @@ pub use cli::llm::{LlmArgs, LlmCheckOutcome, run_llm_check, run_llm_check_with};
 pub use cli::compose::{
     ComposeArgs, ComposeCliOutcome, ComposeWiring, run_compose, run_compose_with,
 };
+
+// r1.s2.w3: the `pulse coach <run-id>` composition-root + debug surface (ADR-0021 /
+// ADR-0017). The three OFFLINE test binaries — `coach_turn` (demo `d6`),
+// `coach_failures` (demo `d7`) and `coach_redaction` — drive the injectable core
+// `run_coach_with` over a SCRIPTED provider + the REAL coach + REAL `apply()` +
+// REAL repos on a tempfile SQLite. NEVER a live LLM: two of the three are ledger
+// lines re-run at every future spine close. `CoachWiring` bundles the LLM-side
+// deps, `CoachCliOutcome` is the recorded session + the stamped prompt version.
+// REQUIRED under `deny(warnings)` — a `pub` item unused outside its private
+// `cli::coach` module is a `dead_code` build error, not a warning.
+pub use cli::coach::{CoachArgs, CoachCliOutcome, CoachWiring, run_coach, run_coach_with};
+// The coach itself, for `r1.s4`'s rail (which drives a turn without the CLI).
+pub use agent::{Coach, CoachTurnError};
 
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
