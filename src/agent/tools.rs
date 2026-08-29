@@ -29,7 +29,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::domain::{
-    Direction, ExitRule, FieldError, RiskParams, SweepableValue, ToolDefinition, ValidationCode,
+    Direction, ExitRule, FieldError, ParamValue, RiskParams, SweepableValue, ToolDefinition,
+    ValidationCode,
 };
 
 use super::builder::StrategyBuilder;
@@ -1082,5 +1083,95 @@ mod tests {
                 "missing tool definition {expected}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// r1.s2.w3 — the coach's single tool (ADR-0013 conventions, ADR-0021 decision 7).
+// ---------------------------------------------------------------------------
+
+/// The coach's one tool name. Exactly one well-formed call ends the turn (A3);
+/// zero calls and two calls are both recorded typed failures, not retries.
+pub(crate) const PROPOSE_MUTATION_TOOL: &str = "propose_mutation";
+
+/// The `propose_mutation` arguments, as the model supplies them.
+///
+/// `new_value` deserializes DIRECTLY into the domain's [`ParamValue`] rather than
+/// into a loose string the coach then has to guess the type of: the tagged shape
+/// (`{"type":"Period","value":21}` / `{"type":"Threshold","value":"0.03"}`) is
+/// what `apply()` already speaks, so a wrong shape is one clean serde failure
+/// recorded as `MalformedArguments` instead of a heuristic that silently picks the
+/// wrong numeric kind.
+///
+/// `hypothesis` is a plain `String` here and is validated into the domain's
+/// non-empty `Hypothesis` by the caller — an empty one is `MalformedArguments`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProposeMutationArgs {
+    /// The `validate.rs` dotted/indexed locator of the leaf to retune.
+    pub(crate) path: String,
+    /// The typed value to write there.
+    pub(crate) new_value: ParamValue,
+    /// Why the coach believes this helps.
+    pub(crate) hypothesis: String,
+}
+
+/// The coach's tool surface: exactly one tool.
+pub(crate) fn coach_tool_definitions() -> Vec<ToolDefinition> {
+    vec![def_propose_mutation()]
+}
+
+fn def_propose_mutation() -> ToolDefinition {
+    ToolDefinition {
+        name: PROPOSE_MUTATION_TOOL.to_owned(),
+        description: "Propose EXACTLY ONE parameter change to the strategy, with the hypothesis \
+                      behind it. Call this once; the first well-formed call ends your turn. \
+                      `path` is the dotted/indexed locator of an existing numeric leaf (e.g. \
+                      `entry.lhs.indicator.rsi.period`, `exits[0].distance_pct`, \
+                      `risk.max_leverage`). Structural edits are not available in this release."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "dotted/indexed locator of the numeric leaf to retune"
+                },
+                "new_value": {
+                    "type": "object",
+                    "description": "the typed replacement value",
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "Period" },
+                                "value": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "an indicator period or bar count"
+                                }
+                            },
+                            "required": ["type", "value"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "const": "Threshold" },
+                                "value": {
+                                    "type": "string",
+                                    "description": "a decimal STRING (e.g. \"0.03\"), never a float"
+                                }
+                            },
+                            "required": ["type", "value"]
+                        }
+                    ]
+                },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "one sentence: what you expect the change to do, and which \
+                                    number in the result led you there. Must not be empty."
+                }
+            },
+            "required": ["path", "new_value", "hypothesis"]
+        }),
     }
 }

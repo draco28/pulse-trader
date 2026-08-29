@@ -39,6 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::domain::{ModelPrice, PriceTable};
 
@@ -61,6 +62,12 @@ const COMPOSER_FILE: &str = "composer.md";
 /// The compiled-in default composer prompt (the versioned `.md`, authored as
 /// DATA per `PROMPT_GOVERNANCE` §3 — not a Rust `const` string literal).
 const COMPOSER_PROMPT_DEFAULT: &str = include_str!("prompts/composer.md");
+
+/// The coach-prompt file name under the resolved prompt-override dir (r1.s2.w3).
+const COACH_FILE: &str = "coach.md";
+
+/// The compiled-in default coach prompt — same DATA discipline as the composer's.
+const COACH_PROMPT_DEFAULT: &str = include_str!("prompts/coach.md");
 
 /// The compiled-in default price table — the SHIPPED `config/prices.toml`,
 /// embedded verbatim so a relocated or packaged binary is self-contained.
@@ -288,6 +295,76 @@ fn load_composer_prompt_from(prompt_dir: Option<&Path>) -> Result<String, Config
         }
     }
     Ok(COMPOSER_PROMPT_DEFAULT.to_owned())
+}
+
+/// A resolved agent prompt and the version stamped on every call it drives.
+///
+/// The pair travels together on purpose (r1.s2 audit C2): `version` is the
+/// content hash of the bytes in `text`, so a caller cannot stamp one prompt's
+/// version onto another prompt's call.
+pub(crate) struct CoachPrompt {
+    /// The resolved prompt text — the overlay's if one won, else the compiled-in
+    /// default.
+    pub(crate) text: String,
+    /// SHA-256 hex of `text`'s bytes — what lands in `llm_call.prompt_version`.
+    pub(crate) version: String,
+}
+
+/// Load the coach system prompt and its version.
+///
+/// Resolution mirrors [`load_composer_prompt`]: `$PULSE_PROMPT_DIR/coach.md` wins
+/// if it exists (the private-workspace runtime override), otherwise the
+/// compiled-in default.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] only when a `$PULSE_PROMPT_DIR/coach.md` override
+/// exists but cannot be read; the compiled-in default path is infallible.
+pub(crate) fn load_coach_prompt() -> Result<CoachPrompt, ConfigError> {
+    let override_dir = std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from);
+    load_coach_prompt_from(override_dir.as_deref())
+}
+
+/// Load the coach prompt given an optional override directory (the testable core
+/// of [`load_coach_prompt`]).
+///
+/// **The version is computed from the RESOLVED bytes** — whichever source won
+/// (audit C2). That is what makes an overlay edit change the recorded version with
+/// no release step, and what makes the ledger's `prompt_version` an answer to
+/// "which prompt produced this?" rather than "which release was this?".
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] when `prompt_dir/coach.md` exists but cannot be
+/// read. A broken overlay is an error rather than a silent fall-back to the
+/// default: silently coaching with a different prompt than the operator installed
+/// is exactly the drift the version hash exists to make visible.
+pub(crate) fn load_coach_prompt_from(
+    prompt_dir: Option<&Path>,
+) -> Result<CoachPrompt, ConfigError> {
+    let text = if let Some(dir) = prompt_dir {
+        let path = dir.join(COACH_FILE);
+        if path.is_file() {
+            fs::read_to_string(&path).map_err(|source| ConfigError::Read { path, source })?
+        } else {
+            COACH_PROMPT_DEFAULT.to_owned()
+        }
+    } else {
+        COACH_PROMPT_DEFAULT.to_owned()
+    };
+    let version = prompt_version(&text);
+    Ok(CoachPrompt { text, version })
+}
+
+/// The SHA-256 hex of a resolved prompt's bytes (audit C2).
+///
+/// `sha2` is the workspace's existing hashing dependency — the same one
+/// `BacktestResult::result_content_hash` and `build.rs`'s engine fingerprint use.
+/// No new crate.
+fn prompt_version(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

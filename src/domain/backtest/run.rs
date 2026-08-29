@@ -27,7 +27,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use super::regime::RegimeBreakdown;
 use super::stats::SummaryStats;
+use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
 
 /// Identifier of a persisted [`PersistedRun`] — a `#[serde(transparent)]`
@@ -97,6 +99,20 @@ pub struct PersistedRun {
     /// The derived read-only summary projection (expectancy / win rate / profit
     /// factor / Sharpe / drawdown / streaks / totals — all C4 stat columns).
     pub summary: SummaryStats,
+    /// The per-regime trade-count / net-P&L breakdown, as persisted.
+    ///
+    /// r1.s2.w3: a **pass-through of a stored value**, not a recomputation.
+    /// `get_run` already decoded this column to re-derive `result_content_hash`;
+    /// it now also surfaces it, because the coach's bounded `CoachContext`
+    /// (ADR-0021 decision 8) reads it and the money-math control says the coach
+    /// must read persisted results rather than recompute them. Nothing about the
+    /// hash input, its feed order, or the query changed.
+    pub regime_breakdown: RegimeBreakdown,
+    /// The counts of entries the sizer skipped, as persisted. Same pass-through
+    /// reasoning as [`regime_breakdown`](Self::regime_breakdown) — and unlike the
+    /// regime split, these are **not** derivable from the trade log at all: they
+    /// count entries that never became trades.
+    pub skipped_entries: SkippedEntryCounts,
 }
 
 /// The typed list projection of one run for the catalog

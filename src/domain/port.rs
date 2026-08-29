@@ -932,6 +932,8 @@ mod backtest_run_repository_tests {
                 funding_total: result.funding_total,
                 slippage_total: result.slippage_total,
                 summary: summary.clone(),
+                regime_breakdown: result.regime_breakdown,
+                skipped_entries: result.skipped_entries,
             };
             self.runs
                 .lock()

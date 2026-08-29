@@ -37,3 +37,10 @@ pub(crate) use tools::{
 // with 2.01–2.03's re-exports at the merge into `slice/VS-1.3.2`).
 mod composer;
 pub use composer::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
+
+// r1.s2.w3 (ADR-0021): the coach turn — ONE provider call over the single
+// `propose_mutation` tool, ending as exactly one recorded `CoachingSession` (a
+// proposal or a typed failure, never silence). `pub` because the CLI composition
+// root (`src/cli/coach.rs`) and `r1.s4`'s rail consume it; mirrored at `src/lib.rs`.
+mod coach;
+pub use coach::{Coach, CoachTurnError};
