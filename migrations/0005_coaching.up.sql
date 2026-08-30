@@ -102,9 +102,24 @@ CREATE TABLE coaching_proposals (
   -- SPACES ONLY. A hypothesis of a single tab or newline would pass `trim(x)` and
   -- then be refused by `Hypothesis::new` (Rust's `str::trim` is whitespace-wide) at
   -- READ time — so the row would insert and `list_sessions_for_run` would
-  -- fail-close on it forever after. The set is ASCII HT/LF/VT/FF/CR/space, the
-  -- whitespace a stored hypothesis can realistically carry.
-  CHECK (length(trim(hypothesis, char(9, 10, 11, 12, 13, 32))) > 0),
+  -- fail-close on it forever after.
+  --
+  -- The set is therefore every scalar Rust's `char::is_whitespace` accepts (the
+  -- Unicode `White_Space` property), NOT the ASCII subset: ASCII HT/LF/VT/FF/CR/SP,
+  -- NEL, NBSP, OGHAM SPACE MARK, EN QUAD..HAIR SPACE, LINE/PARAGRAPH SEPARATOR,
+  -- NARROW NBSP, MEDIUM MATHEMATICAL SPACE, IDEOGRAPHIC SPACE. Parity with the
+  -- domain rule is what matters, so it is test-enforced rather than trusted:
+  -- `migration_0005::the_hypothesis_check_rejects_every_scalar_rust_calls_whitespace`
+  -- derives the set from the toolchain and asserts each one is refused. If a future
+  -- Rust picks up a Unicode revision that adds a scalar, that test goes red and this
+  -- list is what gets updated. Non-whitespace Unicode stays acceptable — U+200B
+  -- ZERO WIDTH SPACE is not `White_Space`, and is deliberately storable.
+  CHECK (
+    length(trim(hypothesis, char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+                                 8192, 8193, 8194, 8195, 8196, 8197, 8198,
+                                 8199, 8200, 8201, 8202, 8232, 8233, 8239,
+                                 8287, 12288))) > 0
+  ),
 
   -- `r1.s4`'s consistency model: no accepted proposal without its child version,
   -- and no child version on a proposal that was not accepted.

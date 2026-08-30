@@ -442,6 +442,66 @@ async fn an_empty_overlay_dir_falls_back_to_the_compiled_in_default() {
 }
 
 // ---------------------------------------------------------------------------
+// 4. One capture buffer per invocation (PR #128, finding F2)
+// ---------------------------------------------------------------------------
+
+/// Turns on ONE coach are serialized by `run_turn(&mut self)`, which answers half of
+/// the correlation question. The other half is the composition root: two invocations
+/// must not share one capture buffer either, or the second turn could name the
+/// first's ledger row. The root mints the buffer per invocation and hands that one
+/// handle to exactly one capturing repo and one coach; this asserts the effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_turns_through_the_composition_root_each_name_their_own_ledger_row() {
+    let (_tmp, db, _version, run_id) = seeded().await;
+
+    let (first, _) = coach_once(
+        &db,
+        &run_id,
+        vec![propose_call(
+            "entry.lhs.indicator.rsi.period",
+            &json!({ "type": "Period", "value": 21 }),
+            "a slower RSI should cut the whipsaw entries",
+        )],
+        None,
+    )
+    .await;
+    let (second, _) = coach_once(
+        &db,
+        &run_id,
+        vec![propose_call(
+            "entry.lhs.indicator.rsi.period",
+            &json!({ "type": "Period", "value": 9 }),
+            "a faster RSI should catch more of the move",
+        )],
+        None,
+    )
+    .await;
+
+    let first_call = first
+        .session
+        .llm_call_id
+        .expect("the first turn reached the provider and names its ledger row");
+    let second_call = second
+        .session
+        .llm_call_id
+        .expect("the second turn reached the provider and names its ledger row");
+
+    assert_ne!(
+        first_call, second_call,
+        "each invocation must name its OWN ledger row, never the other's"
+    );
+
+    // And both ids are real rows, not stale handles from a shared buffer.
+    let llm_repo = SqliteLlmCallRepo::new(db.pool().clone());
+    for id in [&first_call, &second_call] {
+        assert!(
+            llm_repo.get_call(id).await.expect("get_call").is_some(),
+            "the named ledger row must exist"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A price table + config live in `fixture`; this keeps the unused-import lint
 // honest about what this binary actually needs.
 // ---------------------------------------------------------------------------

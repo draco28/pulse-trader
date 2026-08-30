@@ -29,20 +29,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulse::{
-    BacktestResult, BacktestRunId, BacktestRunRepository, CoachCliOutcome, CoachFailure,
-    CoachWiring, CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy, DataError, Db,
-    Disposition, EngineFingerprint, FakeClock, LlmConfig, LlmError, LlmProvider, LlmResponse,
-    MIGRATOR, Message, MutationError, NewVersion, Redactor, RegimeBreakdown, SessionOutcome,
-    SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo,
-    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats, TokenUsage, ToolCall,
-    ToolDefinition, run_coach_with,
+    BacktestResult, BacktestRunId, BacktestRunRepository, Coach, CoachCliOutcome, CoachFailure,
+    CoachTurnError, CoachWiring, CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy,
+    DataError, Db, Disposition, EngineFingerprint, FakeClock, LlmConfig, LlmError, LlmProvider,
+    LlmResponse, MIGRATOR, Message, MutationError, NewVersion, Redactor, RegimeBreakdown,
+    SessionOutcome, SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo,
+    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats,
+    TokenUsage, ToolCall, ToolDefinition, run_coach_with,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
 use tempfile::TempDir;
 
 mod coach_support;
-use coach_support::{CapturingLlmRepo, canonical_dsl_json, config, test_prices};
+use coach_support::{CapturingLlmRepo, canonical_dsl_json, capture, config, test_prices};
 
 /// A scripted provider that counts its calls and can stall past a turn timeout.
 struct ScriptedProvider {
@@ -666,6 +666,87 @@ async fn an_oversized_system_prompt_is_recorded_as_context_overflow_before_any_c
         "a pre-call failure records no ledger row (audit C3)"
     );
     assert_persisted(&db, &outcome).await;
+}
+
+/// A run and a version that do not belong together is a CALLER fault, not a
+/// coaching outcome (PR #128, finding F3). `run_coach_with` loads the version from
+/// the run and cannot produce the pair, but `Coach` is exported, so a direct caller
+/// can — and the turn would then prompt on unrelated DSL and persist a session whose
+/// FKs are individually valid and jointly false. Caught first: no context, no
+/// budget check, no call, no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_and_version_that_do_not_belong_together_are_refused_before_any_call() {
+    let (_tmp, db, run_id) = seeded().await;
+    let clock = FakeClock::at(1_700_000_000_000);
+    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
+    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
+
+    let run = run_repo
+        .get_run(&run_id)
+        .await
+        .expect("load the run")
+        .expect("the seeded run exists");
+    let trades = run_repo.get_trades(&run_id).await.expect("load the trades");
+    let owner = strategy_repo
+        .get_version(&run.strategy_version_id)
+        .await
+        .expect("load the run's version")
+        .expect("the run's version exists");
+
+    // A second version under the same strategy that this run was never produced
+    // against — a real row, and the wrong one.
+    let stranger = strategy_repo
+        .create_version(NewVersion {
+            strategy_id: owner.strategy_id.clone(),
+            parent_version_id: Some(owner.id.clone()),
+            dsl_json: canonical_dsl_json(),
+            created_by: CreatedBy::Human,
+            creating_llm_call_ids: vec![],
+        })
+        .await
+        .expect("create the stranger version");
+
+    let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        good_args("entry.lhs.indicator.rsi.period"),
+    )])]);
+    let mut coach = Coach::new(provider, "unused prompt".to_owned(), config(), capture());
+
+    let err = coach
+        .run_turn(
+            &coaching_repo,
+            CoachingSessionId::new("sess-mismatch".to_owned()),
+            &run,
+            &trades,
+            &stranger,
+        )
+        .await
+        .expect_err("a run and a version that do not belong together is not a coaching outcome");
+
+    match &err {
+        CoachTurnError::RunVersionMismatch {
+            run_version,
+            offered,
+            ..
+        } => {
+            assert_eq!(run_version.as_str(), run.strategy_version_id.as_str());
+            assert_eq!(offered.as_str(), stranger.id.as_str());
+        }
+        other => panic!("expected RunVersionMismatch, got {other:?}"),
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the mismatch is caught before the provider is called"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
+        .fetch_one(db.pool())
+        .await
+        .expect("count the coaching sessions");
+    assert_eq!(rows, 0, "a caller fault writes no session row");
 }
 
 // ---------------------------------------------------------------------------

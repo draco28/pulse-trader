@@ -601,6 +601,32 @@ mod tests {
         );
     }
 
+    /// The MUTABLE SURFACE is a contract too (PR #128, finding F4). `sweepable_paths`
+    /// visits indicator specs, exit numerics and risk numerics — and never
+    /// `ValueSource::Constant`, so the `30` in `RSI(14) < 30` renders as a plain
+    /// number in the document the model reads and is nonetheless unaddressable. A
+    /// prompt inviting "any numeric leaf" is therefore an instruction a model can
+    /// follow faithfully into a deterministic `UnknownPath`.
+    #[test]
+    fn the_shipped_coach_prompt_names_the_mutable_surface_and_excludes_condition_constants() {
+        let prompt = COACH_PROMPT_DEFAULT.to_lowercase();
+
+        for family in ["indicator periods", "exit parameters", "risk parameters"] {
+            assert!(
+                prompt.contains(family),
+                "the prompt must name the `{family}` family, which is what it can actually address"
+            );
+        }
+        assert!(
+            prompt.contains("cannot change a constant"),
+            "the constant exclusion must be an instruction, not an omission"
+        );
+        assert!(
+            prompt.contains("rsi(14) < 30"),
+            "the exclusion needs the concrete case a model will meet in the fixture"
+        );
+    }
+
     /// The live coach path: `pulse coach` resolves [`prompt_override_dir`] and
     /// feeds it to [`load_coach_prompt_from`], so an operator's
     /// `$PULSE_PROMPT_DIR/coach.md` really does drive the turn AND the recorded

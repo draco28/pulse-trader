@@ -478,6 +478,87 @@ async fn a_hypothesis_may_not_be_blank_at_the_sql_layer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hypothesis_check_rejects_every_scalar_rust_calls_whitespace() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    // The expectation is DERIVED from the toolchain rather than restated as a list:
+    // whatever `Hypothesis::new`'s `str::trim` calls whitespace is exactly what this
+    // column must refuse. A scalar the CHECK admits and the domain rejects is a row
+    // that inserts once and that no typed read can ever return.
+    let whitespace: Vec<char> = (0..=0x0010_FFFF)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_whitespace())
+        .collect();
+
+    // Guard the harness itself: an empty or truncated set would make every
+    // assertion below pass while testing nothing.
+    assert!(
+        whitespace.len() >= 25,
+        "the derived whitespace set looks truncated ({} scalars)",
+        whitespace.len()
+    );
+    for probe in ['\u{00a0}', '\u{3000}'] {
+        assert!(
+            whitespace.contains(&probe),
+            "U+{:04X} must be in the derived set",
+            probe as u32
+        );
+    }
+
+    for c in &whitespace {
+        let only = c.to_string();
+        let outcome =
+            insert_proposal(db.pool(), "prop-ws", "sess-1", &only, "proposed", None).await;
+        assert!(
+            outcome.is_err(),
+            "a hypothesis of U+{:04X} alone must be rejected by the schema",
+            *c as u32
+        );
+    }
+
+    // And a string mixing every one of them is just as blank.
+    let mixed: String = whitespace.iter().collect();
+    let outcome = insert_proposal(db.pool(), "prop-ws", "sess-1", &mixed, "proposed", None).await;
+    assert!(
+        outcome.is_err(),
+        "a hypothesis of nothing but whitespace must be rejected however it is spelled"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hypothesis_carrying_non_whitespace_unicode_is_stored() {
+    let (_tmp, db) = seeded_db().await;
+    insert_proposed_session(db.pool(), "sess-1")
+        .await
+        .expect("seed session");
+
+    // The CHECK trims whitespace; it does not ban non-ASCII. `U+200B` is the
+    // boundary case in the other direction — a zero-width SPACE that Unicode does
+    // NOT give the `White_Space` property, so `str::trim` keeps it and so must the
+    // column.
+    for text in [
+        "RSI(14) は速すぎる",
+        "\u{200b}",
+        "\u{00a0}the stop is inside the noise\u{00a0}",
+        "expectancy → 0.03R",
+    ] {
+        insert_proposal(db.pool(), "prop-ok", "sess-1", text, "proposed", None)
+            .await
+            .unwrap_or_else(|e| panic!("a hypothesis of {text:?} must be storable: {e}"));
+
+        // `coaching_proposals.session_id` is UNIQUE, so clear the row before the
+        // next sample rather than seeding a session per case.
+        sqlx::query("DELETE FROM coaching_proposals WHERE id = 'prop-ok'")
+            .execute(db.pool())
+            .await
+            .expect("clear the proposal row");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_session_carries_its_reason_and_a_proposed_one_does_not() {
     let (_tmp, db) = seeded_db().await;
 

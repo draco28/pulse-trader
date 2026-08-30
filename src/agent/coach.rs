@@ -7,10 +7,11 @@
 //! Persistence is inside the turn rather than left to the caller on purpose — a
 //! guarantee a caller can forget is not a guarantee.
 //!
-//! The two things that are NOT recorded outcomes are the two that are not
-//! *coaching* at all: a fault this process raised on the call path (a failed
-//! ledger write, an unpriced model) and a failure to write the session row itself.
-//! Both surface as [`CoachTurnError`] at the CLI edge (ADR-0017).
+//! The things that are NOT recorded outcomes are the ones that are not *coaching*
+//! at all: a caller handing in a run and a version that do not belong together, a
+//! fault this process raised on the call path (a failed ledger write, an unpriced
+//! model), and a failure to write the session row itself. All three surface as
+//! [`CoachTurnError`] at the CLI edge (ADR-0017).
 //!
 //! **One provider call, and every deviation is terminal** (grill L3). Zero tool
 //! calls, several tool calls, unparseable arguments, an empty hypothesis, a
@@ -34,10 +35,12 @@
 use std::time::{Duration, Instant};
 
 use crate::domain::strategy::StrategyVersion;
+use crate::domain::strategy::VersionId;
 use crate::domain::{
-    CoachContext, CoachFailure, CoachingRepository, CoachingSession, CoachingSessionId, DataError,
-    Disposition, Hypothesis, LlmCallId, LlmConfig, LlmError, LlmProvider, Message, Mutation,
-    PersistedRun, Proposal, SessionOutcome, ToolDefinition, Trade, apply,
+    BacktestRunId, CoachContext, CoachFailure, CoachingRepository, CoachingSession,
+    CoachingSessionId, DataError, Disposition, Hypothesis, LlmCallId, LlmConfig, LlmError,
+    LlmProvider, Message, Mutation, PersistedRun, Proposal, SessionOutcome, ToolDefinition, Trade,
+    apply,
 };
 
 use crate::adapters::llm::redacting_logging::Redactor;
@@ -54,6 +57,29 @@ use super::tools::{PROPOSE_MUTATION_TOOL, ProposeMutationArgs, coach_tool_defini
 /// Both surface at the CLI edge, preserved (ADR-0017).
 #[derive(Debug, thiserror::Error)]
 pub enum CoachTurnError {
+    /// The `run` and the `version` handed in do not belong together — `version` is
+    /// not the version `run` was produced against.
+    ///
+    /// A CALLER fault, deliberately on this side of the line (PR #128, finding F3).
+    /// The coach would otherwise prompt on one version's DSL about another
+    /// version's result and then persist a session whose two foreign keys are each
+    /// individually valid and jointly false: an audit row asserting a coaching turn
+    /// that related a run to a version it never touched. `run_coach_with` loads the
+    /// version FROM the run and cannot build the pair, but [`Coach`] is exported, so
+    /// a direct caller can — which is why the check lives in the turn rather than at
+    /// the CLI edge.
+    #[error(
+        "backtest run `{}` was produced against strategy version `{}`, not `{}`",
+        .run.as_str(), .run_version.as_str(), .offered.as_str()
+    )]
+    RunVersionMismatch {
+        /// The run whose ownership the caller contradicted.
+        run: BacktestRunId,
+        /// The version that run names.
+        run_version: VersionId,
+        /// The version the caller offered instead.
+        offered: VersionId,
+    },
     /// The turn never happened because THIS process faulted on the provider call
     /// path — the decorator's ledger insert failed, the configured model has no
     /// price-table entry, the clock is out of range.
@@ -220,19 +246,66 @@ impl<P: LlmProvider> Coach<P> {
     /// [`CoachTurnError`]. Every *coaching* outcome, success or deviation — a
     /// transport fault included — is an `Ok` carrying its recorded session.
     ///
+    /// # Exclusivity
+    ///
+    /// Turns on ONE coach are serialized by the receiver, not by a lock: the
+    /// capture buffer is append-only and shared with the ledger decorator, so the
+    /// snapshot → call → id-extraction sequence must not interleave with another
+    /// turn's, or a session names a ledger row it did not produce. `&mut self`
+    /// makes the interleaving unwritable rather than unlikely — the borrow checker
+    /// rejects a second turn while the first is alive:
+    ///
+    /// ```compile_fail
+    /// # use pulse::{
+    /// #     Coach, CoachingRepository, CoachingSessionId, LlmProvider, PersistedRun,
+    /// #     StrategyVersion, Trade,
+    /// # };
+    /// # async fn overlapping_turns<P: LlmProvider, R: CoachingRepository>(
+    /// #     coach: &mut Coach<P>,
+    /// #     sessions: &R,
+    /// #     first_id: CoachingSessionId,
+    /// #     second_id: CoachingSessionId,
+    /// #     run: &PersistedRun,
+    /// #     trades: &[Trade],
+    /// #     version: &StrategyVersion,
+    /// # ) {
+    /// let first = coach.run_turn(sessions, first_id, run, trades, version);
+    /// let second = coach.run_turn(sessions, second_id, run, trades, version);
+    /// let _ = (first.await, second.await);
+    /// # }
+    /// ```
+    ///
+    /// Two coaches never share one buffer either: the composition root mints it per
+    /// invocation and hands that one handle to exactly one capturing repo and one
+    /// coach (`src/cli/coach.rs`).
+    ///
     /// # Errors
     ///
-    /// [`CoachTurnError::LocalFault`] if this process faulted on the call path;
-    /// [`CoachTurnError::Record`] / [`CoachTurnError::RecordFailed`] if the session
-    /// could not be written.
+    /// [`CoachTurnError::RunVersionMismatch`] if `version` is not the version `run`
+    /// was produced against; [`CoachTurnError::LocalFault`] if this process faulted
+    /// on the call path; [`CoachTurnError::Record`] /
+    /// [`CoachTurnError::RecordFailed`] if the session could not be written.
     pub async fn run_turn<R: CoachingRepository>(
-        &self,
+        &mut self,
         sessions: &R,
         session_id: CoachingSessionId,
         run: &PersistedRun,
         trades: &[Trade],
         version: &StrategyVersion,
     ) -> Result<CoachingSession, CoachTurnError> {
+        // 0. Ownership, before the projection, the budgets, the call and any write
+        // (PR #128, finding F3). A run coached against someone else's version is a
+        // caller mistake, and the session it would leave behind is worse than no
+        // session: individually valid FKs asserting a relationship that never
+        // existed.
+        if run.strategy_version_id != version.id {
+            return Err(CoachTurnError::RunVersionMismatch {
+                run: run.id.clone(),
+                run_version: run.strategy_version_id.clone(),
+                offered: version.id.clone(),
+            });
+        }
+
         // 1. The bounded projection, refused pre-call when the DSL does not fit.
         let context = match CoachContext::build(run, trades, &version.dsl, self.max_dsl_bytes) {
             Ok(context) => context,
