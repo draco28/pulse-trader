@@ -808,8 +808,9 @@ async fn a_run_and_version_that_do_not_belong_together_are_refused_before_any_ca
     assert_eq!(rows, 0, "a caller fault writes no session row");
 }
 
-/// A turn that reached the provider MUST name the ledger row that call minted
-/// (audit C3: `llm_call_id` is NULL precisely when no call was made). `Coach::new`
+/// A turn that reached the provider MUST name the ledger row that call minted: NULL
+/// there would claim a correlation that does not exist, and audit C3 reads a NULL on
+/// a POST-call session as exactly that. `Coach::new`
 /// takes the provider and the capture handle independently, so a caller can hand it
 /// a provider that is not the capturing decorator — and before PR #128 (finding G1)
 /// the turn then wrote a post-call session with NULL, saying "no call was made"

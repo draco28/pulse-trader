@@ -272,6 +272,18 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
             )));
         }
 
+        // `created_at` is a TEXT column, so nothing but this stops a row written
+        // around the adapter from reading back as a timestamp it is not (PR #128,
+        // finding H3; `get_call` already takes this posture). It is a CHECK, not a
+        // normalisation: the stored text is returned unchanged, because rewriting an
+        // audit value on read would make the row disagree with itself.
+        DateTime::parse_from_rfc3339(&r.created_at).map_err(|e| {
+            DataError::Db(format!(
+                "coaching_sessions `{}`: malformed created_at `{}`: {e}",
+                r.id, r.created_at
+            ))
+        })?;
+
         let outcome = match r.outcome.as_str() {
             OUTCOME_PROPOSED => {
                 let proposal = self.fetch_proposal(&r.id).await?.ok_or_else(|| {
@@ -415,12 +427,14 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 
-        // PROVENANCE, in the same transaction and BEFORE the state update
-        // (PR #128, finding G2). `0005`'s FK can say the child version exists; it
-        // cannot say the child is THIS proposal's child.
-        if let Some(child) = disposition.child_version_id() {
-            Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
-        }
+        // The WRITE comes first, and the provenance proof follows it inside the same
+        // transaction (PR #128, finding H2). Reading first made this a DEFERRED
+        // transaction that then had to upgrade to a write, and in WAL an upgrade
+        // whose snapshot another commit has moved past fails immediately with
+        // `SQLITE_BUSY_SNAPSHOT` — `busy_timeout` does not cover snapshot conflicts,
+        // so two clients replaying one idempotent accept could collide. Taking the
+        // write lock with the first statement removes the upgrade; the proof still
+        // runs before any commit, so an invalid child rolls back unwritten.
 
         // CONDITIONAL on the current state, not a blind UPDATE. `Proposed` and
         // `Modified` are the two states a proposal may leave; `Accepted` and
@@ -441,6 +455,14 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         .rows_affected();
 
         if affected == 1 {
+            // PROVENANCE before the commit (PR #128, finding G2). `0005`'s FK can
+            // say the child version exists; it cannot say the child is THIS
+            // proposal's child. An `Err` here drops `tx`, so the row the UPDATE
+            // touched is rolled back and the proposal stays exactly as open as it
+            // was.
+            if let Some(child) = disposition.child_version_id() {
+                Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
+            }
             tx.commit()
                 .await
                 .map_err(|e| DataError::Db(e.to_string()))?;
@@ -474,6 +496,12 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         // proposal, which is what the key exists to refuse. `Disposition`'s
         // equality compares the payload, so the two cases separate themselves.
         if &current == disposition {
+            // A replay is validated too, not waved through on the strength of the
+            // first accept having been checked: this is the branch a retrying client
+            // lands on, and it must not be the cheap way past the lineage rule.
+            if let Some(child) = disposition.child_version_id() {
+                Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
+            }
             tx.commit()
                 .await
                 .map_err(|e| DataError::Db(e.to_string()))?;
@@ -496,8 +524,11 @@ impl<C: Clock> SqliteCoachingRepo<C> {
     /// An accept naming a root version, a version parented elsewhere, or another
     /// strategy's version records a lineage that never happened — and `r1.s4` reads
     /// that lineage AS the version tree, so the false edge is not recoverable from
-    /// the row afterwards. It runs on the caller's `tx` and before the state update
-    /// on purpose: a rejection must leave the proposal exactly as open as it was.
+    /// the row afterwards. It runs on the caller's `tx`, after the conditional write
+    /// and before the commit (PR #128, finding H2): the write has to be the
+    /// transaction's first statement so it never upgrades a read snapshot, and the
+    /// proof has to precede the commit so a rejection leaves the proposal exactly as
+    /// open as it was.
     async fn check_child_provenance(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,

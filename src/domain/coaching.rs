@@ -5,8 +5,11 @@
 //! [`CoachFailure`]. That is a type-level property here, not a convention:
 //! [`SessionOutcome`] is an enum, so a session carrying both or neither is not
 //! representable. The session row is the audit trail (audit C3) — every turn
-//! outcome persists, and `llm_call_id` is `None` precisely when no provider call
-//! was made (a pre-call failure such as [`CoachFailure::ContextOverflow`]).
+//! outcome persists, and `llm_call_id` is `None` when no ledger row was correlated
+//! to the turn. That is NOT the same as "no provider call was made": a pre-call
+//! refusal such as [`CoachFailure::ContextOverflow`] never called, but a
+//! [`CoachFailure::ProviderTimeout`] or [`CoachFailure::TransportFailure`] can be
+//! an ATTEMPT that produced no priced row. The implication runs one way only.
 //!
 //! **Validity is use-time, never stored (audit C4).** There is deliberately no
 //! `validated` field on [`Proposal`] and no such column in migration `0005`.

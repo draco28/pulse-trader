@@ -124,7 +124,9 @@ fn a_session_carries_a_proposal_or_a_failure() {
     }
 
     // A pre-call failure records no LlmCall row (audit C3): the session row IS the
-    // audit trail, and `llm_call_id` is NULL precisely when no call was made.
+    // audit trail, and this refusal happened BEFORE any call, so there is no ledger
+    // row to correlate. (The converse does not hold — a timeout or transport fault
+    // can be an attempt with no row.)
     let failed = session_with(
         SessionOutcome::Failed {
             failure: CoachFailure::ContextOverflow {

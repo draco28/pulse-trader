@@ -433,10 +433,11 @@ pub trait LlmCallRepository {
 /// (`<R: CoachingRepository>`), never as `dyn`. Same `Send`-future style as
 /// [`StrategyRepository`] (audit C3) so a repository call can be `spawn`ed.
 ///
-/// **The session row IS the audit trail.** Every turn persists — a proposal or a
-/// typed failure — so "never silence" is a storage guarantee rather than a
-/// convention, and `llm_call_id` is `None` precisely when no provider call was
-/// made.
+/// **The session row IS the audit trail.** Every coaching outcome persists — a
+/// proposal or a typed failure — so "never silence" is a storage guarantee rather
+/// than a convention. `llm_call_id` is `None` when no ledger row was correlated to
+/// that turn, which does not prove the provider was never called: a timeout or a
+/// transport fault is an attempt that can leave no priced row behind.
 ///
 /// **This port persists; it does not decide.** The disposition state machine lives
 /// in [`Proposal::transition`](crate::domain::Proposal::transition), and

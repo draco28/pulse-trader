@@ -734,6 +734,125 @@ async fn assert_untouched(pool: &SqlitePool, session_id: &str) {
     );
 }
 
+/// Two clients replaying the SAME accept must both succeed (PR #128, finding H2).
+///
+/// The accept is idempotent by session id, so a client that lost the response
+/// retries — and two retries can land together. The provenance check added in G2
+/// read before the conditional UPDATE wrote, which on a DEFERRED transaction means
+/// the write is an upgrade: in WAL, if the other transaction commits in between,
+/// SQLite answers `SQLITE_BUSY_SNAPSHOT` at once and `busy_timeout` does not apply
+/// to snapshot conflicts. Taking the write first removes the upgrade.
+///
+/// Rounds rather than a single pair, because the interleaving is the scheduler's to
+/// choose: each round is an independent session, and every one of them must settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_identical_accepts_both_succeed() {
+    let (repo, pool, _tmp) = repo().await;
+    let accept = Disposition::Accepted {
+        child_version_id: VersionId::new("ver-2"),
+    };
+
+    for round in 0..20 {
+        let session_id = format!("sess-race-{round}");
+        let id = a_proposed_session(&repo, &session_id).await;
+
+        let (first, second) = tokio::join!(
+            repo.record_disposition(&id, &accept),
+            repo.record_disposition(&id, &accept),
+        );
+
+        for (label, outcome) in [("first", first), ("second", second)] {
+            outcome.unwrap_or_else(|e| {
+                panic!("round {round}: the {label} identical accept must succeed, got {e}")
+            });
+        }
+
+        let child: Option<String> = sqlx::query_scalar(
+            "SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1",
+        )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read child_version_id");
+        assert_eq!(
+            child.as_deref(),
+            Some("ver-2"),
+            "round {round}: both accepts must settle on the one child"
+        );
+    }
+}
+
+/// A stored `created_at` that is not RFC3339 is a corrupt row, and reading it back
+/// as if it were a timestamp is how a corrupt row becomes a wrong answer to an audit
+/// question (PR #128, finding H3). `SqliteLlmCallRepo` already fails closed on this;
+/// the coaching read did not. The stored text is returned UNCHANGED on success — the
+/// validation is a check, not a normalisation, because rewriting an audit value on
+/// read is its own kind of lie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_created_at_is_refused_on_read() {
+    let (repo, pool, _tmp) = repo().await;
+    insert_raw_failed_session(&pool, "sess-bad", "yesterday").await;
+
+    let outcome = repo.get_session(&CoachingSessionId::new("sess-bad")).await;
+
+    let err = outcome.expect_err("a malformed created_at must fail the read closed");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("created_at") && rendered.contains("yesterday"),
+        "the error must name the column and the value it refused: {rendered}"
+    );
+
+    // A well-formed row beside it still reads, and its timestamp comes back byte for
+    // byte as stored.
+    insert_raw_failed_session(&pool, "sess-good", "2026-08-29T00:00:00.000Z").await;
+    let good = repo
+        .get_session(&CoachingSessionId::new("sess-good"))
+        .await
+        .expect("a well-formed row still reads")
+        .expect("present");
+    assert_eq!(good.created_at, "2026-08-29T00:00:00.000Z");
+}
+
+/// The list path must fail closed on the same row: it reads ids and then routes each
+/// through `get_session`, which is the one place the decoding lives — a list that
+/// decoded rows a second way would be a second truth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_row_fails_the_list_too() {
+    let (repo, pool, _tmp) = repo().await;
+    insert_raw_failed_session(&pool, "sess-bad", "2026-08-29").await;
+
+    let outcome = repo
+        .list_sessions_for_run(&BacktestRunId::new("run-1"))
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "one corrupt row must fail the list, not be skipped out of it"
+    );
+}
+
+/// Write a `failed` coaching session straight to SQL, `created_at` and all — the
+/// only way to produce a row the adapter itself would never write.
+async fn insert_raw_failed_session(pool: &SqlitePool, id: &str, created_at: &str) {
+    let detail = serde_json::to_string(&CoachFailure::ContextOverflow {
+        detail: "a pathological document".to_owned(),
+    })
+    .expect("serialize the failure");
+
+    sqlx::query(
+        "INSERT INTO coaching_sessions \
+         (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, \
+          failure_kind, failure_detail, schema_version) \
+         VALUES (?1, 'run-1', 'ver-1', ?2, NULL, 'failed', 'context_overflow', ?3, 1)",
+    )
+    .bind(id)
+    .bind(created_at)
+    .bind(detail)
+    .execute(pool)
+    .await
+    .expect("seed the raw session row");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn modified_and_proposed_are_refused_as_targets() {
     let (repo, _pool, _tmp) = repo().await;

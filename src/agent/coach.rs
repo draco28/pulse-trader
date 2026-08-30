@@ -1,11 +1,15 @@
 //! The coach turn (r1.s2.w3, ADR-0021) — one provider call in, one recorded
 //! session out.
 //!
-//! **Never silence.** Every path through [`Coach::run_turn`] ends by persisting
-//! exactly one [`CoachingSession`]: a `Proposed` proposal, or one of the SEVEN
-//! typed [`CoachFailure`]s (`TransportFailure` joined the taxonomy in `r1.s2.w4`).
-//! Persistence is inside the turn rather than left to the caller on purpose — a
-//! guarantee a caller can forget is not a guarantee.
+//! **Never silence.** Every COACHING OUTCOME persists: a turn that produced one
+//! ends by writing exactly one [`CoachingSession`] — a `Proposed` proposal, or one
+//! of the SEVEN typed [`CoachFailure`]s (`TransportFailure` joined the taxonomy in
+//! `r1.s2.w4`). Persistence is inside the turn rather than left to the caller on
+//! purpose — a guarantee a caller can forget is not a guarantee.
+//!
+//! The exceptions are the typed caller, local and persistence faults below, which
+//! are not coaching outcomes at all and write nothing. "Every path persists" would
+//! be the tidier sentence and it is not the true one.
 //!
 //! The things that are NOT recorded outcomes are the ones that are not *coaching*
 //! at all: a caller handing in inputs that do not belong together, a fault this
@@ -396,7 +400,9 @@ impl<P: LlmProvider> Coach<P> {
                 };
                 // A timed-out call may still have produced a ledger row if the
                 // decorator got far enough; name it if so. ZERO is legitimate here
-                // (audit C3 — NULL iff no call was made); SEVERAL never is.
+                // and does NOT mean no attempt was made — the call went out and the
+                // answer did not come back inside the guard. SEVERAL is legitimate
+                // nowhere.
                 let call_id = self.captured_at_most_one(start)?;
                 return self
                     .record(sessions, session_id, run, version, call_id, failure)
@@ -412,8 +418,9 @@ impl<P: LlmProvider> Coach<P> {
                 };
                 // A transport fault may still have minted a ledger row if the
                 // decorator wrote one before failing; name it if so rather than
-                // asserting NULL (audit C3 is "NULL iff no call was made"). Zero is
-                // the common case here — no usable exchange, no priced row.
+                // asserting NULL. Zero is the common case here — no usable exchange,
+                // no priced row — and it records an ATTEMPT that happened, which is
+                // why `llm_call_id = NULL` cannot be read as "no call was made".
                 let call_id = self.captured_at_most_one(start)?;
                 let recorded = self
                     .record(sessions, session_id, run, version, call_id, failure)

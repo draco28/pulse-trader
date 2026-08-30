@@ -46,7 +46,10 @@ CREATE TABLE coaching_sessions (
   backtest_run_id      TEXT NOT NULL REFERENCES backtest_run(id),      -- the run the coach READ (and never recomputed)
   strategy_version_id  TEXT NOT NULL REFERENCES strategy_version(id),  -- whose DSL the proposal mutates
   created_at           TEXT NOT NULL,                                  -- injected Clock (RFC3339 UTC)
-  llm_call_id          TEXT REFERENCES llm_call(id),                   -- NULL iff no provider call was made (audit C3)
+  -- NULL when no ledger row was correlated to the turn (audit C3). NOT a claim
+  -- that no call was attempted: a pre-call refusal never called, but a timeout or a
+  -- transport fault is an attempt that can leave no priced row behind.
+  llm_call_id          TEXT REFERENCES llm_call(id),
   outcome              TEXT NOT NULL,                                  -- 'proposed' | 'failed'
   failure_kind         TEXT,                                           -- the CoachFailure tag; NULL iff outcome='proposed'
   failure_detail       TEXT,                                           -- serde JSON of the whole typed CoachFailure

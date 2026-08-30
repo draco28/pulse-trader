@@ -226,10 +226,7 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
         .model
         .clone()
         .unwrap_or_else(|| super::compose::COMPOSE_MODEL.to_owned());
-    let provider = match transport.base_url.clone() {
-        Some(base_url) => OpenAiCompatProvider::with_base_url(key.expose().to_owned(), base_url),
-        None => OpenAiCompatProvider::new(key.expose().to_owned()),
-    };
+    let provider = coach_provider(key.expose(), transport.base_url.as_deref());
 
     let clock = SystemClock;
     let captured: LlmCallCapture = Arc::new(Mutex::new(Vec::new()));
@@ -349,5 +346,48 @@ fn no_ledger_reason(outcome: &CoachCliOutcome) -> &'static str {
             failure: CoachFailure::ProviderTimeout { .. },
         } => "the call was attempted and did not answer inside the turn's budget",
         _ => "the turn failed before any provider call",
+    }
+}
+
+/// The coach's transport: ONE upstream attempt per turn (PR #128, finding H1).
+///
+/// `run_turn` records one exchange and names one ledger row, and it neither retries
+/// nor nudges (grill L3). The adapter's default posture retries a transient 429/5xx
+/// twice, which would put three upstream attempts — and their cost — behind that one
+/// record. The composer and `llm-check` keep the retrying default: neither records
+/// one exchange per attempt.
+///
+/// A function rather than an inline `match` because the posture is otherwise
+/// unobservable: this is the seam the unit test asserts against.
+fn coach_provider(api_key: &str, base_url: Option<&str>) -> OpenAiCompatProvider {
+    match base_url {
+        Some(url) => {
+            OpenAiCompatProvider::single_attempt_with_base_url(api_key.to_owned(), url.to_owned())
+        }
+        None => OpenAiCompatProvider::single_attempt(api_key.to_owned()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::coach_provider;
+
+    /// The coach's transport posture is chosen HERE, so it is proven here (PR #128,
+    /// finding H1). `OpenAiCompatProvider` cannot enforce it — a caller reaching for
+    /// `new` still retries — which is exactly why the composition site is the thing
+    /// worth asserting.
+    #[test]
+    fn the_live_coach_provider_makes_one_attempt_per_turn() {
+        assert_eq!(
+            coach_provider("k", None).max_retries(),
+            0,
+            "the default endpoint attempts once"
+        );
+        assert_eq!(
+            coach_provider("k", Some("https://example.test/v1")).max_retries(),
+            0,
+            "and a [llm].base_url override does not restore retries"
+        );
     }
 }

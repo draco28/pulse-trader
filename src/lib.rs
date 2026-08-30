@@ -407,8 +407,9 @@ pub use domain::ToolDefinition;
 // NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
 pub use domain::LlmCallRepository;
 // r1.s2.w2 (ADR-0021 / audit C3): the coaching persistence port — the session row is
-// the audit trail, so every turn persists as a proposal or a typed failure and
-// `llm_call_id` is `None` precisely when no provider call was made. REQUIRED under
+// the audit trail, so every coaching outcome persists as a proposal or a typed
+// failure, and `llm_call_id` is `None` when no ledger row was correlated to the turn
+// (not a proof that no call was attempted). REQUIRED under
 // `deny(warnings)` + `pub(crate) mod domain`. `w3` writes through it; `r1.s4`'s rail
 // reads and dispositions through it.
 pub use domain::CoachingRepository;
