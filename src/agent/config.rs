@@ -39,6 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::domain::{ModelPrice, PriceTable};
 
@@ -61,6 +62,12 @@ const COMPOSER_FILE: &str = "composer.md";
 /// The compiled-in default composer prompt (the versioned `.md`, authored as
 /// DATA per `PROMPT_GOVERNANCE` §3 — not a Rust `const` string literal).
 const COMPOSER_PROMPT_DEFAULT: &str = include_str!("prompts/composer.md");
+
+/// The coach-prompt file name under the resolved prompt-override dir (r1.s2.w3).
+const COACH_FILE: &str = "coach.md";
+
+/// The compiled-in default coach prompt — same DATA discipline as the composer's.
+const COACH_PROMPT_DEFAULT: &str = include_str!("prompts/coach.md");
 
 /// The compiled-in default price table — the SHIPPED `config/prices.toml`,
 /// embedded verbatim so a relocated or packaged binary is self-contained.
@@ -269,8 +276,18 @@ fn load_llm_transport_from(config_dir: &Path) -> Result<LlmTransport, ConfigErro
 /// override exists but cannot be read; the compiled-in default path is
 /// infallible.
 pub(crate) fn load_composer_prompt() -> Result<String, ConfigError> {
-    let override_dir = std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from);
-    load_composer_prompt_from(override_dir.as_deref())
+    load_composer_prompt_from(prompt_override_dir().as_deref())
+}
+
+/// The prompt-overlay directory the operator installed, if any — `$PULSE_PROMPT_DIR`.
+///
+/// The ONE place the variable is read, so every agent surface resolves the overlay
+/// the same way. A composition root that needs to hand the directory onward
+/// (`pulse coach`, whose injectable core takes it as a parameter so tests stay
+/// hermetic) calls this; one that resolves in place ([`load_composer_prompt`])
+/// calls it too.
+pub(crate) fn prompt_override_dir() -> Option<PathBuf> {
+    std::env::var_os(PROMPT_DIR_ENV).map(PathBuf::from)
 }
 
 /// Load the composer prompt given an optional override directory (the testable
@@ -290,12 +307,72 @@ fn load_composer_prompt_from(prompt_dir: Option<&Path>) -> Result<String, Config
     Ok(COMPOSER_PROMPT_DEFAULT.to_owned())
 }
 
+/// A resolved agent prompt and the version stamped on every call it drives.
+///
+/// The pair travels together on purpose (r1.s2 audit C2): `version` is the
+/// content hash of the bytes in `text`, so a caller cannot stamp one prompt's
+/// version onto another prompt's call.
+pub(crate) struct CoachPrompt {
+    /// The resolved prompt text — the overlay's if one won, else the compiled-in
+    /// default.
+    pub(crate) text: String,
+    /// SHA-256 hex of `text`'s bytes — what lands in `llm_call.prompt_version`.
+    pub(crate) version: String,
+}
+
+/// Load the coach prompt given an optional override directory.
+///
+/// Unlike [`load_composer_prompt`] this does NOT read the environment itself: the
+/// coach's composition root resolves [`prompt_override_dir`] and passes it in, so
+/// the injectable core (`run_coach_with`) stays hermetic under test rather than
+/// picking up a developer's exported `$PULSE_PROMPT_DIR`.
+///
+/// **The version is computed from the RESOLVED bytes** — whichever source won
+/// (audit C2). That is what makes an overlay edit change the recorded version with
+/// no release step, and what makes the ledger's `prompt_version` an answer to
+/// "which prompt produced this?" rather than "which release was this?".
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] when `prompt_dir/coach.md` exists but cannot be
+/// read. A broken overlay is an error rather than a silent fall-back to the
+/// default: silently coaching with a different prompt than the operator installed
+/// is exactly the drift the version hash exists to make visible.
+pub(crate) fn load_coach_prompt_from(
+    prompt_dir: Option<&Path>,
+) -> Result<CoachPrompt, ConfigError> {
+    let text = if let Some(dir) = prompt_dir {
+        let path = dir.join(COACH_FILE);
+        if path.is_file() {
+            fs::read_to_string(&path).map_err(|source| ConfigError::Read { path, source })?
+        } else {
+            COACH_PROMPT_DEFAULT.to_owned()
+        }
+    } else {
+        COACH_PROMPT_DEFAULT.to_owned()
+    };
+    let version = prompt_version(&text);
+    Ok(CoachPrompt { text, version })
+}
+
+/// The SHA-256 hex of a resolved prompt's bytes (audit C2).
+///
+/// `sha2` is the workspace's existing hashing dependency — the same one
+/// `BacktestResult::result_content_hash` and `build.rs`'s engine fingerprint use.
+/// No new crate.
+fn prompt_version(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        CONFIG_DIR_ENV, ConfigError, load_composer_prompt_from, load_llm_transport,
-        load_llm_transport_from, load_price_table_from, resolve_config_dir,
+        COACH_PROMPT_DEFAULT, CONFIG_DIR_ENV, ConfigError, PROMPT_DIR_ENV, load_coach_prompt_from,
+        load_composer_prompt_from, load_llm_transport, load_llm_transport_from,
+        load_price_table_from, prompt_override_dir, resolve_config_dir,
     };
     use crate::domain::{SchemaVersion, TokenUsage};
     use std::sync::Mutex;
@@ -497,6 +574,135 @@ mod tests {
         std::fs::write(dir.path().join("composer.md"), "OVERRIDDEN COMPOSER PROMPT").unwrap();
         let prompt = load_composer_prompt_from(Some(dir.path())).expect("override read");
         assert_eq!(prompt, "OVERRIDDEN COMPOSER PROMPT");
+    }
+
+    /// The shipped coach prompt as ONE whitespace-flattened line.
+    ///
+    /// Every prompt-contract needle below is a phrase, and the prompt is reflowed
+    /// prose — matching against the raw text would make a contract depend on where a
+    /// line happens to wrap. `scripts/check-adr-0021.sh` settled the same point for
+    /// the ADRs; this is that, in Rust.
+    fn coach_prompt_flattened() -> String {
+        COACH_PROMPT_DEFAULT
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The coach prompt's structural-limit clause is a CONTRACT, not prose
+    /// (PR #128, finding C2). `ADR-0021` says the coach must answer a structural
+    /// need with a recorded inapplicability, never an approximation — and the
+    /// shipped prompt once instructed the opposite, telling the model to reach for
+    /// the closest parameter it could find. Nothing else guards prompt CONTENT:
+    /// the ledger only hashes whatever text resolved, so a re-edit would ship
+    /// unnoticed.
+    ///
+    /// It asserts the bad instruction is absent and the rule that replaced it is
+    /// present. The structural-decline protocol itself is deliberately NOT here —
+    /// that is `r1.s4` (pulseai-labs/pulse-trader#131).
+    #[test]
+    fn the_shipped_coach_prompt_never_asks_for_an_approximated_structural_change() {
+        let prompt = coach_prompt_flattened();
+
+        assert!(
+            !prompt.contains("closest parameter"),
+            "the coach must not be told to approximate a structural change with the nearest parameter (ADR-0021)"
+        );
+        assert!(
+            prompt.contains("do not approximate a structural change"),
+            "the prompt must state the no-approximation rule outright, not merely omit the old instruction"
+        );
+    }
+
+    /// The MUTABLE SURFACE is a contract too (PR #128, finding F4). `sweepable_paths`
+    /// visits indicator specs, exit numerics and risk numerics — and never
+    /// `ValueSource::Constant`, so the `30` in `RSI(14) < 30` renders as a plain
+    /// number in the document the model reads and is nonetheless unaddressable. A
+    /// prompt inviting "any numeric leaf" is therefore an instruction a model can
+    /// follow faithfully into a deterministic `UnknownPath`.
+    #[test]
+    fn the_shipped_coach_prompt_names_the_mutable_surface_and_excludes_condition_constants() {
+        let prompt = coach_prompt_flattened();
+
+        for family in ["indicator periods", "exit parameters", "risk parameters"] {
+            assert!(
+                prompt.contains(family),
+                "the prompt must name the `{family}` family, which is what it can actually address"
+            );
+        }
+        assert!(
+            prompt.contains("cannot change a constant"),
+            "the constant exclusion must be an instruction, not an omission"
+        );
+        assert!(
+            prompt.contains("rsi(14) < 30"),
+            "the exclusion needs the concrete case a model will meet in the fixture"
+        );
+    }
+
+    /// The MFE/MAE numbers are POTENTIAL bounds, and the prompt has to say so
+    /// (PR #128, finding G3). The engine folds every bar the position was open into
+    /// the running excursion, the exit bar included and in full, so a trade that
+    /// exits at a bar's open still carries that whole bar's range — movement after
+    /// the close included. A coach told only "MFE/MAE aggregates in R" reads them as
+    /// profit a tighter stop would have captured, which is a parameter change made
+    /// on a number that was never reachable. Known behaviour, tracked as #55 and not
+    /// closed here.
+    #[test]
+    fn the_shipped_coach_prompt_labels_mfe_mae_as_full_bar_potential() {
+        let prompt = coach_prompt_flattened();
+
+        for needle in [
+            "full-bar potential",
+            "entry-through-exit bar ranges",
+            "the entire exit bar is folded in even when the trade exits at its open",
+            "not an experienced path",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "the prompt must carry {needle:?}, or the excursion numbers read as reachable"
+            );
+        }
+    }
+
+    /// The live coach path: `pulse coach` resolves [`prompt_override_dir`] and
+    /// feeds it to [`load_coach_prompt_from`], so an operator's
+    /// `$PULSE_PROMPT_DIR/coach.md` really does drive the turn AND the recorded
+    /// `prompt_version` (audit C2). Before PR #128 the live arm passed `None` here
+    /// and the overlay was silently ignored — the moat installed and inert.
+    ///
+    /// Env-mutating, so it shares `ENV_LOCK`.
+    #[test]
+    fn the_live_coach_path_resolves_the_prompt_dir_overlay() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("coach.md"), "OVERRIDDEN COACH PROMPT").unwrap();
+
+        // SAFETY: serialized by ENV_LOCK; no other test reads $PULSE_PROMPT_DIR.
+        unsafe {
+            std::env::set_var(PROMPT_DIR_ENV, dir.path());
+        }
+        let resolved = prompt_override_dir();
+        let overlay = load_coach_prompt_from(resolved.as_deref()).expect("overlay read");
+        // SAFETY: same lock scope; restore the environment before releasing it.
+        unsafe {
+            std::env::remove_var(PROMPT_DIR_ENV);
+        }
+
+        assert_eq!(resolved.as_deref(), Some(dir.path()));
+        assert_eq!(overlay.text, "OVERRIDDEN COACH PROMPT");
+        let default = load_coach_prompt_from(None).expect("compiled-in default");
+        assert_ne!(
+            overlay.version, default.version,
+            "an overlay edit must change the recorded prompt_version with no release step"
+        );
+
+        // And with nothing exported, the compiled-in default is what resolves.
+        assert!(
+            prompt_override_dir().is_none(),
+            "no $PULSE_PROMPT_DIR means no overlay"
+        );
     }
 
     /// Resolution order #1: an explicit `$PULSE_CONFIG_DIR` wins. The sole

@@ -11,6 +11,8 @@
 //! when `NO_COLOR` is set (or always, in this v1 — human output is plain).
 
 pub(crate) mod backtest;
+// r1.s2.w3: the coach composition root + the `pulse coach <run-id>` debug verb.
+pub(crate) mod coach;
 pub(crate) mod compose;
 pub(crate) mod fetch_data;
 pub(crate) mod indicators;
@@ -27,6 +29,7 @@ use crate::adapters::store::CandleStore;
 use crate::domain::{Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
+use coach::{CoachArgs, run_coach};
 use compose::{ComposeArgs, run_compose};
 use fetch_data::{TfOutcome, TfSummary, ensure_one_tf};
 use indicators::{IndicatorsArgs, run_indicators};
@@ -67,6 +70,9 @@ pub enum Command {
     /// Compose a natural-language target into a persisted, attributable
     /// `StrategyVersion` via the composer (the VS-1.3.2 demo, FR-3/FR-4/NFR-6).
     Compose(ComposeArgs),
+    /// Run ONE coach turn against a persisted backtest run and record it
+    /// (r1.s2.w3). A developer/debug surface: it claims no user journey.
+    Coach(CoachArgs),
 }
 
 /// `pulse fetch-data <PAIR> --tf <M15,H4> --years <N> [--json]`.
@@ -150,6 +156,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Compose(args) => {
             let db = open_db(args.db.as_deref()).await?;
             run_compose(Some(&db), &args).await
+        }
+        // r1.s2.w3: the coach debug verb. The session + ledger writes need a
+        // migrated `pulse.db` (migrate-then-open, mirroring every other arm).
+        Command::Coach(args) => {
+            let db = open_db(args.db.as_deref()).await?;
+            run_coach(Some(&db), &args).await
         }
     }
 }

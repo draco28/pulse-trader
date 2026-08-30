@@ -120,6 +120,30 @@ pub use domain::{
     EvalContext, compile, stop_price, take_profit_price,
 };
 
+// r1.s2.w1 (ADR-0021): the one-mutation framework. `apply(&StrategyDsl,
+// &Mutation) -> Result<CandidateDsl, MutationError>` is the whole surface — a
+// `CandidateDsl` exists only when the mutated strategy validated AND compiled,
+// and every other outcome is a typed `MutationError` a coaching session can
+// persist verbatim. `Mutation`/`ParamValue`/`ParamKind` are the parameter-only
+// vocabulary (r1). Re-exported on the same curated-surface pattern — REQUIRED
+// under `deny(warnings)` + `pub(crate) mod domain`, and the route r1.s2.w2/w3
+// and r1.s4 reach the framework through.
+pub use domain::{
+    CandidateDsl, Mutation, MutationError, ParamKind, ParamValue, apply, sweepable_paths,
+};
+
+// r1.s2.w2 (ADR-0021): the coaching session domain. `CoachingSession` is the audit
+// record of one coach turn — a `SessionOutcome` that is exactly one of a
+// `Proposal` (typed `Mutation` + non-empty `Hypothesis` + `Disposition`) or a typed
+// `CoachFailure`, never neither (the never-silence guarantee, made structural).
+// `CoachingError` carries the two domain refusals (empty hypothesis, illegal
+// disposition transition). Re-exported on the same curated-surface pattern —
+// REQUIRED under `deny(warnings)` + `pub(crate) mod domain`.
+pub use domain::{
+    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
+    DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
+};
+
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
 // wires behind the CLI and the integration boundary consumes. Same pattern as
@@ -178,6 +202,19 @@ pub use cli::llm::{LlmArgs, LlmCheckOutcome, run_llm_check, run_llm_check_with};
 pub use cli::compose::{
     ComposeArgs, ComposeCliOutcome, ComposeWiring, run_compose, run_compose_with,
 };
+
+// r1.s2.w3: the `pulse coach <run-id>` composition-root + debug surface (ADR-0021 /
+// ADR-0017). The three OFFLINE test binaries — `coach_turn` (demo `d6`),
+// `coach_failures` (demo `d7`) and `coach_redaction` — drive the injectable core
+// `run_coach_with` over a SCRIPTED provider + the REAL coach + REAL `apply()` +
+// REAL repos on a tempfile SQLite. NEVER a live LLM: two of the three are ledger
+// lines re-run at every future spine close. `CoachWiring` bundles the LLM-side
+// deps, `CoachCliOutcome` is the recorded session + the stamped prompt version.
+// REQUIRED under `deny(warnings)` — a `pub` item unused outside its private
+// `cli::coach` module is a `dead_code` build error, not a warning.
+pub use cli::coach::{CoachArgs, CoachCliOutcome, CoachWiring, run_coach, run_coach_with};
+// The coach itself, for `r1.s4`'s rail (which drives a turn without the CLI).
+pub use agent::{Coach, CoachTurnError};
 
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
@@ -250,6 +287,13 @@ pub use adapters::db::SqliteBacktestRunRepo;
 // 1.04's decorator constructs it; 1.05's demo reads a row back. Append-only
 // (keep-both with 1.03's re-export at merge).
 pub use adapters::db::SqliteLlmCallRepo;
+// r1.s2.w2 (ADR-0021): the SQLite `CoachingRepository` adapter. `SqliteCoachingRepo`
+// persists one coach turn per transaction — the session row plus its proposal row —
+// with `created_at` from an injected `Clock`, the typed `Mutation` and `CoachFailure`
+// stored as serde JSON, and a `schema_version` read-reject. REQUIRED under
+// `deny(warnings)` + `pub(crate) mod adapters` (the `db/mod.rs` re-export alone is
+// necessary but NOT sufficient). `w3`'s coach turn and `r1.s4`'s rail construct it.
+pub use adapters::db::SqliteCoachingRepo;
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -362,6 +406,13 @@ pub use domain::ToolDefinition;
 // BUILD error, not a warning (the `domain/mod.rs` re-export alone is necessary but
 // NOT sufficient). 1.04's decorator writes through it; 1.05's demo reads a row back.
 pub use domain::LlmCallRepository;
+// r1.s2.w2 (ADR-0021 / audit C3): the coaching persistence port — the session row is
+// the audit trail, so every coaching outcome persists as a proposal or a typed
+// failure, and `llm_call_id` is `None` when no ledger row was correlated to the turn
+// (not a proof that no call was attempted). REQUIRED under
+// `deny(warnings)` + `pub(crate) mod domain`. `w3` writes through it; `r1.s4`'s rail
+// reads and dispositions through it.
+pub use domain::CoachingRepository;
 
 // VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
 // the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).

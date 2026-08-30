@@ -64,11 +64,18 @@ pub(crate) const DEMO_MODEL: &str = "glm-5.3-flash";
 /// never a determinism input — MASTER-SPEC §9.4 / the `LlmConfig` note).
 const DEMO_TEMPERATURE: f32 = 0.2;
 
-/// The response token cap for the demo round-trip. GLM is a **reasoning**
-/// model whose thinking tokens count against this cap BEFORE the final answer, so
-/// a tight cap yields empty `content` (the live VS-1.3.1 close demo saw an empty
-/// reply at 256 and a real one at ~343). Keep generous headroom past the reasoning.
-const DEMO_MAX_TOKENS: u32 = 4096;
+/// The response token cap for a verb driving the configured reasoning model. GLM
+/// is a **reasoning** model whose thinking tokens count against this cap BEFORE
+/// the final answer, so a tight cap yields empty `content` (the live VS-1.3.1
+/// close demo saw an empty reply at 256 and a real one at ~343). Keep generous
+/// headroom past the reasoning.
+///
+/// Shared with `pulse coach` rather than re-guessed there (#124's reasoning-burn
+/// class): the coach's own `2_048` was a second, undocumented answer to the same
+/// question, and the failure it buys is quiet — a turn that spends its budget
+/// thinking and emits no tool call is recorded as `ZeroCalls`, which reads as a
+/// model that declined rather than a cap that was too small.
+pub(crate) const REASONING_MAX_TOKENS: u32 = 4096;
 
 /// The fixed demo prompt used when the operator gives no prompt argument.
 const DEMO_PROMPT: &str = "In one concise sentence, what is a liquidation in crypto futures?";
@@ -106,7 +113,7 @@ fn demo_config() -> LlmConfig {
         backend: LlmBackend::Ollama,
         model: DEMO_MODEL.to_owned(),
         temperature: DEMO_TEMPERATURE,
-        max_tokens: DEMO_MAX_TOKENS,
+        max_tokens: REASONING_MAX_TOKENS,
     }
 }
 

@@ -64,7 +64,33 @@ pub(crate) const OLLAMA_MODEL_ID: &str = "glm-5.3-flash";
 const OLLAMA_TIMEOUT_SECS: u64 = 60;
 
 /// Max retry attempts for transient (429 / 5xx) errors (audit ch4).
+///
+/// The COMPOSER and `llm-check` posture. Neither records one exchange per attempt,
+/// so absorbing a transient fault there costs nothing an auditor would want back.
 const OLLAMA_MAX_RETRIES: u32 = 2;
+
+/// The COACH posture: one turn is one attempt (PR #128, finding H1).
+///
+/// `run_turn` records exactly one exchange and names exactly one ledger row, and it
+/// has no retries and no nudges by design (grill L3) — an adapter quietly making
+/// three upstream attempts behind that one record contradicts the rule a layer
+/// below it, and bills for the difference. A transient 5xx therefore becomes a
+/// recorded `TransportFailure` on the first failure rather than an absorbed one:
+/// fewer silent recoveries, more honest rows (operator-approved, 2026-08-30).
+const COACH_MAX_RETRIES: u32 = 0;
+
+/// The one place a provider config is built, so the two postures cannot drift
+/// beyond the retry count they exist to differ in.
+fn provider_config(
+    api_key: impl Into<String>,
+    base_url: impl Into<String>,
+    max_retries: u32,
+) -> OpenAIConfig {
+    OpenAIConfig::new(api_key, OLLAMA_MODEL_ID)
+        .with_base_url(base_url)
+        .with_timeout(OLLAMA_TIMEOUT_SECS)
+        .with_max_retries(max_retries)
+}
 
 /// The OpenAI-compatible transport adapter — implements `PulseTrader`'s
 /// [`LlmProvider`] port over the `PulseHive` OpenAI-compatible transport (README
@@ -77,6 +103,14 @@ const OLLAMA_MAX_RETRIES: u32 = 2;
 /// manual/demo concern — MASTER-SPEC §9.4).
 pub struct OpenAiCompatProvider {
     inner: OpenAICompatibleProvider,
+    /// The retry posture this provider was built with, kept ONLY under `cfg(test)`.
+    ///
+    /// It is evidence, not runtime state: `PulseHive`'s provider does not surface
+    /// its config, so a composition root's choice would otherwise be unassertable
+    /// without a live request. Carrying it in production builds would be a field
+    /// nothing reads, so it is not carried there (operator ruling, 2026-08-30).
+    #[cfg(test)]
+    max_retries: u32,
 }
 
 impl OpenAiCompatProvider {
@@ -104,12 +138,48 @@ impl OpenAiCompatProvider {
     /// retry posture is unchanged; only the endpoint is caller-chosen.
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        let config = OpenAIConfig::new(api_key, OLLAMA_MODEL_ID)
-            .with_base_url(base_url)
-            .with_timeout(OLLAMA_TIMEOUT_SECS)
-            .with_max_retries(OLLAMA_MAX_RETRIES);
+        Self::from_config(provider_config(api_key, base_url, OLLAMA_MAX_RETRIES))
+    }
+
+    /// Build a provider that makes exactly ONE upstream attempt — the coach's
+    /// posture (PR #128, finding H1), pinned to the default [`OLLAMA_BASE_URL`].
+    ///
+    /// Identical to [`new`](Self::new) but for the retry count. Use it wherever a
+    /// caller records one exchange per turn and must not bill for attempts that
+    /// exchange does not mention.
+    ///
+    /// This is a WIRING obligation, not a property of the type: a caller who builds
+    /// with [`new`](Self::new) and hands the result to a `Coach` still retries.
+    /// `run_coach` selects this path (`cli::coach::coach_provider`).
+    #[must_use]
+    pub fn single_attempt(api_key: impl Into<String>) -> Self {
+        Self::single_attempt_with_base_url(api_key, OLLAMA_BASE_URL)
+    }
+
+    /// [`single_attempt`](Self::single_attempt) with an explicit OpenAI-compatible
+    /// `base_url` (the config `[llm].base_url` override).
+    #[must_use]
+    pub fn single_attempt_with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::from_config(provider_config(api_key, base_url, COACH_MAX_RETRIES))
+    }
+
+    /// The retry posture this provider was built with — test-build evidence, so a
+    /// composition root's choice is assertable without a live request.
+    #[cfg(test)]
+    pub(crate) const fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    fn from_config(config: OpenAIConfig) -> Self {
+        #[cfg(test)]
+        let max_retries = config.max_retries;
         Self {
             inner: OpenAICompatibleProvider::new(config),
+            #[cfg(test)]
+            max_retries,
         }
     }
 }
@@ -247,8 +317,9 @@ fn map_hive_error(error: PulseHiveError) -> LlmError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        OLLAMA_BASE_URL, OLLAMA_MODEL_ID, OpenAiCompatProvider, from_hive_response, map_hive_error,
-        to_hive_config, to_hive_message, to_hive_tool_def,
+        COACH_MAX_RETRIES, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES, OLLAMA_MODEL_ID,
+        OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config, to_hive_config,
+        to_hive_message, to_hive_tool_def,
     };
     use crate::domain::{LlmBackend, LlmConfig, LlmError, Message, ToolCall, ToolDefinition};
     use pulsehive::error::PulseHiveError;
@@ -392,5 +463,52 @@ mod tests {
             matches!(&err, LlmError::Provider(message) if message == "upstream 500"),
             "expected Provider(\"upstream 500\"), got {err:?}"
         );
+    }
+
+    /// One coach turn is one upstream attempt (PR #128, finding H1).
+    ///
+    /// The adapter retried transient 429/5xx twice for every surface, so a coach
+    /// turn could be three attempts behind one recorded exchange and one ledger row
+    /// — the turn's own "no retries and no nudges" rule, contradicted a layer below
+    /// it. The composer and `llm-check` keep the retrying posture on purpose:
+    /// neither records one exchange per attempt, so absorbing a transient fault
+    /// there costs no honesty.
+    #[test]
+    fn the_coach_path_pins_a_single_attempt_and_the_other_surfaces_still_retry() {
+        assert_eq!(
+            OpenAiCompatProvider::new("k").max_retries(),
+            OLLAMA_MAX_RETRIES,
+            "the composer / llm-check default keeps its retries"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::with_base_url("k", "https://example.test/v1").max_retries(),
+            OLLAMA_MAX_RETRIES,
+            "a base-url override does not change the retry posture"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::single_attempt("k").max_retries(),
+            0,
+            "the coach path attempts once"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::single_attempt_with_base_url("k", "https://example.test/v1")
+                .max_retries(),
+            0,
+            "and still once behind a base-url override"
+        );
+    }
+
+    /// Retries are the ONLY thing the two postures disagree about — the shared
+    /// builder is what keeps a future edit from quietly widening that gap.
+    #[test]
+    fn the_two_postures_differ_in_retries_and_nothing_else() {
+        let retrying = provider_config("k", "https://example.test/v1", OLLAMA_MAX_RETRIES);
+        let single = provider_config("k", "https://example.test/v1", COACH_MAX_RETRIES);
+
+        assert_eq!(retrying.model, single.model);
+        assert_eq!(retrying.base_url, single.base_url);
+        assert_eq!(retrying.timeout_secs, single.timeout_secs);
+        assert_eq!(retrying.max_retries, 2);
+        assert_eq!(single.max_retries, 0);
     }
 }

@@ -12,6 +12,10 @@
 pub(crate) mod backtest;
 mod candle;
 mod clock;
+// r1.s2.w2 (ADR-0021): the coaching session domain — never-silence outcomes, the
+// typed failure taxonomy, and the disposition state machine. Pure + zero-I/O; the
+// `CoachingRepository` port lives in `port` beside the other ports.
+mod coaching;
 mod dsl;
 mod error;
 // VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
@@ -86,6 +90,20 @@ pub use indicator::Indicator;
 pub use dsl::{FieldError, ValidatedDsl, ValidationCode, ValidationErrors, validate};
 // VS-1.1.2 work-2.05: the version-safe migration read-path (FR-4).
 pub use dsl::{LoadError, Loaded, Migration, MigrationError, MigrationKind, Migrator};
+// r1.s2.w1 (ADR-0021): the one-mutation framework the coach and r1.s4's accept
+// path both stand on. Re-exported so `lib.rs` can curate the crate surface — an
+// un-re-exported public domain type is a `dead_code` BUILD error under
+// `deny(warnings)`.
+pub use dsl::{
+    CandidateDsl, Mutation, MutationError, ParamKind, ParamValue, apply, sweepable_paths,
+};
+// r1.s2.w2 (ADR-0021): the coaching session domain. Re-exported so `lib.rs` can
+// curate the crate surface — an un-re-exported public domain type is a `dead_code`
+// BUILD error under `deny(warnings)`.
+pub use coaching::{
+    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
+    DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
+};
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3). `compile`
 // turns a `ValidatedDsl` into a `CompiledStrategy` the backtester walks; the
 // `Compiled*` types + `EvalContext` seam + pure exit-geometry helpers are its
@@ -105,8 +123,8 @@ pub use pair::Pair;
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource,
-    StrategyRepository,
+    BacktestRunRepository, CoachingRepository, ExchangeAdapter, LlmCallRepository, LlmProvider,
+    MarketDataSource, StrategyRepository,
 };
 // VS-1.3.2 slice-close FIX C: the shared secret-token heuristic. `pub(crate)` (an
 // internal cross-ring utility, not a public API surface) — used by the composer

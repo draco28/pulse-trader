@@ -584,6 +584,13 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             funding_total,
             slippage_total,
             summary,
+            // r1.s2.w3: surface the two values this function ALREADY decoded above
+            // to re-derive `result_content_hash`. A pass-through of persisted
+            // columns — no new query, no change to the hash input or its feed
+            // order — so the coach's bounded context can read them instead of
+            // recomputing anything (ADR-0021 decision 8).
+            regime_breakdown,
+            skipped_entries,
         }))
     }
 
