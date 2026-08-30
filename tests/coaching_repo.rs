@@ -401,7 +401,8 @@ async fn an_inapplicable_mutation_keeps_its_typed_error_through_the_database() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. llm_call_id — NULL means "no provider call was made" (audit C3)
+// 3. llm_call_id — NULL means "no ledger row was correlated to this turn" (audit
+//    C3); it does NOT mean no attempt was made
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

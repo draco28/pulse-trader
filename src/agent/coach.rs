@@ -21,8 +21,8 @@
 //! That last category is the one place never-silence yields, and it does so
 //! deliberately (PR #128, finding G1): when the turn cannot say WHICH ledger row it
 //! produced, there is no honest row to write, and writing one anyway would put a
-//! wrong `llm_call_id` — or a NULL that claims no call was made — into the audit
-//! trail. Refusing is the smaller lie.
+//! wrong `llm_call_id` — or a NULL implying no ledger row was produced — into the
+//! audit trail. Refusing is the smaller lie.
 //!
 //! **One provider call, and every deviation is terminal** (grill L3). Zero tool
 //! calls, several tool calls, unparseable arguments, an empty hypothesis, a
@@ -106,9 +106,11 @@ pub enum CoachTurnError {
     LocalFault(#[from] LlmError),
     /// A response came back and NO ledger id appeared for this turn.
     ///
-    /// Audit C3 reads `llm_call_id = NULL` as "no provider call was made", so
-    /// recording this turn would file that claim against a call that happened and
-    /// was billed. It means the provider is not the capturing ledger decorator, or
+    /// `llm_call_id = NULL` says no ledger row was correlated to the turn, and on a
+    /// turn that got a usable response that is a false record: the call happened, was
+    /// billed, and minted a row this session then fails to name. (NULL is honest on
+    /// the pre-call and timeout/transport paths, where there is no row to name.) It
+    /// means the provider is not the capturing ledger decorator, or
     /// the capture handle is not the one that decorator writes through —
     /// [`Coach::new`] takes the two independently, so the pairing is a caller's
     /// obligation and is checked here rather than assumed (PR #128, finding G1).

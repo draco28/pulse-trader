@@ -37,10 +37,12 @@
 -- never-silence guarantee is that this row exists either way, so a failed turn is
 -- a record rather than an absence.
 --
--- `llm_call_id` is NULLABLE and is NULL PRECISELY WHEN NO PROVIDER CALL WAS MADE:
--- a pre-call failure (an oversized context) records the session with no ledger
--- row, while every turn that reached the provider names its `llm_call`. The
--- precedent is `strategy_version.creating_llm_call_ids`.
+-- `llm_call_id` is NULLABLE and is NULL WHEN NO LEDGER ROW WAS CORRELATED TO THE
+-- TURN. The implication runs one way: a pre-call failure (an oversized context)
+-- never called, so it records the session with no ledger row -- but a NULL does not
+-- prove no attempt, because a timeout or a transport fault reaches the provider and
+-- can still leave no priced row behind. A turn that got a usable RESPONSE does name
+-- its `llm_call`. The precedent is `strategy_version.creating_llm_call_ids`.
 CREATE TABLE coaching_sessions (
   id                   TEXT PRIMARY KEY NOT NULL,
   backtest_run_id      TEXT NOT NULL REFERENCES backtest_run(id),      -- the run the coach READ (and never recomputed)
