@@ -22,10 +22,11 @@
 
 use pulse::BacktestRunId;
 use pulse::{
-    CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Comparator, Condition,
-    Direction, Disposition, DispositionKind, ExitRule, Hypothesis, IndicatorSpec, LlmCallId,
-    Mutation, MutationError, ParamValue, Proposal, RiskParams, SchemaVersion, SessionOutcome,
-    StrategyDsl, SweepableValue, ValueSource, VersionId, apply,
+    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Comparator,
+    Condition, Direction, Disposition, DispositionKind, ExitRule, Hypothesis, IndicatorSpec,
+    LlmCallId, MfeMaeAggregates, Mutation, MutationError, ParamValue, Proposal, RegimeBreakdown,
+    RiskParams, SchemaVersion, SessionOutcome, SkippedEntryCounts, StrategyDsl, SummaryStats,
+    SweepableValue, ValueSource, VersionId, apply,
 };
 use rust_decimal::Decimal;
 
@@ -476,4 +477,42 @@ fn a_deserialized_hypothesis_cannot_be_empty() {
     let ok: Hypothesis =
         serde_json::from_str("\"a slower RSI cuts whipsaw entries\"").expect("a real hypothesis");
     assert_eq!(ok.as_str(), "a slower RSI cuts whipsaw entries");
+}
+
+// ---------------------------------------------------------------------------
+// 7. What the MFE/MAE numbers actually mean (PR #128, finding G3)
+// ---------------------------------------------------------------------------
+
+/// The excursion aggregates are POTENTIAL bounds, not a path any trade walked, and
+/// the rendered context has to say so. The engine folds every bar the position was
+/// open into the running MFE/MAE, the exit bar included and in full — so a trade
+/// that exits at a bar's open still carries that whole bar's range, movement after
+/// the close included (`engine.rs`, and `mfe_r >= realized_r >= mae_r` is explicitly
+/// NOT guaranteed there). A model reading "MFE / MAE (R multiples, aggregated)"
+/// alone will read them as reachable, which is the coaching mistake this label
+/// prevents. Known behaviour, tracked as #55 and NOT closed here.
+#[test]
+fn the_rendered_context_labels_mfe_mae_as_full_bar_potential() {
+    let context = CoachContext {
+        summary: SummaryStats::default(),
+        regime_breakdown: RegimeBreakdown::default(),
+        mfe_mae: MfeMaeAggregates::from_trades(&[]),
+        skipped_entries: SkippedEntryCounts::default(),
+        engine_fingerprint: "fp-test".to_owned(),
+        dsl: rsi_oversold_strategy(),
+    };
+
+    let rendered = context.render().to_lowercase();
+
+    for needle in [
+        "full-bar potential",
+        "entry-through-exit bar ranges",
+        "the entire exit bar is folded in even when the trade exits at its open",
+        "not an experienced path",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "the rendered context must carry {needle:?}, or the numbers read as reachable: {rendered}"
+        );
+    }
 }

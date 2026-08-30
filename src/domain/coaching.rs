@@ -573,6 +573,19 @@ impl CoachContext {
             );
         }
         let _ = writeln!(out, "\n## MFE / MAE (R multiples, aggregated)");
+        // What these numbers ARE, next to the numbers themselves (PR #128, finding
+        // G3). The engine folds every bar the position was open into the running
+        // excursion — the exit bar included and in full — so they bound what the bar
+        // ranges held, not what a trade could have taken. Unlabelled, a coach reads
+        // them as reachable profit and retunes a stop toward a number that never
+        // existed. Known behaviour (#55), described here rather than changed.
+        let _ = writeln!(
+            out,
+            "FULL-BAR POTENTIAL bounds over the inclusive entry-through-exit bar ranges: the \
+             entire exit bar is folded in even when the trade exits at its open, so price \
+             movement after the close may be included. These are NOT an experienced path and \
+             are not guaranteed to bracket the realized result."
+        );
         let _ = writeln!(
             out,
             "over {} trades — avg_mfe {} · avg_mae {} · best_mfe {} · worst_mae {}",

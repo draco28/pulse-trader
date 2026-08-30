@@ -58,7 +58,13 @@ read the document before you pick a value.
 The result you are given is the persisted one. Do not recompute it, do not estimate
 what it "would have been", and do not ask for the raw trade log or the equity curve
 — you have summary statistics, a regime breakdown, MFE/MAE aggregates in R, and the
-counts of entries the sizer skipped. If the skipped-entry counts are large relative
+counts of entries the sizer skipped.
+
+The MFE/MAE aggregates are FULL-BAR POTENTIAL bounds over the inclusive
+entry-through-exit bar ranges: the entire exit bar is folded in even when the trade
+exits at its open, so price movement after the close may be included. They are NOT
+an experienced path — do not read them as profit a tighter stop or a wider target
+would have captured, and do not assume they bracket the realized result. If the skipped-entry counts are large relative
 to the trade count, the sizing parameters are often the more useful thing to move
 than the entry threshold.
 

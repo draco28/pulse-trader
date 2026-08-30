@@ -442,16 +442,21 @@ async fn an_empty_overlay_dir_falls_back_to_the_compiled_in_default() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. One capture buffer per invocation (PR #128, finding F2)
+// 4. One capture buffer per Coach/repo pair (PR #128, findings F2 / G5)
 // ---------------------------------------------------------------------------
 
 /// Turns on ONE coach are serialized by `run_turn(&mut self)`, which answers half of
-/// the correlation question. The other half is the composition root: two invocations
-/// must not share one capture buffer either, or the second turn could name the
-/// first's ledger row. The root mints the buffer per invocation and hands that one
-/// handle to exactly one capturing repo and one coach; this asserts the effect.
+/// the correlation question. The other half is the buffer: a turn wired to its own
+/// capture must name its own ledger row and never the previous turn's.
+///
+/// Scope, precisely (G5): `coach_once` INJECTS `CoachWiring.captured`, so what this
+/// drives is one buffer per Coach/CapturingRepo pair — the same shape the live
+/// `run_coach` allocation produces, not that allocation itself. The live path's
+/// per-invocation minting is read from `src/cli/coach.rs`, not asserted here, and a
+/// direct `Coach::new` caller owes the same pairing; `CoachTurnError::LedgerRow*`
+/// is what catches a caller who does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_turns_through_the_composition_root_each_name_their_own_ledger_row() {
+async fn two_turns_with_separate_capture_buffers_each_name_their_own_ledger_row() {
     let (_tmp, db, _version, run_id) = seeded().await;
 
     let (first, _) = coach_once(

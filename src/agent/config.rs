@@ -576,6 +576,20 @@ mod tests {
         assert_eq!(prompt, "OVERRIDDEN COMPOSER PROMPT");
     }
 
+    /// The shipped coach prompt as ONE whitespace-flattened line.
+    ///
+    /// Every prompt-contract needle below is a phrase, and the prompt is reflowed
+    /// prose — matching against the raw text would make a contract depend on where a
+    /// line happens to wrap. `scripts/check-adr-0021.sh` settled the same point for
+    /// the ADRs; this is that, in Rust.
+    fn coach_prompt_flattened() -> String {
+        COACH_PROMPT_DEFAULT
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The coach prompt's structural-limit clause is a CONTRACT, not prose
     /// (PR #128, finding C2). `ADR-0021` says the coach must answer a structural
     /// need with a recorded inapplicability, never an approximation — and the
@@ -589,7 +603,7 @@ mod tests {
     /// that is `r1.s4` (pulseai-labs/pulse-trader#131).
     #[test]
     fn the_shipped_coach_prompt_never_asks_for_an_approximated_structural_change() {
-        let prompt = COACH_PROMPT_DEFAULT.to_lowercase();
+        let prompt = coach_prompt_flattened();
 
         assert!(
             !prompt.contains("closest parameter"),
@@ -609,7 +623,7 @@ mod tests {
     /// follow faithfully into a deterministic `UnknownPath`.
     #[test]
     fn the_shipped_coach_prompt_names_the_mutable_surface_and_excludes_condition_constants() {
-        let prompt = COACH_PROMPT_DEFAULT.to_lowercase();
+        let prompt = coach_prompt_flattened();
 
         for family in ["indicator periods", "exit parameters", "risk parameters"] {
             assert!(
@@ -625,6 +639,31 @@ mod tests {
             prompt.contains("rsi(14) < 30"),
             "the exclusion needs the concrete case a model will meet in the fixture"
         );
+    }
+
+    /// The MFE/MAE numbers are POTENTIAL bounds, and the prompt has to say so
+    /// (PR #128, finding G3). The engine folds every bar the position was open into
+    /// the running excursion, the exit bar included and in full, so a trade that
+    /// exits at a bar's open still carries that whole bar's range — movement after
+    /// the close included. A coach told only "MFE/MAE aggregates in R" reads them as
+    /// profit a tighter stop would have captured, which is a parameter change made
+    /// on a number that was never reachable. Known behaviour, tracked as #55 and not
+    /// closed here.
+    #[test]
+    fn the_shipped_coach_prompt_labels_mfe_mae_as_full_bar_potential() {
+        let prompt = coach_prompt_flattened();
+
+        for needle in [
+            "full-bar potential",
+            "entry-through-exit bar ranges",
+            "the entire exit bar is folded in even when the trade exits at its open",
+            "not an experienced path",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "the prompt must carry {needle:?}, or the excursion numbers read as reachable"
+            );
+        }
     }
 
     /// The live coach path: `pulse coach` resolves [`prompt_override_dir`] and

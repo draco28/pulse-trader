@@ -8,10 +8,17 @@
 //! guarantee a caller can forget is not a guarantee.
 //!
 //! The things that are NOT recorded outcomes are the ones that are not *coaching*
-//! at all: a caller handing in a run and a version that do not belong together, a
-//! fault this process raised on the call path (a failed ledger write, an unpriced
-//! model), and a failure to write the session row itself. All three surface as
-//! [`CoachTurnError`] at the CLI edge (ADR-0017).
+//! at all: a caller handing in inputs that do not belong together, a fault this
+//! process raised on the call path (a failed ledger write, an unpriced model, a
+//! ledger correlation that cannot be established), and a failure to write the
+//! session row itself. Each surfaces as [`CoachTurnError`] at the CLI edge
+//! (ADR-0017).
+//!
+//! That last category is the one place never-silence yields, and it does so
+//! deliberately (PR #128, finding G1): when the turn cannot say WHICH ledger row it
+//! produced, there is no honest row to write, and writing one anyway would put a
+//! wrong `llm_call_id` — or a NULL that claims no call was made — into the audit
+//! trail. Refusing is the smaller lie.
 //!
 //! **One provider call, and every deviation is terminal** (grill L3). Zero tool
 //! calls, several tool calls, unparseable arguments, an empty hypothesis, a
@@ -48,13 +55,15 @@ use crate::adapters::llm::redacting_logging::Redactor;
 use super::composer::LlmCallCapture;
 use super::tools::{PROPOSE_MUTATION_TOOL, ProposeMutationArgs, coach_tool_definitions};
 
-/// A turn that produced no record — the two faults that are not coaching outcomes.
+/// A turn that produced no record — the faults that are not coaching outcomes.
 ///
 /// Deliberately NOT [`CoachFailure`]s. The seven failure variants are the ways a
 /// *coach turn* can deviate, and each of them is written to the audit trail. What
-/// is left here is what a session row would have to lie about: a fault raised
-/// inside this process on the call path, and a failure to write the row at all.
-/// Both surface at the CLI edge, preserved (ADR-0017).
+/// is left here is what a session row would have to lie about, in three
+/// categories: inputs that do not belong together, a fault raised inside this
+/// process on the call path (an unpriced model, a failed ledger write, a ledger
+/// correlation that cannot be established), and a failure to write the row at all.
+/// Every one of them surfaces at the CLI edge, preserved (ADR-0017).
 #[derive(Debug, thiserror::Error)]
 pub enum CoachTurnError {
     /// The `run` and the `version` handed in do not belong together — `version` is
@@ -91,6 +100,31 @@ pub enum CoachTurnError {
     /// binary (PR #128, finding 5).
     #[error("the coach turn could not run: {0}")]
     LocalFault(#[from] LlmError),
+    /// A response came back and NO ledger id appeared for this turn.
+    ///
+    /// Audit C3 reads `llm_call_id = NULL` as "no provider call was made", so
+    /// recording this turn would file that claim against a call that happened and
+    /// was billed. It means the provider is not the capturing ledger decorator, or
+    /// the capture handle is not the one that decorator writes through —
+    /// [`Coach::new`] takes the two independently, so the pairing is a caller's
+    /// obligation and is checked here rather than assumed (PR #128, finding G1).
+    #[error(
+        "the coach turn reached the provider but captured no ledger row: the provider or the \
+         capture handle is not the one the ledger decorator writes through"
+    )]
+    LedgerRowMissing,
+    /// Several ledger ids appeared for one turn.
+    ///
+    /// One turn is one call is one row. Several ids mean the buffer is shared with
+    /// another turn or the decorator wrote more than once, and no choice among them
+    /// is honest: taking the newest — what this code did before PR #128 (finding
+    /// G1) — can name a different turn's row in the audit trail. Detected and
+    /// refused instead of resolved.
+    #[error("the coach turn captured {seen} ledger rows; one turn is one call is one row")]
+    LedgerRowsAmbiguous {
+        /// How many ids appeared since the pre-call snapshot.
+        seen: usize,
+    },
     /// The proposal could not be recorded. Fatal by design: an unrecordable turn is
     /// the silence this spine exists to prevent, so it is surfaced rather than
     /// swallowed.
@@ -275,15 +309,23 @@ impl<P: LlmProvider> Coach<P> {
     /// # }
     /// ```
     ///
-    /// Two coaches never share one buffer either: the composition root mints it per
-    /// invocation and hands that one handle to exactly one capturing repo and one
-    /// coach (`src/cli/coach.rs`).
+    /// The buffer itself is a WIRING obligation rather than something this type can
+    /// enforce: the production composition root mints one per invocation and hands
+    /// it to exactly one capturing repo and one coach (`src/cli/coach.rs`), and a
+    /// direct [`Coach::new`] caller owes the same. What the turn can do is refuse to
+    /// guess — zero or several ids for one turn fail closed
+    /// ([`CoachTurnError::LedgerRowMissing`],
+    /// [`CoachTurnError::LedgerRowsAmbiguous`]). That is detection, not proof of
+    /// origin: a shared buffer in which only one of the two providers captures an id
+    /// still yields exactly one, and nothing here can tell whose it is.
     ///
     /// # Errors
     ///
     /// [`CoachTurnError::RunVersionMismatch`] if `version` is not the version `run`
     /// was produced against; [`CoachTurnError::LocalFault`] if this process faulted
-    /// on the call path; [`CoachTurnError::Record`] /
+    /// on the call path; [`CoachTurnError::LedgerRowMissing`] /
+    /// [`CoachTurnError::LedgerRowsAmbiguous`] if the turn cannot name exactly the
+    /// ledger row it produced; [`CoachTurnError::Record`] /
     /// [`CoachTurnError::RecordFailed`] if the session could not be written.
     pub async fn run_turn<R: CoachingRepository>(
         &mut self,
@@ -353,8 +395,9 @@ impl<P: LlmProvider> Coach<P> {
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 };
                 // A timed-out call may still have produced a ledger row if the
-                // decorator got far enough; name it if so.
-                let call_id = self.captured_since(start);
+                // decorator got far enough; name it if so. ZERO is legitimate here
+                // (audit C3 — NULL iff no call was made); SEVERAL never is.
+                let call_id = self.captured_at_most_one(start)?;
                 return self
                     .record(sessions, session_id, run, version, call_id, failure)
                     .await;
@@ -369,8 +412,9 @@ impl<P: LlmProvider> Coach<P> {
                 };
                 // A transport fault may still have minted a ledger row if the
                 // decorator wrote one before failing; name it if so rather than
-                // asserting NULL (audit C3 is "NULL iff no call was made").
-                let call_id = self.captured_since(start);
+                // asserting NULL (audit C3 is "NULL iff no call was made"). Zero is
+                // the common case here — no usable exchange, no priced row.
+                let call_id = self.captured_at_most_one(start)?;
                 let recorded = self
                     .record(sessions, session_id, run, version, call_id, failure)
                     .await?;
@@ -388,7 +432,9 @@ impl<P: LlmProvider> Coach<P> {
             }
             Ok(Ok(response)) => response,
         };
-        let call_id = self.captured_since(start);
+        // A turn that REACHED the provider names exactly one ledger row, or it is a
+        // wiring fault and not a coaching outcome (PR #128, finding G1).
+        let call_id = Some(self.captured_exactly_one(start)?);
 
         // 4. Route the one response. No retries, no nudges (grill L3).
         let outcome = classify(&self.redactor, &version.dsl, response.tool_calls);
@@ -526,13 +572,39 @@ impl<P: LlmProvider> Coach<P> {
             .len()
     }
 
-    /// The id the decorator minted for this turn, if it minted one.
-    fn captured_since(&self, start: usize) -> Option<LlmCallId> {
+    /// The ids that appeared since the pre-call snapshot, in order.
+    fn ids_since(&self, start: usize) -> Vec<LlmCallId> {
         let guard = self
             .captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(start..).and_then(|ids| ids.last().cloned())
+        guard.get(start..).unwrap_or_default().to_vec()
+    }
+
+    /// The one ledger row a SUCCESSFUL turn must have minted.
+    ///
+    /// Exactly one: the call happened, so a row exists, and the session names it.
+    fn captured_exactly_one(&self, start: usize) -> Result<LlmCallId, CoachTurnError> {
+        let mut ids = self.ids_since(start);
+        match ids.len() {
+            1 => Ok(ids.remove(0)),
+            0 => Err(CoachTurnError::LedgerRowMissing),
+            seen => Err(CoachTurnError::LedgerRowsAmbiguous { seen }),
+        }
+    }
+
+    /// The ledger row a DEVIANT turn may or may not have minted.
+    ///
+    /// Zero is legitimate here and only here: a timeout can strike before the
+    /// decorator writes, and a transport fault produces no usable exchange to price
+    /// at all. Several is legitimate nowhere.
+    fn captured_at_most_one(&self, start: usize) -> Result<Option<LlmCallId>, CoachTurnError> {
+        let mut ids = self.ids_since(start);
+        match ids.len() {
+            0 => Ok(None),
+            1 => Ok(Some(ids.remove(0))),
+            seen => Err(CoachTurnError::LedgerRowsAmbiguous { seen }),
+        }
     }
 }
 

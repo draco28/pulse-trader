@@ -31,11 +31,11 @@ use std::time::Duration;
 use pulse::{
     BacktestResult, BacktestRunId, BacktestRunRepository, Coach, CoachCliOutcome, CoachFailure,
     CoachTurnError, CoachWiring, CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy,
-    DataError, Db, Disposition, EngineFingerprint, FakeClock, LlmConfig, LlmError, LlmProvider,
-    LlmResponse, MIGRATOR, Message, MutationError, NewVersion, Redactor, RegimeBreakdown,
-    SessionOutcome, SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats,
-    TokenUsage, ToolCall, ToolDefinition, run_coach_with,
+    DataError, Db, Disposition, EngineFingerprint, FakeClock, LlmCallCapture, LlmCallId, LlmConfig,
+    LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, MutationError, NewVersion, PersistedRun,
+    Redactor, RegimeBreakdown, SessionOutcome, SkippedEntryCounts, SqliteBacktestRunRepo,
+    SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
+    SummaryStats, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -51,6 +51,11 @@ struct ScriptedProvider {
     delay: Option<Duration>,
     /// When set, the call fails at the transport layer instead of answering.
     fails_with: Option<LlmError>,
+    /// Ids to push into the shared capture buffer during the call — the capturing
+    /// decorator's side effect, under a test's control (PR #128, finding G1).
+    pushes: Vec<LlmCallId>,
+    /// The buffer `pushes` are written to.
+    capture: Option<LlmCallCapture>,
 }
 
 impl ScriptedProvider {
@@ -62,9 +67,25 @@ impl ScriptedProvider {
                 calls: Arc::clone(&calls),
                 delay: None,
                 fails_with: None,
+                pushes: Vec::new(),
+                capture: None,
             },
             calls,
         )
+    }
+
+    /// A provider that answers AND mints `pushes` ledger ids into `capture` — the
+    /// capturing decorator's side effect, made scriptable so a turn can be driven
+    /// into the zero-id and several-id cases (PR #128, finding G1).
+    fn pushing(
+        responses: Vec<LlmResponse>,
+        capture: LlmCallCapture,
+        pushes: Vec<LlmCallId>,
+    ) -> (Self, Arc<AtomicUsize>) {
+        let (mut provider, calls) = Self::new(responses);
+        provider.pushes = pushes;
+        provider.capture = Some(capture);
+        (provider, calls)
     }
 
     fn stalling(delay: Duration) -> (Self, Arc<AtomicUsize>) {
@@ -93,6 +114,11 @@ impl LlmProvider for ScriptedProvider {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some(capture) = &self.capture
+            && let Ok(mut ids) = capture.lock()
+        {
+            ids.extend(self.pushes.iter().cloned());
         }
         if let Some(error) = &self.fails_with {
             return Err(error.clone());
@@ -250,6 +276,39 @@ async fn turn_with_redactor(
     run_coach_with(wiring, &run_repo, &strategy_repo, &coaching_repo, run_id)
         .await
         .expect("a deviant turn is still a completed turn")
+}
+
+/// The run + trades + version a direct `Coach::run_turn` call needs, read back
+/// through the repos exactly as `run_coach_with` does.
+async fn coachable(
+    db: &Db,
+    run_id: &BacktestRunId,
+) -> (PersistedRun, Vec<pulse::Trade>, pulse::StrategyVersion) {
+    let clock = FakeClock::at(1_700_000_000_000);
+    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
+    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+
+    let run = run_repo
+        .get_run(run_id)
+        .await
+        .expect("load the run")
+        .expect("the seeded run exists");
+    let trades = run_repo.get_trades(run_id).await.expect("load the trades");
+    let version = strategy_repo
+        .get_version(&run.strategy_version_id)
+        .await
+        .expect("load the version")
+        .expect("the run's version exists");
+    (run, trades, version)
+}
+
+/// How many coaching sessions are on disk — the never-silence counter, and the
+/// counter a caller fault must leave at zero.
+async fn session_count(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
+        .fetch_one(db.pool())
+        .await
+        .expect("count the coaching sessions")
 }
 
 /// The recorded failure of a turn — panicking if it produced a proposal instead.
@@ -747,6 +806,100 @@ async fn a_run_and_version_that_do_not_belong_together_are_refused_before_any_ca
         .await
         .expect("count the coaching sessions");
     assert_eq!(rows, 0, "a caller fault writes no session row");
+}
+
+/// A turn that reached the provider MUST name the ledger row that call minted
+/// (audit C3: `llm_call_id` is NULL precisely when no call was made). `Coach::new`
+/// takes the provider and the capture handle independently, so a caller can hand it
+/// a provider that is not the capturing decorator — and before PR #128 (finding G1)
+/// the turn then wrote a post-call session with NULL, saying "no call was made"
+/// about a call that was made and billed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_successful_turn_that_captured_no_ledger_row_is_a_local_fault() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (run, trades, version) = coachable(&db, &run_id).await;
+    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), FakeClock::at(1));
+
+    // A RAW provider: it answers, and nothing writes a ledger row.
+    let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        good_args("entry.lhs.indicator.rsi.period"),
+    )])]);
+    let mut coach = Coach::new(provider, "prompt".to_owned(), config(), capture());
+
+    let err = coach
+        .run_turn(
+            &coaching_repo,
+            CoachingSessionId::new("sess-nocapture".to_owned()),
+            &run,
+            &trades,
+            &version,
+        )
+        .await
+        .expect_err("a response with no ledger row is a wiring fault, not a coaching outcome");
+
+    assert!(
+        matches!(err, CoachTurnError::LedgerRowMissing),
+        "expected LedgerRowMissing, got {err:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "this is a POST-call fault — the call did happen"
+    );
+    assert_eq!(
+        session_count(&db).await,
+        0,
+        "a wiring fault writes no coaching row"
+    );
+}
+
+/// Several ids for one turn means the buffer is shared or looping, and there is no
+/// honest way to pick one. Taking `.last()` — what the code did before PR #128
+/// (finding G1) — is a guess that can name another turn's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_capture_is_refused_rather_than_guessed() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (run, trades, version) = coachable(&db, &run_id).await;
+    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), FakeClock::at(1));
+
+    let captured = capture();
+    let (provider, calls) = ScriptedProvider::pushing(
+        vec![with_calls(vec![call(
+            "c1",
+            "propose_mutation",
+            good_args("entry.lhs.indicator.rsi.period"),
+        )])],
+        Arc::clone(&captured),
+        vec![
+            LlmCallId::new("call-one".to_owned()),
+            LlmCallId::new("call-two".to_owned()),
+        ],
+    );
+    let mut coach = Coach::new(provider, "prompt".to_owned(), config(), captured);
+
+    let err = coach
+        .run_turn(
+            &coaching_repo,
+            CoachingSessionId::new("sess-ambiguous".to_owned()),
+            &run,
+            &trades,
+            &version,
+        )
+        .await
+        .expect_err("two ids for one turn cannot be resolved into one honest row");
+
+    match err {
+        CoachTurnError::LedgerRowsAmbiguous { seen } => assert_eq!(seen, 2),
+        other => panic!("expected LedgerRowsAmbiguous, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "still one call per turn");
+    assert_eq!(
+        session_count(&db).await,
+        0,
+        "an unresolvable correlation writes no coaching row"
+    );
 }
 
 // ---------------------------------------------------------------------------

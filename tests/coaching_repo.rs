@@ -68,17 +68,50 @@ async fn seed_parents(pool: &SqlitePool) {
     .await
     .expect("seed strategy");
 
-    for (id, hash, by) in [
-        ("ver-1", "hash-1", "human"),
-        ("ver-2", "hash-2", "coach_llm"),
+    // A SECOND strategy, so a cross-strategy child is expressible.
+    sqlx::query(
+        "INSERT INTO strategy (id, name, tags, archived, created_at) \
+         VALUES ('strat-2', 'Another Strategy', '[]', 0, '2026-08-29T00:00:00.000Z')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed second strategy");
+
+    // The version TREE the accept path has to reason about (PR #128, finding G2).
+    // `ver-1` is what the seeded runs — and therefore the sessions — were produced
+    // against; `ver-2` and `ver-3` are its real children, the shape an accept mints.
+    // The rest are the wrong shapes, each expressible only because the schema's FK
+    // says "some version", not "this one's child".
+    for (id, strategy, parent, hash, by) in [
+        ("ver-1", "strat-1", None, "hash-1", "human"),
+        ("ver-2", "strat-1", Some("ver-1"), "hash-2", "coach_llm"),
+        ("ver-3", "strat-1", Some("ver-1"), "hash-3", "coach_llm"),
+        ("ver-root", "strat-1", None, "hash-root", "human"),
+        (
+            "ver-sibling",
+            "strat-1",
+            Some("ver-root"),
+            "hash-sib",
+            "coach_llm",
+        ),
+        (
+            "ver-foreign",
+            "strat-2",
+            Some("ver-1"),
+            "hash-foreign",
+            "coach_llm",
+        ),
     ] {
         sqlx::query(
             "INSERT INTO strategy_version \
-             (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, \
-              creating_llm_call_ids, created_at) \
-             VALUES (?1, 'strat-1', '1.0.0', '{}', '{}', ?2, ?3, '[]', '2026-08-29T00:00:00.000Z')",
+             (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
+              version_hash, created_by, creating_llm_call_ids, created_at) \
+             VALUES (?1, ?2, ?3, '1.0.0', '{}', '{}', ?4, ?5, '[]', \
+                     '2026-08-29T00:00:00.000Z')",
         )
         .bind(id)
+        .bind(strategy)
+        .bind(parent)
         .bind(hash)
         .bind(by)
         .execute(pool)
@@ -610,6 +643,95 @@ async fn replaying_the_same_accept_is_a_no_op() {
         SessionOutcome::Proposed { proposal } => assert_eq!(proposal.disposition, accept),
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
     }
+}
+
+/// An accept names the child version the mutation MINTED, and the schema can only
+/// say "some version exists" (PR #128, finding G2). Three shapes are individually
+/// legal rows and jointly a false provenance claim: a root version (no parent at
+/// all), a version parented elsewhere, and a version belonging to another strategy.
+/// Each is refused inside the same transaction, before the state update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepting_a_root_version_as_a_child_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    let outcome = repo
+        .record_disposition(
+            &id,
+            &Disposition::Accepted {
+                child_version_id: VersionId::new("ver-root"),
+            },
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "a version with no parent cannot be this proposal's child"
+    );
+    assert_untouched(&pool, "sess-1").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepting_a_version_parented_elsewhere_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    // `ver-sibling` descends from `ver-root`, not from the version this session
+    // coached — a real row, and the wrong lineage.
+    let outcome = repo
+        .record_disposition(
+            &id,
+            &Disposition::Accepted {
+                child_version_id: VersionId::new("ver-sibling"),
+            },
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "only a DIRECT child of the coached version may be accepted"
+    );
+    assert_untouched(&pool, "sess-1").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepting_a_child_from_another_strategy_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    // `ver-foreign` names `ver-1` as its parent and still belongs to `strat-2`, so
+    // the parent check alone would pass it — the lineage check is what does not.
+    let outcome = repo
+        .record_disposition(
+            &id,
+            &Disposition::Accepted {
+                child_version_id: VersionId::new("ver-foreign"),
+            },
+        )
+        .await;
+
+    assert!(
+        outcome.is_err(),
+        "an accept may not move a proposal into another strategy's tree"
+    );
+    assert_untouched(&pool, "sess-1").await;
+}
+
+/// The proposal row is still open and unsettled after a refused accept.
+async fn assert_untouched(pool: &SqlitePool, session_id: &str) {
+    let (disposition, child): (String, Option<String>) = sqlx::query_as(
+        "SELECT disposition, child_version_id FROM coaching_proposals WHERE session_id = ?1",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the proposal row");
+
+    assert_eq!(disposition, "proposed", "a refused accept settles nothing");
+    assert!(
+        child.is_none(),
+        "a refused accept names no child, got {child:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

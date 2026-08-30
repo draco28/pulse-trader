@@ -415,6 +415,13 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 
+        // PROVENANCE, in the same transaction and BEFORE the state update
+        // (PR #128, finding G2). `0005`'s FK can say the child version exists; it
+        // cannot say the child is THIS proposal's child.
+        if let Some(child) = disposition.child_version_id() {
+            Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
+        }
+
         // CONDITIONAL on the current state, not a blind UPDATE. `Proposed` and
         // `Modified` are the two states a proposal may leave; `Accepted` and
         // `Rejected` are terminal (`Proposal::transition`). Without the predicate
@@ -483,6 +490,63 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
 }
 
 impl<C: Clock> SqliteCoachingRepo<C> {
+    /// Prove the accepted child version really is THIS proposal's child, using the
+    /// caller's transaction (PR #128, finding G2).
+    ///
+    /// An accept naming a root version, a version parented elsewhere, or another
+    /// strategy's version records a lineage that never happened — and `r1.s4` reads
+    /// that lineage AS the version tree, so the false edge is not recoverable from
+    /// the row afterwards. It runs on the caller's `tx` and before the state update
+    /// on purpose: a rejection must leave the proposal exactly as open as it was.
+    async fn check_child_provenance(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        child_id: &str,
+    ) -> Result<(), DataError> {
+        let lineage = sqlx::query!(
+            r#"SELECT
+                 child.parent_version_id AS "child_parent?: String",
+                 child.strategy_id       AS "child_strategy!: String",
+                 parent.strategy_id      AS "parent_strategy!: String",
+                 s.strategy_version_id   AS "coached_version!: String"
+               FROM coaching_sessions s
+               JOIN strategy_version parent ON parent.id = s.strategy_version_id
+               JOIN strategy_version child ON child.id = ?2
+               WHERE s.id = ?1"#,
+            session_id,
+            child_id,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+
+        let Some(row) = lineage else {
+            return Err(DataError::Db(format!(
+                "coaching session `{session_id}`: no such session, or child version \
+                 `{child_id}` does not exist"
+            )));
+        };
+
+        if row.child_parent.as_deref() != Some(row.coached_version.as_str()) {
+            return Err(DataError::Db(format!(
+                "coaching session `{session_id}`: version `{child_id}` is not a child of the \
+                 coached version `{}` (its parent is {})",
+                row.coached_version,
+                row.child_parent
+                    .as_deref()
+                    .unwrap_or("nothing — it is a root version"),
+            )));
+        }
+        if row.child_strategy != row.parent_strategy {
+            return Err(DataError::Db(format!(
+                "coaching session `{session_id}`: version `{child_id}` belongs to strategy \
+                 `{}`, not `{}`",
+                row.child_strategy, row.parent_strategy,
+            )));
+        }
+        Ok(())
+    }
+
     /// The proposal row for a session, decoded into the domain type.
     async fn fetch_proposal(&self, session_id: &str) -> Result<Option<Proposal>, DataError> {
         let row = sqlx::query!(
