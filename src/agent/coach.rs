@@ -441,8 +441,10 @@ impl<P: LlmProvider> Coach<P> {
             }
             Ok(Ok(response)) => response,
         };
-        // A turn that REACHED the provider names exactly one ledger row, or it is a
-        // wiring fault and not a coaching outcome (PR #128, finding G1).
+        // A turn that got a USABLE RESPONSE names exactly one ledger row, or it is
+        // a wiring fault and not a coaching outcome (PR #128, finding G1). The
+        // guarantee belongs to this branch alone: timeout and transport reached the
+        // provider too, and legitimately name none.
         let call_id = Some(self.captured_exactly_one(start)?);
 
         // 4. Route the one response. No retries, no nudges (grill L3).

@@ -9,8 +9,8 @@
 //!      string, not a lossy projection (`r1.s4`'s modify path edits it);
 //!   2. every `CoachFailure` variant round-trips, including
 //!      `InapplicableMutation`, which carries a w1 `MutationError` verbatim;
-//!   3. `llm_call_id` persists NULL and non-NULL, and NULL means exactly "no
-//!      provider call was made" (audit C3);
+//!   3. `llm_call_id` persists NULL and non-NULL, and NULL means "no ledger row was
+//!      correlated to this turn" (audit C3) — not that no attempt was made;
 //!   4. recording a disposition persists `child_version_id` only for `Accepted`;
 //!   5. at most one proposal per session, end to end — the accept idempotency key.
 //!
@@ -327,10 +327,12 @@ async fn every_failure_variant_round_trips() {
     for (i, failure) in failures.into_iter().enumerate() {
         let id = format!("sess-fail-{i}");
         // Which failures leave a ledger row, by EXHAUSTIVE match (no `_` arm): a
-        // pre-call refusal never reached the provider, and a transport fault
-        // produced no usable exchange to bill, so both record `llm_call_id` NULL
-        // (audit C3). An eighth variant has to answer this question before this
-        // file compiles.
+        // pre-call refusal never reached the provider, and a transport fault reached
+        // it but produced no usable exchange for this process to price — so neither
+        // correlates a ledger row and both record `llm_call_id` NULL (audit C3). The
+        // transport case is an ATTEMPT that may still have cost something upstream;
+        // NULL records what was correlated here, not what was spent there. An eighth
+        // variant has to answer this question before this file compiles.
         let call = match &failure {
             CoachFailure::ContextOverflow { .. } | CoachFailure::TransportFailure { .. } => None,
             CoachFailure::ZeroCalls

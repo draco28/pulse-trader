@@ -974,8 +974,10 @@ async fn a_transport_failure_is_recorded_rather_than_returned() {
     // One call was attempted, and it is not retried (grill L3).
     assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
 
-    // No usable exchange happened, so there is no priced ledger row to name
-    // (audit C3).
+    // No usable exchange came back, so this process priced nothing and the turn
+    // correlates no ledger row (audit C3). The attempt itself DID happen — NULL here
+    // records the absent correlation, not an absent call or an absent upstream
+    // charge.
     assert!(
         outcome.session.llm_call_id.is_none(),
         "a transport fault yields no LlmCall row"

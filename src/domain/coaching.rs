@@ -327,8 +327,11 @@ pub enum CoachFailure {
     /// an exception. The CLI still surfaces the error too (ADR-0017): recorded AND
     /// loud, not either-or.
     ///
-    /// No usable exchange means no usage, no cost and no ledger row, so these
-    /// sessions persist with `llm_call_id` NULL (audit C3).
+    /// No usable exchange means no usage this process can read and nothing it can
+    /// price, so no ledger row is written and these sessions persist with
+    /// `llm_call_id` NULL (audit C3). That is a statement about correlation, not
+    /// about spend: the request may have reached the provider and been billed there,
+    /// and a NULL here does not say otherwise.
     #[error("the coach's provider call failed: {detail}")]
     TransportFailure {
         /// The provider error's preserved text, scrubbed — an error body can echo
@@ -359,8 +362,10 @@ pub enum SessionOutcome {
 /// One coach turn, recorded.
 ///
 /// The session row **is** the audit trail (audit C3): it exists whether the turn
-/// succeeded or failed, and `llm_call_id` is `Some` exactly when a provider call
-/// was actually made — a pre-call failure records the session with `None`.
+/// succeeded or failed, and `llm_call_id` is `Some` when a ledger row was correlated
+/// to the turn. A turn that got a usable response must name exactly one or it is a
+/// wiring fault; a pre-call failure records `None` because it never called; and a
+/// timeout or transport fault may record `None` for an attempt that did happen.
 ///
 /// `created_at` is an RFC3339 UTC string minted by the adapter's injected `Clock`,
 /// mirroring [`PersistedRun`](crate::domain::PersistedRun) rather than parsing to
