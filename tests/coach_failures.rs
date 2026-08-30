@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -210,6 +211,7 @@ async fn turn_with(
         turn_timeout,
         max_dsl_bytes,
         Redactor::default(),
+        None,
     )
     .await
 }
@@ -222,6 +224,7 @@ async fn turn_with_redactor(
     turn_timeout: Option<Duration>,
     max_dsl_bytes: Option<usize>,
     redactor: Redactor,
+    prompt_dir: Option<PathBuf>,
 ) -> CoachCliOutcome {
     let clock = FakeClock::at(1_700_000_000_000);
     let ids = Arc::new(Mutex::new(Vec::new()));
@@ -236,7 +239,7 @@ async fn turn_with_redactor(
         clock,
         key_source: None,
         config: config(),
-        prompt_dir: None,
+        prompt_dir,
         turn_timeout,
         max_dsl_bytes,
         captured: ids,
@@ -575,7 +578,7 @@ async fn an_oversized_dsl_is_recorded_as_context_overflow_before_any_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_overflow_budget_measures_the_bytes_the_turn_would_send() {
+async fn the_dsl_budget_measures_the_rendered_form_not_the_compact_one() {
     let (_tmp, db, run_id) = seeded().await;
     let dsl: StrategyDsl =
         serde_json::from_str(&canonical_dsl_json()).expect("the canonical fixture parses");
@@ -606,6 +609,61 @@ async fn the_overflow_budget_measures_the_bytes_the_turn_would_send() {
         calls.load(Ordering::SeqCst),
         0,
         "still a pre-call refusal, so it still costs nothing"
+    );
+    assert_persisted(&db, &outcome).await;
+}
+
+/// The DSL budget bounds the one variable-length CONTEXT field. It cannot see the
+/// resolved system prompt, which an operator's `$PULSE_PROMPT_DIR/coach.md`
+/// overlay owns and can make arbitrarily large — so before PR #128 (finding C1) a
+/// huge overlay sailed past the pre-call check and was sent anyway. The refusal
+/// belongs where every other pre-call refusal is: before the call, recorded, free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_system_prompt_is_recorded_as_context_overflow_before_any_call() {
+    let (_tmp, db, run_id) = seeded().await;
+
+    // ~184 KiB of overlay, well past the whole-turn ceiling, over a canonical DSL
+    // that fits its own sub-budget comfortably — so ONLY the whole-turn check can
+    // refuse this turn.
+    let overlay_dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        overlay_dir.path().join("coach.md"),
+        "OVERSIZED COACH PROMPT\n".repeat(8_000),
+    )
+    .expect("write the oversized overlay");
+
+    let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        good_args("entry.lhs.indicator.rsi.period"),
+    )])]);
+
+    let outcome = turn_with_redactor(
+        &db,
+        &run_id,
+        provider,
+        None,
+        None,
+        Redactor::default(),
+        Some(overlay_dir.path().to_path_buf()),
+    )
+    .await;
+
+    match failure_of(&outcome) {
+        CoachFailure::ContextOverflow { detail } => assert!(
+            detail.contains("budget"),
+            "the recorded reason states the budget it measured against: {detail}"
+        ),
+        other => panic!("expected ContextOverflow, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an oversized prompt must be refused BEFORE the provider is called"
+    );
+    assert!(
+        outcome.session.llm_call_id.is_none(),
+        "a pre-call failure records no ledger row (audit C3)"
     );
     assert_persisted(&db, &outcome).await;
 }
@@ -658,6 +716,7 @@ async fn a_transport_failure_is_recorded_rather_than_returned() {
         None,
         None,
         Redactor::from_config(vec![TRANSPORT_CANARY.to_owned()]),
+        None,
     )
     .await;
 

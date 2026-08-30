@@ -119,15 +119,44 @@ impl<P: LlmProvider> Coach<P> {
     /// and value, reused rather than re-invented).
     pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
 
-    /// The default budget for the one variable-length context field, the DSL.
+    /// The default budget for the one variable-length CONTEXT field, the DSL.
     ///
     /// Every other `CoachContext` field is fixed-size, so this single number is
-    /// what turns "will the context fit?" into a pre-call checkable condition
+    /// what turns "will the *context* fit?" into a pre-call checkable condition
     /// (grill L4). 32 KiB is far above any strategy the r1 grammar can express —
     /// the canonical fixture is well under 1 KiB — so in practice it fires only on
     /// a pathological document, which is exactly when the coach should refuse
     /// before spending a call.
+    ///
+    /// It is a SUB-budget, and the question it answers is deliberately the smaller
+    /// one: the resolved system prompt is not a `CoachContext` field, so this
+    /// number cannot see it. The whole turn is bounded by
+    /// [`Self::DEFAULT_MAX_TURN_BYTES`].
     pub const DEFAULT_MAX_DSL_BYTES: usize = 32 * 1024;
+
+    /// The budget for the WHOLE turn — every deterministic byte this process
+    /// decides to send, not just the one context field.
+    ///
+    /// The other operator-owned input is the resolved system prompt, which
+    /// `$PULSE_PROMPT_DIR/coach.md` owns and can make arbitrarily large. Before
+    /// PR #128 (finding C1) the pre-call check measured a part and let the whole
+    /// through: an oversized overlay reached the provider instead of being recorded
+    /// as [`CoachFailure::ContextOverflow`]. Twice the DSL sub-budget, so that
+    /// sub-budget stays the binding constraint on a strategy document and this
+    /// ceiling fires only on what the sub-budget cannot see.
+    ///
+    /// **Bytes, not tokens.** A conservative LOCAL POLICY proxy: the serialized
+    /// size of the exact [`Message`] and [`ToolDefinition`] values handed to
+    /// [`LlmProvider::chat`], which counts the role tags, field names, delimiters
+    /// and tool schemas that travel with the text. It is deliberately NOT the
+    /// provider's token count and NOT the `PulseHive` wire envelope the adapter
+    /// builds from these values (ADR-0012 keeps that shape on the far side of the
+    /// port). It exists to refuse the pathological turn before it costs a call, not
+    /// to predict a context window.
+    ///
+    /// A fixed policy ceiling rather than a per-turn knob: nothing needs to tune it,
+    /// and the tunable budget is the sub-budget above.
+    pub const DEFAULT_MAX_TURN_BYTES: usize = 64 * 1024;
 
     /// Build a coach over `provider`, framed by the resolved `prompt`.
     ///
@@ -222,6 +251,16 @@ impl<P: LlmProvider> Coach<P> {
             Message::user(context.render()),
         ];
 
+        // 2b. The WHOLE-TURN budget (PR #128, finding C1). `max_dsl_bytes` bounds
+        // the projection's one variable-length field and cannot see the resolved
+        // system prompt, so the two refusals live in the same place for the same
+        // reason: pre-call, recorded with `llm_call_id = None` (audit C3), free.
+        if let Err(failure) = Self::check_turn_budget(&messages, &self.tools) {
+            return self
+                .record(sessions, session_id, run, version, None, failure)
+                .await;
+        }
+
         // 3. ONE call, under the wall-clock guard.
         let start = self.captured_len();
         let started = Instant::now();
@@ -297,6 +336,48 @@ impl<P: LlmProvider> Coach<P> {
                     .await
             }
         }
+    }
+
+    /// The deterministic bytes this turn would send, against
+    /// [`Self::DEFAULT_MAX_TURN_BYTES`].
+    ///
+    /// Measured over a serialization of the EXACT `messages` and `tools` values
+    /// handed to [`LlmProvider::chat`], not a hand-sum of the text inside them:
+    /// role tags, field names, delimiters and the tool schemas are all content the
+    /// turn sends, and a hand-sum silently under-counts the moment either type
+    /// gains a field.
+    ///
+    /// A serialization failure is unreachable — every field is a `String`, a `u32`
+    /// or an already-valid `serde_json::Value` — but it is mapped to the same
+    /// pre-call refusal rather than unwrapped: a turn whose size cannot be
+    /// established is a turn that must not be sent.
+    fn check_turn_budget(
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<(), CoachFailure> {
+        let messages_bytes = serde_json::to_string(messages)
+            .map_err(|e| CoachFailure::ContextOverflow {
+                detail: format!("the turn's messages could not be measured: {e}"),
+            })?
+            .len();
+        let tools_bytes = serde_json::to_string(tools)
+            .map_err(|e| CoachFailure::ContextOverflow {
+                detail: format!("the turn's tool schemas could not be measured: {e}"),
+            })?
+            .len();
+
+        let total = messages_bytes + tools_bytes;
+        let budget = Self::DEFAULT_MAX_TURN_BYTES;
+        if total > budget {
+            return Err(CoachFailure::ContextOverflow {
+                detail: format!(
+                    "the turn would send {total} deterministic bytes \
+                     ({messages_bytes} of messages, {tools_bytes} of tool schemas) \
+                     against a {budget}-byte budget"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Persist a failed turn — the never-silence path, used by every deviation.

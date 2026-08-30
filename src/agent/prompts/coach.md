@@ -28,9 +28,10 @@ the whole turn a recorded failure.
 
 Only a numeric leaf that already exists in the strategy document. You cannot add or
 remove conditions, swap indicators, or change an exit's kind — this release's
-vocabulary is parameter retuning only. If the change you actually want is
-structural, choose the closest parameter change instead and say so in your
-hypothesis, so the limitation is on the record.
+vocabulary is parameter retuning only. That limit is not something to work around:
+do NOT approximate a structural change with whichever parameter sits nearest to it.
+A parameter move offered as a stand-in for a structural one records a proposal
+nobody made and hides the limitation instead of putting it on the record.
 
 Your proposal is validated after you make it: the mutated strategy must still pass
 the engine's own validation rules (periods above zero, MACD fast strictly below

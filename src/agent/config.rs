@@ -370,7 +370,7 @@ fn prompt_version(text: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        CONFIG_DIR_ENV, ConfigError, PROMPT_DIR_ENV, load_coach_prompt_from,
+        COACH_PROMPT_DEFAULT, CONFIG_DIR_ENV, ConfigError, PROMPT_DIR_ENV, load_coach_prompt_from,
         load_composer_prompt_from, load_llm_transport, load_llm_transport_from,
         load_price_table_from, prompt_override_dir, resolve_config_dir,
     };
@@ -574,6 +574,31 @@ mod tests {
         std::fs::write(dir.path().join("composer.md"), "OVERRIDDEN COMPOSER PROMPT").unwrap();
         let prompt = load_composer_prompt_from(Some(dir.path())).expect("override read");
         assert_eq!(prompt, "OVERRIDDEN COMPOSER PROMPT");
+    }
+
+    /// The coach prompt's structural-limit clause is a CONTRACT, not prose
+    /// (PR #128, finding C2). `ADR-0021` says the coach must answer a structural
+    /// need with a recorded inapplicability, never an approximation — and the
+    /// shipped prompt once instructed the opposite, telling the model to reach for
+    /// the closest parameter it could find. Nothing else guards prompt CONTENT:
+    /// the ledger only hashes whatever text resolved, so a re-edit would ship
+    /// unnoticed.
+    ///
+    /// It asserts the bad instruction is absent and the rule that replaced it is
+    /// present. The structural-decline protocol itself is deliberately NOT here —
+    /// that is `r1.s4` (pulseai-labs/pulse-trader#131).
+    #[test]
+    fn the_shipped_coach_prompt_never_asks_for_an_approximated_structural_change() {
+        let prompt = COACH_PROMPT_DEFAULT.to_lowercase();
+
+        assert!(
+            !prompt.contains("closest parameter"),
+            "the coach must not be told to approximate a structural change with the nearest parameter (ADR-0021)"
+        );
+        assert!(
+            prompt.contains("do not approximate a structural change"),
+            "the prompt must state the no-approximation rule outright, not merely omit the old instruction"
+        );
     }
 
     /// The live coach path: `pulse coach` resolves [`prompt_override_dir`] and

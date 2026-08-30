@@ -166,6 +166,29 @@ pub enum MutationError {
         /// The kind the mutation offered.
         offered: ParamKind,
     },
+    /// The addressed leaf already holds the offered value — a mutation that would
+    /// change nothing.
+    ///
+    /// A **typed inapplicability, not a success** (PR #128, finding C3). `apply`
+    /// returning `Ok` here would let the coach record a `Proposed` no-op and
+    /// `r1.s4`'s accept mint a child version byte-identical to its parent, which
+    /// is a version-tree entry that says a change happened when none did.
+    ///
+    /// Numeric equality, so a `Threshold` differing only in scale (`0.030` offered
+    /// against a leaf holding `0.03`) is the same number and is declined. A
+    /// `Sweep` leaf is NEVER this error: pinning a swept parameter at one of its
+    /// own points removes the sweep, which is a real change — and the only reason
+    /// the candidate compiles at all.
+    ///
+    /// The offered value is deliberately not duplicated into the variant:
+    /// [`CoachFailure::InapplicableMutation`](crate::domain::CoachFailure) persists
+    /// the whole [`Mutation`] alongside this error, and a direct `apply` caller
+    /// supplied it.
+    #[error("`{path}` already holds the offered value; the mutation would change nothing")]
+    NoChange {
+        /// The leaf that already holds it.
+        path: String,
+    },
     /// The value was written, and the resulting strategy failed semantic
     /// validation — an out-of-domain value (a period of 0) or a cross-field rule
     /// the change broke (MACD `fast >= slow`). Carries every [`ValidationErrors`]
@@ -263,7 +286,8 @@ pub fn sweepable_paths(dsl: &StrategyDsl) -> Vec<String> {
 ///
 /// Returns [`MutationError::UnknownPath`] when the locator addresses no sweepable
 /// leaf, [`MutationError::TypeMismatch`] when it addresses one of the other
-/// numeric kind, [`MutationError::ValidationFailed`] when the mutated strategy
+/// numeric kind, [`MutationError::NoChange`] when the leaf already holds the
+/// offered value, [`MutationError::ValidationFailed`] when the mutated strategy
 /// violates a semantic rule, and [`MutationError::CompileFailed`] if it validated
 /// but did not compile.
 pub fn apply(dsl: &StrategyDsl, mutation: &Mutation) -> Result<CandidateDsl, MutationError> {
@@ -279,13 +303,25 @@ pub fn apply(dsl: &StrategyDsl, mutation: &Mutation) -> Result<CandidateDsl, Mut
             return ControlFlow::Continue(());
         }
         written = Some(match (leaf, new_value) {
+            // The `Fixed(current) == offered` guard runs BEFORE the write in both
+            // arms: a leaf that already holds the value is a no-op, and a no-op is
+            // inapplicable (PR #128, finding C3). Matching `Fixed` specifically is
+            // what keeps `Sweep -> Fixed` a real change.
             (LeafMut::Period(slot), ParamValue::Period { value }) => {
-                *slot = SweepableValue::Fixed(*value);
-                Ok(())
+                if matches!(slot, SweepableValue::Fixed(current) if *current == *value) {
+                    Err(MutationError::NoChange { path: path.clone() })
+                } else {
+                    *slot = SweepableValue::Fixed(*value);
+                    Ok(())
+                }
             }
             (LeafMut::Threshold(slot), ParamValue::Threshold { value }) => {
-                *slot = SweepableValue::Fixed(*value);
-                Ok(())
+                if matches!(slot, SweepableValue::Fixed(current) if *current == *value) {
+                    Err(MutationError::NoChange { path: path.clone() })
+                } else {
+                    *slot = SweepableValue::Fixed(*value);
+                    Ok(())
+                }
             }
             (addressed, offered) => Err(MutationError::TypeMismatch {
                 path: path.clone(),

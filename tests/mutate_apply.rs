@@ -358,6 +358,101 @@ fn compile_failed_carries_its_context() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. A proposal that would change nothing (PR #128, finding C3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setting_a_period_to_the_value_it_already_holds_is_refused_as_no_change() {
+    let dsl = rsi_oversold_strategy();
+
+    // The fixture's entry RSI period is already 14, so this mutation would mint a
+    // candidate byte-identical to its parent.
+    let err = apply(&dsl, &set_period("entry.lhs.indicator.rsi.period", 14))
+        .expect_err("re-offering the value a leaf already holds changes nothing");
+
+    match &err {
+        MutationError::NoChange { path } => {
+            assert_eq!(path, "entry.lhs.indicator.rsi.period");
+        }
+        other => panic!("expected NoChange, got {other:?}"),
+    }
+    assert!(
+        err.to_string().contains("entry.lhs.indicator.rsi.period"),
+        "a recorded failure reason must name the leaf it declined: {err}"
+    );
+}
+
+#[test]
+fn setting_a_threshold_to_the_value_it_already_holds_is_refused_as_no_change() {
+    let dsl = rsi_oversold_strategy();
+
+    // The fixture's stop is 0.05 and this offers 0.050 -- the SAME number at a
+    // different scale, so the strategy it would produce is the same strategy.
+    let err = apply(
+        &dsl,
+        &set_threshold("exits[0].distance_pct", Decimal::new(50, 3)),
+    )
+    .expect_err("a scale-only difference is not a change");
+
+    assert!(
+        matches!(&err, MutationError::NoChange { path } if path == "exits[0].distance_pct"),
+        "expected NoChange on the stop leaf, got {err:?}"
+    );
+}
+
+#[test]
+fn fixing_a_swept_leaf_at_its_current_value_is_a_real_change() {
+    // A `Sweep` leaf pinned to one of its own points is NOT a no-op: it removes
+    // the sweep, and `validate()` rejects every `Sweep`, so the pin is the whole
+    // reason the candidate compiles at all.
+    let mut dsl = rsi_oversold_strategy();
+    dsl.entry = Condition::Compare {
+        lhs: ValueSource::Indicator {
+            spec: IndicatorSpec::Rsi {
+                period: SweepableValue::Sweep {
+                    start: 10,
+                    end: 20,
+                    step: 2,
+                },
+            },
+        },
+        op: Comparator::Lt,
+        rhs: ValueSource::Constant {
+            value: Decimal::new(30, 0),
+        },
+    };
+
+    let candidate = apply(&dsl, &set_period("entry.lhs.indicator.rsi.period", 14))
+        .expect("pinning a swept leaf is a real change, not a no-op");
+
+    assert_eq!(
+        entry_rsi_period(candidate.dsl()),
+        &SweepableValue::Fixed(14),
+        "the swept leaf must come back fixed"
+    );
+}
+
+#[test]
+fn a_no_change_error_survives_a_serde_round_trip() {
+    // `CoachFailure::InapplicableMutation` persists this error verbatim (w2/w3),
+    // so a new variant only reaches the audit trail if it round-trips typed.
+    let err = apply(
+        &rsi_oversold_strategy(),
+        &set_period("entry.lhs.indicator.rsi.period", 14),
+    )
+    .expect_err("a no-op mutation is inapplicable");
+
+    let json = serde_json::to_string(&err).expect("serialize the typed reason");
+    let back: MutationError = serde_json::from_str(&json).expect("read the typed reason back");
+
+    assert_eq!(back, err, "the recorded reason must survive the round trip");
+    assert!(
+        json.contains("no_change"),
+        "the variant tag stays snake_case, like every other: {json}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3. No panic paths
 // ---------------------------------------------------------------------------
 
