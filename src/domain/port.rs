@@ -1,6 +1,11 @@
 //! Domain ports — the hexagonal seams the outer rings implement.
 //!
 //! - [`MarketDataSource`] — historical/incremental candle data (WI-02 onward).
+//! - [`CandleSeriesRepository`] — the candle-snapshot persistence port (r1.s3.w1,
+//!   #112); `CandleStore` (`adapters/store`) implements it, and the fetch,
+//!   indicator and backtest use cases consume it generically. Synchronous, unlike
+//!   its siblings, because its only implementor is. It closes ADR-0015's one
+//!   named hexagonal exception.
 //! - [`StrategyRepository`] — the strategy-tree persistence port (VS-1.1.4,
 //!   FR-4 / FR-11); the `sqlx` adapter (1.03) implements it, the CLI (1.05) and
 //!   agent layer consume it generically (`<R: StrategyRepository>`).
@@ -33,10 +38,11 @@ use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
 use crate::domain::llm_call::{LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
-use crate::domain::series::CandleSeries;
+use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
 use crate::domain::strategy::{NewVersion, Strategy, StrategyId, StrategyVersion, VersionId};
 use crate::domain::timeframe::Timeframe;
+use crate::domain::version::DataVersion;
 use rust_decimal::Decimal;
 
 /// The exchange-metadata port (VS-1.2.2, FR-5 / NFR-3) — audit C3 / C5.
@@ -91,6 +97,89 @@ pub trait MarketDataSource {
         tf: Timeframe,
         since_ms: i64,
     ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
+}
+
+/// The candle-snapshot persistence port (r1.s3.w1, #112).
+///
+/// ADR-0015 named exactly one hexagonal exception: candle storage had no port, so
+/// the fetch, indicator and backtest use cases imported and constructed the
+/// concrete `CandleStore` adapter. This trait closes that exception. The Parquet
+/// adapter implements it; the use cases consume it generically
+/// (`<R: CandleSeriesRepository>`), never as `dyn`, and only `src/cli/mod.rs` (the
+/// composition root) still chooses a concrete implementation.
+///
+/// **Synchronous, unlike the sibling ports.** The only implementor is the existing
+/// synchronous Parquet adapter, and the debug CLI already drives it that way;
+/// stating `async` here would buy nothing and force every consumer into a runtime
+/// it does not need. Offloading the blocking read from a Tauri command is `r1.s3`'s
+/// `w3` problem, not this port's.
+///
+/// **Deep, not shallow (ADR-0012).** Three semantic operations, and deliberately
+/// no content-version, path, encode, raw HEAD-write, provenance-decoder, existence,
+/// latest-version or temp-file method. Those are adapter internals — re-exposing
+/// them here would recreate `CandleStore` as a trait and close nothing.
+pub trait CandleSeriesRepository {
+    /// Load the current snapshot for `(pair, timeframe)` — the `HEAD` pointer and
+    /// the exact snapshot it names, resolved as ONE caller operation.
+    ///
+    /// `Ok(None)` means no `HEAD` exists yet (a first run, before anything was
+    /// committed). A `HEAD` that names an absent or unreadable snapshot is an
+    /// **error**, never `Ok(None)`: "nothing here yet" and "the pointer is broken"
+    /// are different facts and a caller must not confuse them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when `HEAD` is unreadable or malformed, or when the
+    /// snapshot it names is absent or cannot be decoded.
+    fn load_head(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+    ) -> Result<Option<StoredCandleSeries>, DataError>;
+
+    /// Load precisely the immutable snapshot identified by `version`.
+    ///
+    /// It never falls back to `HEAD`: an unknown version is an error, because a
+    /// caller asking for an exact identity (a replayed run, a provenance check)
+    /// is worse served by silently different data than by a refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when no snapshot exists for `version` or it cannot be
+    /// decoded.
+    fn load_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> Result<StoredCandleSeries, DataError>;
+
+    /// Publish `candles` as the current snapshot for `(pair, timeframe)`.
+    ///
+    /// There is **no version parameter**: the repository derives the canonical
+    /// identity (ADR-0009's content hash) from the content itself, constructs the
+    /// series and validates it. A caller-supplied identity that disagrees with the
+    /// content is therefore unrepresentable rather than merely rejected.
+    ///
+    /// For a non-empty commit the immutable snapshot is written/reconciled
+    /// **first** and `HEAD` advanced **second** (ADR-0018's crash-safe ordering), and
+    /// `storage_location` is `Some(..)`. A failure to advance `HEAD` returns an
+    /// error and may leave an already-valid orphan snapshot behind — the existing
+    /// contract, preserved.
+    ///
+    /// For **zero** candles nothing is written, `HEAD` is left exactly where it was,
+    /// and the derived identity comes back with `storage_location: None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on a structurally invalid series, a same-identity
+    /// different-content collision, or any storage failure.
+    fn commit(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: Vec<Candle>,
+    ) -> Result<StoredCandleSeries, DataError>;
 }
 
 /// The strategy-tree persistence port (VS-1.1.4, FR-4 / FR-11).

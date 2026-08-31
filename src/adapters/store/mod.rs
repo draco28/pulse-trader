@@ -19,7 +19,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::domain::CANDLE_SCHEMA_VERSION;
-use crate::domain::{Candle, CandleSeries, DataError, DataVersion, Pair, Timeframe};
+use crate::domain::{
+    Candle, CandleSeries, CandleSeriesRepository, DataError, DataVersion, Pair, StoredCandleSeries,
+    Timeframe,
+};
 
 /// The per-`(pair,tf)` `HEAD` pointer file name (audit C6 — a bare file holding
 /// the current `data_version`).
@@ -300,6 +303,90 @@ impl CandleStore {
             }
         }
         Ok(newest.map(|(_, v)| v))
+    }
+
+    /// The display locator this adapter reports for a persisted snapshot: the
+    /// snapshot's ABSOLUTE path (ADR-0017 — the debug CLI's `path` field is locked
+    /// to it). Owned, and converted here so the domain never sees a `PathBuf`.
+    fn locator(&self, pair: &Pair, tf: Timeframe, version: &DataVersion) -> String {
+        self.snapshot_path(pair, tf, version).display().to_string()
+    }
+}
+
+/// The [`CandleSeriesRepository`] implementation (r1.s3.w1, #112) — three semantic
+/// operations composed from the inherent primitives above, which stay public for
+/// focused adapter tests and tooling. No hash, Parquet codec, path layout or
+/// atomic-write helper moves into the domain; only these three behaviours cross.
+impl CandleSeriesRepository for CandleStore {
+    fn load_head(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+    ) -> Result<Option<StoredCandleSeries>, DataError> {
+        let Some(version) = self.read_head(pair, timeframe)? else {
+            // No HEAD yet: a first run, not a fault.
+            return Ok(None);
+        };
+        // A HEAD that names an absent or corrupt snapshot propagates the read
+        // error — it must NOT collapse into `Ok(None)`, which would read as
+        // "nothing stored yet" and silently trigger a full re-fetch.
+        self.load_version(pair, timeframe, &version).map(Some)
+    }
+
+    fn load_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> Result<StoredCandleSeries, DataError> {
+        let series = self.read_snapshot(pair, timeframe, version)?;
+        Ok(StoredCandleSeries {
+            storage_location: Some(self.locator(pair, timeframe, version)),
+            series,
+        })
+    }
+
+    fn commit(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: Vec<Candle>,
+    ) -> Result<StoredCandleSeries, DataError> {
+        // Identity is DERIVED here, from the content (ADR-0009). The port takes no
+        // version argument, so a caller cannot state a stale or wrong one.
+        let version = Self::content_version(pair, timeframe, &candles);
+        let series = CandleSeries {
+            pair: pair.clone(),
+            timeframe,
+            version,
+            candles,
+        };
+        // Structural corruption (unsorted / duplicate `open_time`) is refused here
+        // rather than at encode time; reported gaps are information, not a failure
+        // (audit C2), so they are deliberately dropped.
+        series.validate()?;
+
+        if series.candles.is_empty() {
+            // The existing zero-candle first-run outcome: write no snapshot, leave
+            // HEAD untouched (else the next run reads an empty prior and back-fills
+            // from epoch), and report the derived identity with no locator.
+            return Ok(StoredCandleSeries {
+                series,
+                storage_location: None,
+            });
+        }
+
+        // Snapshot FIRST (atomic temp→rename), HEAD SECOND (atomic) — audit C1 /
+        // ADR-0018. A crash between the two leaves a valid orphan and a consistent
+        // HEAD, and a HEAD-write failure surfaces as an error with the orphan in
+        // place, which is the pre-existing contract.
+        self.write_snapshot(&series)?;
+        self.write_head(pair, timeframe, &series.version)?;
+        let storage_location = Some(self.locator(pair, timeframe, &series.version));
+        Ok(StoredCandleSeries {
+            series,
+            storage_location,
+        })
     }
 }
 

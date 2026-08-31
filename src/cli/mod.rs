@@ -25,8 +25,12 @@ use clap::{Parser, Subcommand};
 use crate::adapters::binance::BinanceDataSource;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, default_db_path, open_migrated};
+// r1.s3.w1 (#112): this module is ADR-0015's explicit composition-root exception —
+// the ONE place that still names the concrete Parquet adapter. The use-case modules
+// (`fetch_data`, `indicators`, `backtest`) depend on `CandleSeriesRepository` and are
+// handed an implementation from here.
 use crate::adapters::store::CandleStore;
-use crate::domain::{Pair, Timeframe};
+use crate::domain::{CandleSeriesRepository, Pair, Timeframe};
 
 use backtest::{BacktestArgs, run_backtest_cli};
 use coach::{CoachArgs, run_coach};
@@ -118,7 +122,15 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("build binance source: {e}"))?;
             run_fetch_data(&source, &store, &SystemClock, &args).await
         }
-        Command::Indicators(args) => run_indicators(&args),
+        // r1.s3.w1: the fixture/default root resolution moved here — `run_indicators`
+        // now takes a repository, not a directory.
+        Command::Indicators(args) => {
+            let base_dir = match &args.base_dir {
+                Some(path) => path.clone(),
+                None => default_fixture_base_dir()?,
+            };
+            run_indicators(&CandleStore::with_base_dir(base_dir), &args)
+        }
         Command::Strategy(args) => {
             let db = open_db(args.db.as_deref()).await?;
             run_strategy(&db, &args).await
@@ -135,7 +147,14 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             } else {
                 None
             };
-            run_backtest_cli(db.as_ref(), &args).await
+            // r1.s3.w1: the `--store` / default-root choice is composition, so it
+            // lives here; `run_backtest_cli` only sees the port.
+            let repo = match &args.store {
+                Some(dir) => CandleStore::with_base_dir(dir.clone()),
+                None => CandleStore::with_default_base_dir()
+                    .map_err(|e| anyhow::anyhow!("resolve default candle-store dir: {e}"))?,
+            };
+            run_backtest_cli(db.as_ref(), &repo, &args).await
         }
         // VS-1.2.4 work-4.05 (D6): the `runs list/show` read verb always opens the
         // db via `open_migrated` (same migrate-then-open as the Strategy arm).
@@ -188,24 +207,26 @@ async fn open_db(db_override: Option<&std::path::Path>) -> anyhow::Result<Db> {
         .map_err(|e| anyhow::anyhow!("open db: {e}"))
 }
 
-/// Orchestrate `fetch-data` over the injected port + store (NFR-9 / AC-6 — this
-/// fn names only the `MarketDataSource` + `Clock` bounds, never the concrete
-/// adapter). Each tf is fetched **independently**; a failing tf is reported and
-/// the process exits non-zero, while successful tfs remain (audit C4 / AC-8).
+/// Orchestrate `fetch-data` over the injected ports (NFR-9 / AC-6 — this fn names
+/// only the `MarketDataSource`, `Clock` and `CandleSeriesRepository` bounds, never
+/// a concrete adapter). Each tf is fetched **independently**; a failing tf is
+/// reported and the process exits non-zero, while successful tfs remain
+/// (audit C4 / AC-8).
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] iff at least one tf failed (after all tfs have
 /// been attempted + reported).
-pub async fn run_fetch_data<S, C>(
+pub async fn run_fetch_data<S, C, R>(
     source: &S,
-    store: &CandleStore,
+    repo: &R,
     clock: &C,
     args: &FetchArgs,
 ) -> anyhow::Result<()>
 where
     S: crate::domain::MarketDataSource,
     C: crate::domain::Clock,
+    R: CandleSeriesRepository,
 {
     // Validate the untrusted CLI symbol before it can reach the store-path layer
     // (it is joined verbatim into `<base>/candles/<PAIR>/…`; an unvalidated
@@ -219,7 +240,7 @@ where
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for tf in timeframes {
-        match ensure_one_tf(source, store, clock, &pair, tf, args.years).await {
+        match ensure_one_tf(source, repo, clock, &pair, tf, args.years).await {
             TfOutcome::Ok(summary) => summaries.push(summary),
             TfOutcome::Failed { timeframe, error } => failures.push((timeframe, error)),
         }
@@ -283,6 +304,15 @@ fn parse_timeframes(raw: &[String]) -> anyhow::Result<Vec<Timeframe>> {
         }
     }
     Ok(out)
+}
+
+/// The default `pulse indicators` candle root: the committed `BTCUSDT` fixture
+/// store under the current working directory (r1.s3.w1 — moved here from
+/// `indicators`, which no longer resolves roots or constructs adapters).
+fn default_fixture_base_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("resolve current directory for default fixture: {e}"))?
+        .join("tests/fixtures/btcusdt-1m-store"))
 }
 
 /// Parse one timeframe token (case-insensitive: `M15`/`15m`, `H4`/`4h`).

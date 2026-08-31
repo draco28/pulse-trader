@@ -1,9 +1,14 @@
 //! `pulse indicators` offline indicator-series viewer.
+//!
+//! Since r1.s3.w1 (#112) it reads candles through the [`CandleSeriesRepository`]
+//! port; `src/cli/mod.rs` resolves the fixture/default root and chooses the
+//! concrete adapter.
 
 use std::path::PathBuf;
 
 use crate::{
-    CandleStore, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair, SweepableValue,
+    CandleSeriesRepository, CompiledValue, EvalContext, IndicatorEngine, IndicatorSpec, Pair,
+    SweepableValue,
 };
 use rust_decimal::Decimal;
 
@@ -37,26 +42,24 @@ pub(crate) struct IndicatorColumn {
     pub(crate) spec: IndicatorSpec,
 }
 
-/// Load a local snapshot, stream the indicator engine over every candle, and
-/// print a deterministic tab-separated series.
+/// Load the `HEAD` snapshot through the repository port, stream the indicator
+/// engine over every candle, and print a deterministic tab-separated series.
 ///
 /// # Errors
 ///
 /// Returns an [`anyhow::Error`] on invalid args, missing fixture data, or engine
 /// construction failure.
-pub fn run_indicators(args: &IndicatorsArgs) -> anyhow::Result<()> {
+pub fn run_indicators<R>(repo: &R, args: &IndicatorsArgs) -> anyhow::Result<()>
+where
+    R: CandleSeriesRepository,
+{
     let pair = Pair::parse(args.pair.clone())
         .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
     let tf = parse_one_tf(&args.tf)?;
-    let base_dir = match &args.base_dir {
-        Some(path) => path.clone(),
-        None => default_fixture_base_dir()?,
-    };
-    let store = CandleStore::with_base_dir(base_dir);
-    let head = store
-        .read_head(&pair, tf)?
-        .ok_or_else(|| anyhow::anyhow!("no HEAD snapshot for {pair} {}", tf.binance_interval()))?;
-    let series = store.read_snapshot(&pair, tf, &head)?;
+    let series = repo
+        .load_head(&pair, tf)?
+        .ok_or_else(|| anyhow::anyhow!("no HEAD snapshot for {pair} {}", tf.binance_interval()))?
+        .series;
     let columns = parse_indicator_specs(&args.indicators)?;
     let specs = columns
         .iter()
@@ -126,12 +129,6 @@ pub(crate) fn render_row(open_time: i64, values: &[Option<Decimal>]) -> String {
     cells.push(open_time.to_string());
     cells.extend(values.iter().copied().map(render_indicator_value));
     cells.join("\t")
-}
-
-fn default_fixture_base_dir() -> anyhow::Result<PathBuf> {
-    Ok(std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("resolve current directory for default fixture: {e}"))?
-        .join("tests/fixtures/btcusdt-1m-store"))
 }
 
 fn parse_one_indicator(token: &str) -> anyhow::Result<IndicatorColumn> {

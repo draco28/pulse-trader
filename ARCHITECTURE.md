@@ -39,7 +39,7 @@ define every external concern:
 | `ExchangeAdapter` | Fetch historical candles + live feeds |
 | `LlmProvider` | Issue prompts, receive structured responses |
 | `StrategyRepository` | Persist and load `Strategy` / `StrategyVersion` |
-| `CandleSeriesRepository` | Read / write immutable Parquet candle snapshots |
+| `CandleSeriesRepository` | Load the `HEAD` or an exact `data_version` candle snapshot; commit a new one |
 | `MarketDataSource` | Abstraction over bulk, REST, and WebSocket data |
 | `EventBus` | In-process event dispatch |
 | `Clock` | Mockable wall time |

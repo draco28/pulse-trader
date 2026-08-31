@@ -1,22 +1,24 @@
 //! `pulse fetch-data` orchestration (WI-1.1.1.05).
 //!
 //! Composes the [`MarketDataSource`] port (a [`BinanceDataSource`](crate::adapters::binance::BinanceDataSource)
-//! in production) + the [`CandleStore`] into the slice's user-facing seam. The
-//! orchestration depends **only** on the port + the store (NFR-9 / AC-6) — it
-//! never names the concrete adapter type.
+//! in production) + the [`CandleSeriesRepository`] port (the Parquet adapter in
+//! production) into the slice's user-facing seam. Since r1.s3.w1 (#112) the
+//! orchestration depends on **two ports and no concrete type** (NFR-9 / AC-6);
+//! `src/cli/mod.rs` is where an implementation is chosen.
 //!
 //! Per-(pair, tf) flow (grill + audit-locked, spec §3):
 //! - **First run** (no `HEAD`): bulk over the `--years N` window
 //!   ([`MarketDataSource::fetch_historical`]) **then** an immediate REST top-up
 //!   to the clock cutoff ([`MarketDataSource::fetch_incremental`]) so the first
-//!   snapshot is current. Write the snapshot, then set `HEAD`. Action `bulk`.
+//!   snapshot is current. Commit the result. Action `bulk`.
 //! - **Subsequent run** (`HEAD` present): read the prior snapshot, top up only
-//!   newly-closed candles. If any closed → write a new version + move `HEAD`
-//!   (action `incremental`); if nothing newly closed → **`up-to-date` no-op**,
-//!   not an error.
-//! - **Ordering + crash-safety (audit C1):** the snapshot Parquet is written
-//!   **first** (atomic, WI-04), `HEAD` **second** (atomic). A crash between
-//!   leaves a valid orphaned snapshot and an unchanged `HEAD`.
+//!   newly-closed candles. If any closed → commit a new version (action
+//!   `incremental`); if nothing newly closed → **`up-to-date` no-op**, not an
+//!   error.
+//! - **Ordering + crash-safety (audit C1):** snapshot-then-`HEAD` ordering is the
+//!   repository's guarantee ([`CandleSeriesRepository::commit`]), not something
+//!   this module sequences any more. A crash between the two still leaves a valid
+//!   orphaned snapshot and an unchanged `HEAD`.
 //! - **`--years N` window (audit C5):** start = floor to the first day of the
 //!   month `N` years before the current UTC month.
 //! - **Multi-tf (audit C4):** each tf is fetched independently; a failing tf is
@@ -26,8 +28,9 @@
 use chrono::{Datelike, TimeZone, Utc};
 use serde::Serialize;
 
-use crate::adapters::store::CandleStore;
-use crate::domain::{Clock, DataError, MarketDataSource, Pair, Timeframe};
+use crate::domain::{
+    CandleSeriesRepository, Clock, DataError, MarketDataSource, Pair, StoredCandleSeries, Timeframe,
+};
 
 /// The action taken for one `(pair, tf)` this run (the `--json` `action` field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -115,9 +118,9 @@ pub fn years_window_start_ms(now_ms: i64, n_years: u32) -> i64 {
 /// entry on error — never panics; the caller aggregates exit status, AC-8).
 ///
 /// `now_ms` is read once from the clock so the window + cutoff are deterministic.
-pub async fn ensure_one_tf<S, C>(
+pub async fn ensure_one_tf<S, C, R>(
     source: &S,
-    store: &CandleStore,
+    repo: &R,
     clock: &C,
     pair: &Pair,
     tf: Timeframe,
@@ -126,9 +129,10 @@ pub async fn ensure_one_tf<S, C>(
 where
     S: MarketDataSource,
     C: Clock,
+    R: CandleSeriesRepository,
 {
     let now_ms = clock.now_ms();
-    match ensure_inner(source, store, pair, tf, n_years, now_ms).await {
+    match ensure_inner(source, repo, pair, tf, n_years, now_ms).await {
         Ok(summary) => TfOutcome::Ok(summary),
         Err(e) => TfOutcome::Failed {
             timeframe: tf.binance_interval().to_string(),
@@ -138,9 +142,9 @@ where
 }
 
 /// The fallible body of [`ensure_one_tf`] (kept ≤ 80 lines; helpers below).
-async fn ensure_inner<S>(
+async fn ensure_inner<S, R>(
     source: &S,
-    store: &CandleStore,
+    repo: &R,
     pair: &Pair,
     tf: Timeframe,
     n_years: u32,
@@ -148,18 +152,22 @@ async fn ensure_inner<S>(
 ) -> Result<TfSummary, DataError>
 where
     S: MarketDataSource,
+    R: CandleSeriesRepository,
 {
-    match store.read_head(pair, tf)? {
-        None => first_run(source, store, pair, tf, n_years, now_ms).await,
-        Some(prior_version) => subsequent_run(source, store, pair, tf, &prior_version).await,
+    // ONE port call resolves HEAD and the snapshot it names. A broken pointer is
+    // an error here, not an `Ok(None)` that would look like a first run and
+    // silently re-bulk the whole window.
+    match repo.load_head(pair, tf)? {
+        None => first_run(source, repo, pair, tf, n_years, now_ms).await,
+        Some(prior) => subsequent_run(source, repo, pair, tf, prior).await,
     }
 }
 
 /// First run: bulk over the years window, then top up to now; write snapshot,
 /// then `HEAD` (audit C1).
-async fn first_run<S>(
+async fn first_run<S, R>(
     source: &S,
-    store: &CandleStore,
+    repo: &R,
     pair: &Pair,
     tf: Timeframe,
     n_years: u32,
@@ -167,6 +175,7 @@ async fn first_run<S>(
 ) -> Result<TfSummary, DataError>
 where
     S: MarketDataSource,
+    R: CandleSeriesRepository,
 {
     let start_ms = years_window_start_ms(now_ms, n_years);
     // Bulk covers COMPLETE months only — exclude the current (incomplete) month,
@@ -191,86 +200,67 @@ where
     }
     if series.candles.is_empty() {
         // Nothing fetched (e.g. `--years 0` right after a UTC month rollover,
-        // before the first candle closes). Do NOT persist an empty snapshot or
-        // set `HEAD` — else the next run would read an empty prior and back-fill
-        // from epoch (CodeRabbit). With no `HEAD`, the next run is a fresh first
-        // run (which anchors on the window). Report a no-data up-to-date result
-        // with an EMPTY path: no Parquet was written, so reporting
-        // `snapshot_path(...)` would point at a file that does not exist (Codex P2).
-        series.version = CandleStore::content_version(pair, tf, &series.candles);
-        return summarize_no_data(&series);
+        // before the first candle closes). The repository's zero-candle contract
+        // is exactly the behaviour this branch needs: it persists no snapshot and
+        // sets no `HEAD` — else the next run would read an empty prior and
+        // back-fill from epoch (CodeRabbit) — and returns the derived identity
+        // with NO locator, so the reported `path` is empty rather than naming a
+        // Parquet that does not exist (Codex P2).
+        let stored = repo.commit(pair, tf, series.candles)?;
+        return summarize(&stored, Action::UpToDate);
     }
-    persist(store, pair, tf, series, Action::Bulk)
+    persist(repo, pair, tf, series, Action::Bulk)
 }
 
 /// Subsequent run: read the prior snapshot, top up only newly-closed candles.
-async fn subsequent_run<S>(
+async fn subsequent_run<S, R>(
     source: &S,
-    store: &CandleStore,
+    repo: &R,
     pair: &Pair,
     tf: Timeframe,
-    prior_version: &crate::domain::DataVersion,
+    prior: StoredCandleSeries,
 ) -> Result<TfSummary, DataError>
 where
     S: MarketDataSource,
+    R: CandleSeriesRepository,
 {
-    let prior = store.read_snapshot(pair, tf, prior_version)?;
-    let since = prior.candles.last().map_or(-1, |c| c.open_time);
+    let since = prior.series.candles.last().map_or(-1, |c| c.open_time);
     let new = source.fetch_incremental(pair, tf, since).await?;
     if new.is_empty() {
-        // Nothing newly closed ⇒ up-to-date no-op (NOT an error). HEAD unchanged.
-        return summarize(store, &prior, Action::UpToDate);
+        // Nothing newly closed ⇒ up-to-date no-op (NOT an error). HEAD unchanged,
+        // and the reported `path` is the locator HEAD was already resolved through.
+        return summarize(&prior, Action::UpToDate);
     }
-    let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&prior, new)?;
-    persist(store, pair, tf, merged, Action::Incremental)
+    let (merged, _gaps) = crate::adapters::binance::merge::merge_new(&prior.series, new)?;
+    persist(repo, pair, tf, merged, Action::Incremental)
 }
 
-/// Write the snapshot (FIRST) then move `HEAD` (SECOND) atomically (audit C1),
-/// re-deriving the content-hash `data_version` for the merged candle set.
-fn persist(
-    store: &CandleStore,
+/// Commit the merged candle set through the repository port. Identity derivation
+/// (ADR-0009's content hash) and the snapshot-then-`HEAD` ordering (audit C1) are
+/// the repository's guarantees now — this function just hands over the candles.
+fn persist<R>(
+    repo: &R,
     pair: &Pair,
     tf: Timeframe,
-    mut series: crate::domain::CandleSeries,
+    series: crate::domain::CandleSeries,
     action: Action,
-) -> Result<TfSummary, DataError> {
-    series.version = CandleStore::content_version(pair, tf, &series.candles);
-    // Snapshot FIRST (atomic temp→rename, WI-04).
-    store.write_snapshot(&series)?;
-    // HEAD SECOND (atomic temp→rename). A crash between leaves a valid orphan.
-    store.write_head(pair, tf, &series.version)?;
-    summarize(store, &series, action)
+) -> Result<TfSummary, DataError>
+where
+    R: CandleSeriesRepository,
+{
+    let stored = repo.commit(pair, tf, series.candles)?;
+    summarize(&stored, action)
 }
 
-/// Build the no-data summary for a first run that fetched zero candles: nothing
-/// was persisted and no `HEAD` set, so the `path` MUST be empty (reporting
-/// `snapshot_path(...)` would point at a Parquet that does not exist — Codex P2).
-/// The grill-locked `--json` field set/types are unchanged (`path` stays a
-/// `String`; here it is `""`).
-fn summarize_no_data(series: &crate::domain::CandleSeries) -> Result<TfSummary, DataError> {
+/// Build the `--json`/human summary from a stored series.
+///
+/// The grill-locked field set/types are unchanged. `path` is the repository's
+/// display locator — the snapshot's absolute path for a persisted series, and the
+/// empty string for the zero-candle outcome, where no snapshot exists and naming
+/// one would point at a Parquet that was never written (Codex P2).
+fn summarize(stored: &StoredCandleSeries, action: Action) -> Result<TfSummary, DataError> {
+    let series = &stored.series;
     let gaps = series.validate()?;
-    Ok(TfSummary {
-        pair: series.pair.to_string(),
-        timeframe: series.timeframe.binance_interval().to_string(),
-        data_version: series.version.to_string(),
-        action: Action::UpToDate.as_str().to_string(),
-        candle_count: series.candles.len(),
-        first_open_ms: series.candles.first().map(|c| c.open_time),
-        last_open_ms: series.candles.last().map(|c| c.open_time),
-        // Empty: no snapshot was written, so there is no path to report.
-        path: String::new(),
-        gap_count: gaps.len(),
-    })
-}
-
-/// Build the `--json`/human summary for a (persisted or already-current) series.
-fn summarize(
-    store: &CandleStore,
-    series: &crate::domain::CandleSeries,
-    action: Action,
-) -> Result<TfSummary, DataError> {
-    let gaps = series.validate()?;
-    let path = store.snapshot_path(&series.pair, series.timeframe, &series.version);
     Ok(TfSummary {
         pair: series.pair.to_string(),
         timeframe: series.timeframe.binance_interval().to_string(),
@@ -279,7 +269,7 @@ fn summarize(
         candle_count: series.candles.len(),
         first_open_ms: series.candles.first().map(|c| c.open_time),
         last_open_ms: series.candles.last().map(|c| c.open_time),
-        path: path.display().to_string(),
+        path: stored.storage_location.clone().unwrap_or_default(),
         gap_count: gaps.len(),
     })
 }

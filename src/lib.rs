@@ -28,6 +28,13 @@ pub use domain::{
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
 
+// r1.s3.w1 (#112): the candle-snapshot persistence port + the value it returns.
+// Re-exported beside `CandleStore` so the contract target
+// (`tests/candle_repository.rs`) can drive BOTH a zero-I/O double and the real
+// Parquet adapter through the same bound — which is what proves the port, not the
+// adapter, is what the use cases depend on (ADR-0015's named exception, closed).
+pub use domain::{CandleSeriesRepository, StoredCandleSeries};
+
 // VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
 // NFR-2). `current()` is the sha2-256 hex baked in by `build.rs`; `target()` is the
 // compiled triple (the arch tag for the cross-arch story); `compare()` is the FR-7

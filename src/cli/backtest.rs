@@ -41,12 +41,11 @@ use rust_decimal::Decimal;
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::db::{Db, SqliteBacktestRunRepo, SqliteStrategyRepo};
-use crate::adapters::store::CandleStore;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestResult, BacktestRunRepository, CandleSeries, CompiledStrategy, Direction,
-    EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, StrategyDsl,
-    StrategyRepository, SummaryStats, Timeframe, Trade, compile, validate,
+    BacktestResult, BacktestRunRepository, CandleSeries, CandleSeriesRepository, CompiledStrategy,
+    Direction, EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime,
+    StrategyDsl, StrategyRepository, SummaryStats, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -138,7 +137,14 @@ pub struct BacktestArgs {
 /// validation, a compile error, an invalid pair/timeframe, a missing candle
 /// snapshot, an engine error (e.g. `NoStopLoss`), or a persistence failure. Every
 /// path surfaces a clear message + non-zero exit; nothing panics.
-pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::Result<()> {
+pub async fn run_backtest_cli<R>(
+    db: Option<&Db>,
+    repo: &R,
+    args: &BacktestArgs,
+) -> anyhow::Result<()>
+where
+    R: CandleSeriesRepository,
+{
     let pair = Pair::parse(args.pair.clone())
         .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
     let tf = parse_one_tf(&args.tf)?;
@@ -164,15 +170,9 @@ pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::R
     // The clap ArgGroup guarantees EXACTLY ONE of --dsl / --version is present.
     let loaded = load_strategy(db, args).await?;
 
-    let store = match &args.store {
-        Some(dir) => CandleStore::with_base_dir(dir.clone()),
-        None => CandleStore::with_default_base_dir()
-            .map_err(|e| anyhow::anyhow!("resolve default candle-store dir: {e}"))?,
-    };
-
-    let primary = load_series(&store, &pair, tf)?;
+    let primary = load_series(repo, &pair, tf)?;
     let htf_series = match htf {
-        Some(htf_tf) => Some(load_series(&store, &pair, htf_tf)?),
+        Some(htf_tf) => Some(load_series(repo, &pair, htf_tf)?),
         None => None,
     };
 
@@ -380,20 +380,28 @@ fn reject_if_gapped(series: &CandleSeries) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load the HEAD snapshot for `(pair, tf)` from the store, erroring clearly when
-/// no snapshot exists or when the series is not gap-free.
-fn load_series(store: &CandleStore, pair: &Pair, tf: Timeframe) -> anyhow::Result<CandleSeries> {
-    let head = store.read_head(pair, tf)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no HEAD snapshot for {pair} {} in the candle store",
-            tf.binance_interval()
-        )
-    })?;
-    let series = store
-        .read_snapshot(pair, tf, &head)
-        .map_err(|e| anyhow::anyhow!("read snapshot for {pair} {}: {e}", tf.binance_interval()))?;
-    reject_if_gapped(&series)?;
-    Ok(series)
+/// Load the `HEAD` snapshot for `(pair, tf)` through the repository port, erroring
+/// clearly when no snapshot exists or when the series is not gap-free.
+fn load_series<R>(repo: &R, pair: &Pair, tf: Timeframe) -> anyhow::Result<CandleSeries>
+where
+    R: CandleSeriesRepository,
+{
+    let stored = repo
+        .load_head(pair, tf)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "read HEAD snapshot for {pair} {}: {e}",
+                tf.binance_interval()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no HEAD snapshot for {pair} {} in the candle store",
+                tf.binance_interval()
+            )
+        })?;
+    reject_if_gapped(&stored.series)?;
+    Ok(stored.series)
 }
 
 /// The tab-separated trade-log header (names every cost column the demo reads,
