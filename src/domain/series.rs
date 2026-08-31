@@ -38,6 +38,24 @@ pub struct CandleSeries {
     pub candles: Vec<Candle>,
 }
 
+/// A [`CandleSeries`] as a repository holds it, plus an opaque locator for the
+/// snapshot it came from or went to (r1.s3.w1, #112).
+///
+/// `storage_location` is a **display** locator, not an instruction: it is not a
+/// `PathBuf`, the caller never joins to it or opens it, and its shape is the
+/// adapter's business. The Parquet adapter returns the snapshot's absolute path,
+/// which is what the debug CLI's locked `path` field reports (ADR-0017); an
+/// in-memory double may return anything at all. It is `None` only for the
+/// existing zero-candle first-run outcome, where no snapshot exists to point at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCandleSeries {
+    /// The series itself.
+    pub series: CandleSeries,
+    /// An opaque display locator for the persisted snapshot, or `None` when the
+    /// zero-candle outcome persisted nothing.
+    pub storage_location: Option<String>,
+}
+
 impl CandleSeries {
     /// Validate structural soundness and report spacing gaps (audit C2).
     ///

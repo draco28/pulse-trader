@@ -25,14 +25,26 @@ A **modular monolith** with **hexagonal (ports-and-adapters)** discipline: ports
 traits in the domain layer, adapters implement them, and dependency direction is
 always inward.
 
-**The invariant holds for most external concerns, not all — and the exception is
-named rather than glossed.** `src/domain/port.rs` defines `ExchangeAdapter`,
-`MarketDataSource`, `StrategyRepository`, `BacktestRunRepository`, `LlmProvider` and
-`LlmCallRepository`. **Candle storage has no port**: the `CandleSeriesRepository` trait
-ADR-0002 named was never built, and the CLI imports and constructs the concrete
-`CandleStore` adapter directly. So the current candle path is the one place that does
-*not* satisfy this decision, and a contributor should not read it as the compliant
-pattern. Closing that gap is tracked in **#112**.
+**The invariant now holds for every external concern; the one named exception is
+closed.** `src/domain/port.rs` defines `ExchangeAdapter`, `MarketDataSource`,
+`StrategyRepository`, `BacktestRunRepository`, `LlmProvider`, `LlmCallRepository`,
+`CoachingRepository` — and, since **r1.s3.w1 (#112)**, `CandleSeriesRepository`.
+Candle storage previously had no port: the trait ADR-0002 named was never built and
+the use cases imported and constructed the concrete `CandleStore` adapter directly,
+which made the candle path the one place that did *not* satisfy this decision. It
+now does. `CandleSeriesRepository` is a **deep** domain trait — three semantic
+operations (`load_head`, `load_version`, `commit`), with the content hash, Parquet
+codec, path layout and atomic-write internals left inside the adapter — and the
+fetch, indicator and backtest use cases consume it generically.
+
+**The composition-root qualification stands.** "Only composition roots choose a
+concrete adapter" is the rule, not "no module ever names one": `src/cli/mod.rs`
+still constructs `CandleStore` (from the default root or a `--store` / `--base-dir`
+argument) and hands it to the use cases, exactly as it constructs `BinanceDataSource`
+and the `sqlx` repositories. That is the decision being satisfied, not a residue of
+the old exception. `tests/candle_repository.rs` is the standing guard: it scans the
+three use-case modules for a concrete-store mention in code, and asserts the
+deterministic engine names neither the adapter nor the port.
 
 **The domain invariant is "zero I/O", not "zero dependencies"** — `src/domain/mod.rs`
 states that policy explicitly. Domain types freely use `serde`, `rust_decimal`,
@@ -78,3 +90,14 @@ Crate splits stay mechanical because ports live in the domain. No IPC, no proces
 supervision, no version skew between components. The cost is that everything shares one
 address space and one release cadence: a component that genuinely needs independent
 deployment would force a revisit, which is this bone's trigger.
+
+With #112 closed there is **no standing exception left to read as precedent** — a
+contributor can now take any use-case module as the compliant pattern. The candle
+path in particular gains a substitutable seam: `r1.s3.w2` captures a backtest's
+exact snapshot inputs through this port rather than threading provenance through a
+concrete filesystem adapter, and a future replay or remote candle source becomes an
+adapter swap instead of an edit to every consumer. The cost is one more trait to
+keep **deep**: re-exposing `content_version`, `snapshot_path`, `write_head` or the
+encode helpers on the port would recreate `CandleStore` as a shallow interface and
+close nothing. Those stay inherent methods on the adapter, for its own tests and
+tooling.
