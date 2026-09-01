@@ -384,7 +384,14 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported
 // public domain type is a `dead_code` build error, not a warning. 4.05's CLI
 // consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
-pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
+// r1.s3.w2 (#110): the durable INPUT provenance value types ride the same
+// re-export (an un-re-exported public domain type is a `dead_code` BUILD error
+// under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
+// name them.
+pub use domain::{
+    BacktestInputs, BacktestRunId, BacktestRunRepository, FundingConfig, PersistedRun, RunSummary,
+    SnapshotSelection,
+};
 
 // VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The
 // PulseTrader-OWNED `LlmProvider` port + the message/response/usage/config value

@@ -41,6 +41,8 @@ pub use error::BacktestError;
 pub use feed::{AlignedBar, align};
 pub use regime::{ADX_TREND_THRESHOLD, Regime, RegimeBreakdown, RegimeCell, classify};
 pub use result::BacktestResult;
-pub use run::{BacktestRunId, PersistedRun, RunSummary};
+pub use run::{
+    BacktestInputs, BacktestRunId, FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
+};
 pub use stats::{EquityCurve, EquityPoint, SummaryStats};
 pub use trade::{ExitReason, Fill, Trade, TradeSource};

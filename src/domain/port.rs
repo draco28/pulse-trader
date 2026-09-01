@@ -30,7 +30,9 @@
 use std::future::Future;
 
 use crate::domain::backtest::SummaryStats;
-use crate::domain::backtest::{BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade};
+use crate::domain::backtest::{
+    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade,
+};
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{CoachingSession, CoachingSessionId, Disposition};
 use crate::domain::error::DataError;
@@ -356,6 +358,14 @@ pub trait BacktestRunRepository {
     /// run header back in ONE transaction; stores the `result_content_hash`. The
     /// `created_at` is sourced from the injected `Clock`.
     ///
+    /// **`inputs` is required, not optional (r1.s3.w2, #110).** A fresh run must
+    /// name the pair, the exact primary and optional HTF snapshot identities, and
+    /// the cost/funding configuration it actually ran with. The `Option` on
+    /// [`PersistedRun::inputs`] is a READ-side accommodation for rows written
+    /// before migration `0006`, never a write-side choice. Taking it by value here
+    /// is what makes "a fresh run with no provenance" unrepresentable at the port,
+    /// before the database trigger has to catch it.
+    ///
     /// # Errors
     ///
     /// Returns [`DataError::Db`] if the `strategy_version_id` is absent /
@@ -364,6 +374,7 @@ pub trait BacktestRunRepository {
     fn save_run(
         &self,
         strategy_version_id: &VersionId,
+        inputs: &BacktestInputs,
         result: &BacktestResult,
         summary: &SummaryStats,
         starting_equity: Decimal,
@@ -987,10 +998,14 @@ mod repository_tests {
 mod backtest_run_repository_tests {
     use super::BacktestRunRepository;
     use crate::domain::backtest::{
-        BacktestResult, BacktestRunId, PersistedRun, RunSummary, SummaryStats, Trade,
+        BacktestInputs, BacktestResult, BacktestRunId, FundingConfig, PersistedRun, RunSummary,
+        SnapshotSelection, SummaryStats, Trade,
     };
     use crate::domain::error::DataError;
+    use crate::domain::pair::Pair;
     use crate::domain::strategy::VersionId;
+    use crate::domain::timeframe::Timeframe;
+    use crate::domain::version::DataVersion;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::future::Future;
@@ -1019,6 +1034,7 @@ mod backtest_run_repository_tests {
         fn save_run(
             &self,
             strategy_version_id: &VersionId,
+            inputs: &BacktestInputs,
             result: &BacktestResult,
             summary: &SummaryStats,
             starting_equity: Decimal,
@@ -1027,6 +1043,10 @@ mod backtest_run_repository_tests {
             let persisted = PersistedRun {
                 id: id.clone(),
                 strategy_version_id: strategy_version_id.clone(),
+                // The fake stores what it was given: `save_run` takes inputs by
+                // value, so a fresh run with no provenance is unrepresentable here
+                // too, not merely rejected by the database.
+                inputs: Some(inputs.clone()),
                 schema_version: 1,
                 created_at: "2026-06-30T00:00:00.000Z".to_owned(),
                 engine_fingerprint: result.engine_fingerprint.as_str().to_owned(),
@@ -1132,9 +1152,21 @@ mod backtest_run_repository_tests {
             summary: SummaryStats::default(),
             equity_curve: crate::domain::backtest::EquityCurve::default(),
         };
+        let inputs = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("v-primary"),
+            },
+            htf: None,
+            taker_fee_bps: Decimal::new(4, 0),
+            slippage_bps: Decimal::new(1, 0),
+            funding: FundingConfig::SnapshotRates,
+        };
         let id = repo
             .save_run(
                 &version_id,
+                &inputs,
                 &result,
                 &SummaryStats::default(),
                 Decimal::ZERO,

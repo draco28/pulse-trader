@@ -28,14 +28,33 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use pulse::{
-    BacktestResult, BacktestRunId, BacktestRunRepository, CoachCliOutcome, CoachWiring,
-    CoachingRepository, CoachingSession, CreatedBy, Db, Disposition, EngineFingerprint, FakeClock,
-    LlmCall, LlmCallId, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR,
-    Message, ModelPrice, Mutation, NewVersion, ParamValue, PriceTable, Redactor, RegimeBreakdown,
-    SessionOutcome, SkippedEntryCounts, SqliteBacktestRunRepo, SqliteCoachingRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion, SummaryStats,
-    TokenUsage, ToolCall, ToolDefinition, run_coach_with,
+    BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CoachCliOutcome,
+    CoachWiring, CoachingRepository, CoachingSession, CreatedBy, DataVersion, Db, Disposition,
+    EngineFingerprint, FakeClock, FundingConfig, LlmCall, LlmCallId, LlmCallRepository, LlmConfig,
+    LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, ModelPrice, Mutation, NewVersion, Pair,
+    ParamValue, PriceTable, Redactor, RegimeBreakdown, SessionOutcome, SkippedEntryCounts,
+    SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo,
+    SqliteStrategyRepo, StrategyRepository, StrategyVersion, SummaryStats, Timeframe, TokenUsage,
+    ToolCall, ToolDefinition, run_coach_with,
 };
+
+/// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
+/// tests are about coach/library behaviour, not provenance, so the tuple is a
+/// plain complete single-timeframe one; `tests/backtest_provenance.rs` owns the
+/// provenance shapes themselves.
+fn seed_inputs() -> BacktestInputs {
+    BacktestInputs {
+        pair: Pair::new("BTCUSDT"),
+        primary: SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: DataVersion::new("v-primary"),
+        },
+        htf: None,
+        taker_fee_bps: Decimal::new(4, 0),
+        slippage_bps: Decimal::new(1, 0),
+        funding: FundingConfig::SnapshotRates,
+    }
+}
 use rust_decimal::Decimal;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -162,6 +181,7 @@ async fn seeded() -> (TempDir, Db, StrategyVersion, BacktestRunId) {
     let run_id = run_repo
         .save_run(
             &version.id,
+            &seed_inputs(),
             &result,
             &SummaryStats::default(),
             Decimal::new(10_000, 0),

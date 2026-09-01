@@ -931,50 +931,43 @@ mod reserved_number_tests {
         }
     }
 
-    /// Move the real `0005_*` files OUT of `dir` (into a sibling holding pen),
-    /// leaving the set as it stood while `0005` was a reserved gap. Returns the
-    /// holding pen for [`restore_0005`].
-    fn withhold_0005(dir: &Path) -> PathBuf {
-        let pen = dir.with_extension("withheld");
+    /// Move the real `<prefix>` migration pair OUT of `dir` (into a sibling holding
+    /// pen), leaving the set as it stood before that number shipped. Returns the pen
+    /// for [`restore`].
+    ///
+    /// **Withhold-and-restore, never a synthetic probe.** Writing a stand-in
+    /// migration at a chosen number works only while that number is unclaimed; every
+    /// spine that ships one moves the collision to the next free number. The real
+    /// pair cannot collide with anything, and it exercises the shipped migration
+    /// rather than a fake of it. Generalised over the prefix at r1.s3.w2 so `0005`
+    /// and `0006` share one mechanism.
+    fn withhold(dir: &Path, prefix: &str) -> PathBuf {
+        let pen = dir.with_extension(format!("withheld-{}", prefix.trim_end_matches('_')));
         std::fs::create_dir_all(&pen).unwrap();
         let mut moved = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.starts_with("0005_") {
+            if name.starts_with(prefix) {
                 std::fs::rename(&path, pen.join(&name)).unwrap();
                 moved += 1;
             }
         }
         assert_eq!(
             moved, 2,
-            "expected the real 0005 up+down pair to withhold, moved {moved}"
+            "expected the real {prefix} up+down pair to withhold, moved {moved}"
         );
         pen
     }
 
-    /// Put the withheld `0005_*` files back — the binary that ships the reserved
-    /// migration opening the same database.
-    fn restore_0005(dir: &Path, pen: &Path) {
+    /// Put the withheld files back — the binary that ships the reserved migration
+    /// opening the same database.
+    fn restore(dir: &Path, pen: &Path) {
         for entry in std::fs::read_dir(pen).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             std::fs::rename(&path, dir.join(&name)).unwrap();
         }
-    }
-
-    /// Write a reversible probe migration whose up creates `<name>` and down drops it.
-    fn write_probe(dir: &Path, stem: &str, table: &str) {
-        std::fs::write(
-            dir.join(format!("{stem}.up.sql")),
-            format!("CREATE TABLE {table} (id TEXT PRIMARY KEY);\n"),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(format!("{stem}.down.sql")),
-            format!("DROP TABLE {table};\n"),
-        )
-        .unwrap();
     }
 
     async fn table_present(db: &Db, name: &str) -> bool {
@@ -1022,7 +1015,7 @@ mod reserved_number_tests {
 
         // The "older binary": the shipped set as it stood while `0005` was still a
         // reserved gap and `0007` had already shipped. Withhold the real 0005.
-        let withheld = withhold_0005(&dir);
+        let withheld = withhold(&dir, "0005_");
 
         let db_path = tmp.path().join("pulse.db");
         let older = Migrator::new(dir.as_path()).await.unwrap();
@@ -1047,7 +1040,7 @@ mod reserved_number_tests {
 
         // r1.s2 lands its reserved 0005 — BELOW the database's current maximum, so
         // the max is unchanged and a max-based gate would call this current.
-        restore_0005(&dir, &withheld);
+        restore(&dir, &withheld);
         let gapped = Migrator::new(dir.as_path()).await.unwrap();
 
         let filled = run_migrations_with_backup_using(&db_path, &gapped)
@@ -1076,24 +1069,44 @@ mod reserved_number_tests {
     /// The refusal used to be `applied_max > embedded_max`, which a db holding an
     /// unknown LOW version walks straight past. There is no down path for a
     /// migration we do not ship, so opening that db is not an option.
+    ///
+    /// **r1.s3.w2:** this used to WRITE a synthetic `0006_from_a_newer_binary`
+    /// probe and delete it again. `r1.s3` has since shipped the real
+    /// `0006_backtest_inputs`, so a synthetic 0006 would be a SECOND version-6
+    /// migration in the same directory — `Migrator::new` refuses a duplicate
+    /// version, and the two `remove_file` calls would have removed the probe while
+    /// leaving the real pair behind, so the "older binary" would not have been older
+    /// at all. Picking another free number only moves the collision to whichever
+    /// spine ships next. It now withholds and restores the REAL `0006`, the same way
+    /// the test above does for `0005`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_db_holding_an_unknown_low_version_is_refused_as_ahead() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("migrations");
         std::fs::create_dir_all(&dir).unwrap();
         copy_shipped_set(&dir);
-        // A future spine's 0006, applied by a NEWER binary than the one run after.
-        write_probe(&dir, "0006_from_a_newer_binary", "newer_binary_probe");
 
+        // The NEWER binary ships everything, real 0006 included, and applies it.
         let db_path = tmp.path().join("pulse.db");
         let newer = Migrator::new(dir.as_path()).await.unwrap();
         run_migrations_with_backup_using(&db_path, &newer)
             .await
             .expect("the newer binary's set applies");
+        {
+            let db = Db::with_path(&db_path).await.unwrap();
+            assert!(
+                super::applied_versions(db.pool())
+                    .await
+                    .unwrap()
+                    .contains(&6),
+                "the newer binary applied 0006 — the version the older one below lacks"
+            );
+        }
 
-        // Now the OLDER binary — the shipped set, without 0006 — opens the same db.
-        std::fs::remove_file(dir.join("0006_from_a_newer_binary.up.sql")).unwrap();
-        std::fs::remove_file(dir.join("0006_from_a_newer_binary.down.sql")).unwrap();
+        // Now the OLDER binary — the same set with the real 0006 withheld — opens
+        // the same db. 0006 sorts BELOW the embedded max of 7, so a max comparison
+        // would walk straight past it.
+        let withheld = withhold(&dir, "0006_");
         let older = Migrator::new(dir.as_path()).await.unwrap();
 
         let err = run_migrations_with_backup_using(&db_path, &older)
@@ -1104,5 +1117,7 @@ mod reserved_number_tests {
             message.contains('6'),
             "the refusal must name the offending version: {message}"
         );
+
+        restore(&dir, &withheld);
     }
 }

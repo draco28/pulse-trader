@@ -25,6 +25,30 @@ snapshots are **immutable and content-addressed** by `data_version` (ADR-0009).
 `StrategyVersion` is **immutable** with provenance (ADR-0010). Correction is a new
 version, never an edit.
 
+**Runs record their inputs, not only their outputs (r1.s3.w2, #110).** Immutable
+snapshots are only half of re-derivability; the other half is knowing *which* snapshot
+a stored result came from. Until `0006`, `backtest_run` persisted `engine_fingerprint`,
+`engine_target`, `result_content_hash` and the money totals but nothing about the data
+— while the CLI loaded the `HEAD` snapshot and `fetch-data` advanced `HEAD`. Once
+`HEAD` moved the old Parquet files might still exist, and nothing in the row said which
+of them produced it: the reproducibility claim rested on a link that was not stored.
+Migration `0006` adds eight columns — pair, primary and optional HTF
+`timeframe`+`data_version`, taker fee and slippage bps, and the funding discriminant —
+and `BacktestRunRepository::save_run` takes them by value, so a fresh run with no
+provenance is unrepresentable rather than merely rejected. The identities are captured
+from the `CandleSeries` values the engine actually consumed, never from a second `HEAD`
+read, which would record what is current rather than what ran.
+
+**Old rows stay honestly unavailable rather than plausibly wrong.** The eight columns
+are nullable, because a row written before `0006` cannot be backfilled truthfully —
+nothing stored recovers the snapshot identity it used — and this bone forbids rewriting
+immutable records with invented facts. Those rows read back as `inputs: None`, an
+explicit "provenance unavailable"; the debug CLI says so in words. A `BEFORE INSERT`
+completeness trigger, installed after the columns exist, holds the line for every FRESH
+row without touching a single existing one, and a partially-populated row is a read
+error rather than a partially-trusted projection. #110 closes when `r1.s3` reaches
+`main`; the capability lands here.
+
 **There is one destructive exception and it is currently uncontrolled.** The tree ships
 four `*.down.sql` migrations and a publicly exported `undo_to(pool, target_version)`
 (`src/adapters/db/migrate.rs`). Calling it applies those down migrations, dropping the
@@ -36,7 +60,14 @@ describes the startup path, **not the crate's public API**. Restricting or gatin
 ## Consequences
 
 Reproducibility holds by construction **on the normal startup path**, and there the
-determinism fingerprint means something. It does **not** survive the `undo_to`
+determinism fingerprint means something — and since `0006` it means more than it did:
+a stored run now names the exact immutable snapshots it consumed, so it stays
+re-derivable after `fetch-data` advances `HEAD`, which is the case that previously
+broke the claim silently. The cost is a permanent two-tier read: every consumer of a
+persisted run has to handle `inputs: None`, and will for as long as pre-`0006` rows
+exist. That is the honest shape — the alternative was a backfill that would have made
+every legacy row *look* re-derivable while pointing at a snapshot nobody can prove it
+used. It does **not** survive the `undo_to`
 exception above: a library caller that runs the down migrations destroys the persisted
 inputs a result would be re-derived from, so the guarantee is scoped to a database that
 has only ever migrated forward. The cost of the immutability discipline is storage

@@ -19,9 +19,10 @@ use std::path::Path;
 use std::process::Command;
 
 use pulse::{
-    BacktestResult, BacktestRunRepository, CreatedBy, Db, EngineFingerprint, EquityCurve, MIGRATOR,
-    NewVersion, RegimeBreakdown, SkippedEntryCounts, SqliteBacktestRunRepo, SqliteStrategyRepo,
-    StrategyId, StrategyRepository, SummaryStats, VersionId,
+    BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy, DataVersion, Db,
+    EngineFingerprint, EquityCurve, FundingConfig, MIGRATOR, NewVersion, Pair, RegimeBreakdown,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteStrategyRepo, StrategyId,
+    StrategyRepository, SummaryStats, Timeframe, VersionId,
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
@@ -108,9 +109,28 @@ async fn seed_prior_run_with_bogus_fingerprint(db_path: &str, version_id: &Versi
         summary: SummaryStats::default(),
         equity_curve: EquityCurve::default(),
     };
-    repo.save_run(version_id, &result, &result.summary, starting_equity)
-        .await
-        .expect("seed prior run");
+    // r1.s3.w2 (#110): a fresh save now carries its input provenance. This seed is
+    // about the FR-7 fingerprint mismatch, so the tuple is a plain complete one.
+    let inputs = BacktestInputs {
+        pair: Pair::new("BTCUSDT"),
+        primary: SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: DataVersion::new("v-primary"),
+        },
+        htf: None,
+        taker_fee_bps: Decimal::new(4, 0),
+        slippage_bps: Decimal::new(1, 0),
+        funding: FundingConfig::SnapshotRates,
+    };
+    repo.save_run(
+        version_id,
+        &inputs,
+        &result,
+        &result.summary,
+        starting_equity,
+    )
+    .await
+    .expect("seed prior run");
 }
 
 /// Run `pulse backtest --version <id> --pair BTCUSDT --tf M15 --store <fixture>

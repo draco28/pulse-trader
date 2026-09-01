@@ -15,10 +15,29 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pulse::{
-    BacktestResult, BacktestRunRepository, CreatedBy, DesktopState, EngineFingerprint, EquityCurve,
-    NewVersion, RegimeBreakdown, SkippedEntryCounts, StrategyRepository, SummaryStats, VersionId,
+    BacktestInputs, BacktestResult, BacktestRunRepository, CreatedBy, DataVersion, DesktopState,
+    EngineFingerprint, EquityCurve, FundingConfig, NewVersion, Pair, RegimeBreakdown,
+    SkippedEntryCounts, SnapshotSelection, StrategyRepository, SummaryStats, Timeframe, VersionId,
     library_overview_core,
 };
+
+/// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
+/// tests are about coach/library behaviour, not provenance, so the tuple is a
+/// plain complete single-timeframe one; `tests/backtest_provenance.rs` owns the
+/// provenance shapes themselves.
+fn seed_inputs() -> BacktestInputs {
+    BacktestInputs {
+        pair: Pair::new("BTCUSDT"),
+        primary: SnapshotSelection {
+            timeframe: Timeframe::M15,
+            data_version: DataVersion::new("v-primary"),
+        },
+        htf: None,
+        taker_fee_bps: Decimal::new(4, 0),
+        slippage_bps: Decimal::new(1, 0),
+        funding: FundingConfig::SnapshotRates,
+    }
+}
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 
@@ -135,6 +154,7 @@ async fn seeded_state() -> (DesktopState, TempDir, Vec<VersionId>, String) {
     let result = trade_free_result();
     runs.save_run(
         &alpha_versions[0],
+        &seed_inputs(),
         &result,
         &kpi_summary(300, 462, 38),
         Decimal::new(10_000, 0),
@@ -143,6 +163,7 @@ async fn seeded_state() -> (DesktopState, TempDir, Vec<VersionId>, String) {
     .expect("save va1's run");
     runs.save_run(
         &alpha_versions[1],
+        &seed_inputs(),
         &result,
         &kpi_summary(420, 483, 64),
         Decimal::new(10_000, 0),

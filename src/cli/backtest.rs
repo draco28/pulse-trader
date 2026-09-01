@@ -43,9 +43,10 @@ use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::db::{Db, SqliteBacktestRunRepo, SqliteStrategyRepo};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestResult, BacktestRunRepository, CandleSeries, CandleSeriesRepository, CompiledStrategy,
-    Direction, EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime,
-    StrategyDsl, StrategyRepository, SummaryStats, Timeframe, Trade, compile, validate,
+    BacktestInputs, BacktestResult, BacktestRunRepository, CandleSeries, CandleSeriesRepository,
+    CompiledStrategy, Direction, EngineFingerprint, ExchangeAdapter as _, ExitReason,
+    FundingConfig, Migrator, Pair, Regime, SnapshotSelection, StrategyDsl, StrategyRepository,
+    SummaryStats, Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -200,7 +201,13 @@ where
     if let Some(version_id) = loaded.persist {
         let db =
             db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
-        persist_and_compare(db, &version_id, &result, config.starting_equity).await?;
+        // r1.s3.w2 (#110): the provenance is read off the series the engine JUST
+        // consumed and the config it JUST ran with — not re-derived, and emphatically
+        // not a second `load_head`, which would record whatever HEAD points at now
+        // rather than what this run used. `CandleSeries` already carries pair,
+        // timeframe and the immutable `data_version`, so nothing extra is loaded.
+        let inputs = inputs_from_run(&primary, htf_series.as_ref(), &config);
+        persist_and_compare(db, &version_id, &inputs, &result, config.starting_equity).await?;
     }
 
     if args.json {
@@ -300,6 +307,7 @@ async fn load_compiled_from_version(
 async fn persist_and_compare(
     db: &Db,
     version_id: &VersionId,
+    inputs: &BacktestInputs,
     result: &BacktestResult,
     starting_equity: Decimal,
 ) -> anyhow::Result<()> {
@@ -322,10 +330,42 @@ async fn persist_and_compare(
     // the repo re-stores it as the typed projection (4.04). We pass it through —
     // never recompute (D1 / spec §9).
     let summary: &SummaryStats = &result.summary;
-    repo.save_run(version_id, result, summary, starting_equity)
+    repo.save_run(version_id, inputs, result, summary, starting_equity)
         .await
         .map_err(|e| anyhow::anyhow!("persist backtest run: {e}"))?;
     Ok(())
+}
+
+/// Build the run's [`BacktestInputs`] from the series the engine actually consumed
+/// and the exact cost config it ran with (r1.s3.w2, #110).
+///
+/// Both series are already loaded and still in scope, and each carries its pair,
+/// timeframe and immutable `data_version` — so capturing provenance costs no I/O
+/// and, more importantly, cannot drift from what ran. Re-reading `HEAD` here would
+/// be the bug: `fetch-data` may have advanced it between the load and the save.
+///
+/// `funding` is [`FundingConfig::SnapshotRates`] because that is what the engine
+/// does — funding accrues from the loaded candles' own rates. It records behaviour;
+/// it is not a control the CLI exposes.
+fn inputs_from_run(
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+    config: &BacktestConfig,
+) -> BacktestInputs {
+    BacktestInputs {
+        pair: primary.pair.clone(),
+        primary: SnapshotSelection {
+            timeframe: primary.timeframe,
+            data_version: primary.version.clone(),
+        },
+        htf: htf.map(|series| SnapshotSelection {
+            timeframe: series.timeframe,
+            data_version: series.version.clone(),
+        }),
+        taker_fee_bps: config.taker_fee_bps,
+        slippage_bps: config.slippage_bps,
+        funding: FundingConfig::SnapshotRates,
+    }
 }
 
 /// Parse a DSL document through the **version-safe migrator** (FR-4), matching the
