@@ -141,10 +141,23 @@ fn domain_error_maps_to_one_serializable_shape() {
 
         let mut keys: Vec<String> = object.keys().cloned().collect();
         keys.sort();
+        // r1.s3.w3 widened the shape to {code, message, run_id}. The invariant this
+        // asserts is unchanged and, if anything, stronger: ONE key set for every
+        // error, so the frontend still renders with one code path. `run_id` is
+        // ALWAYS present rather than skipped-when-absent — a field that sometimes
+        // vanishes reaches TypeScript as `undefined` while its generated type says
+        // `string | null`, which is exactly the mismatch this clause exists to stop.
         assert_eq!(
             keys,
-            vec!["code".to_owned(), "message".to_owned()],
-            "{label} must serialize to exactly {{code, message}}, got {keys:?}"
+            vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
+            "{label} must serialize to exactly {{code, message, run_id}}, got {keys:?}"
+        );
+        // No DOMAIN-family error can name a persisted run: only the application
+        // ring's saved-but-unreadable case knows a run id, and it is not in this set.
+        assert!(
+            object["run_id"].is_null(),
+            "{label} must carry a null run_id — only a saved-but-unreadable backtest \
+             has a row to name"
         );
         shapes.push(keys);
 

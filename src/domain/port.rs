@@ -354,9 +354,16 @@ pub trait BacktestRunRepository {
     /// Persist a finished run + all its trades (FR-6, #39 ownership-on-write).
     ///
     /// Asserts the `strategy_version_id` row exists (FK + an explicit `SELECT 1`
-    /// guard INSIDE the transaction); INSERTs the run + every trade + reads the
-    /// run header back in ONE transaction; stores the `result_content_hash`. The
+    /// guard INSIDE the transaction), then INSERTs the run + every trade in that
+    /// ONE transaction and commits; stores the `result_content_hash`. The
     /// `created_at` is sourced from the injected `Clock`.
+    ///
+    /// **It returns the minted id and reads nothing back (r1.s3.w3).** A read after
+    /// the commit is not part of the transaction — it runs on another connection —
+    /// and an implementation that failed there could only report a bare error,
+    /// discarding the id of a row that already exists. A caller that wants the
+    /// persisted projection calls [`get_run`](Self::get_run) itself, with the id in
+    /// hand, and can therefore say "saved, but unreadable" rather than "failed".
     ///
     /// **`inputs` is required, not optional (r1.s3.w2, #110).** A fresh run must
     /// name the pair, the exact primary and optional HTF snapshot identities, and
