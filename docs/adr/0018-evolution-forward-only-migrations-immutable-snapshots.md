@@ -34,10 +34,10 @@ a stored result came from. Until `0006`, `backtest_run` persisted `engine_finger
 of them produced it: the reproducibility claim rested on a link that was not stored.
 Migration `0006` adds eight columns — pair, primary and optional HTF
 `timeframe`+`data_version`, taker fee and slippage bps, and the funding discriminant —
-and `BacktestRunRepository::save_run` takes them by value, so a fresh run with no
-provenance is unrepresentable rather than merely rejected. The identities are captured
-from the `CandleSeries` values the engine actually consumed, never from a second `HEAD`
-read, which would record what is current rather than what ran.
+and `BacktestRunRepository::save_run` requires a typed `inputs` parameter, so a fresh
+run with no provenance is unrepresentable rather than merely rejected. The identities
+are captured from the `CandleSeries` values the engine actually consumed, never from a
+second `HEAD` read, which would record what is current rather than what ran.
 
 **Old rows stay honestly unavailable rather than plausibly wrong.** The eight columns
 are nullable, because a row written before `0006` cannot be backfilled truthfully —
