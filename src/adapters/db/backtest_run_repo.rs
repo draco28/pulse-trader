@@ -52,12 +52,16 @@ use uuid::Uuid;
 
 use crate::adapters::clock::SystemClock;
 use crate::domain::backtest::{
-    BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill, PersistedRun, Regime,
-    RegimeBreakdown, RunSummary, SummaryStats, Trade, TradeSource,
+    BacktestInputs, BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill, FundingConfig,
+    PersistedRun, Regime, RegimeBreakdown, RunSummary, SnapshotSelection, SummaryStats, Trade,
+    TradeSource,
 };
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
-use crate::domain::{BacktestRunRepository, Clock, DataError, Direction, EngineFingerprint};
+use crate::domain::{
+    BacktestRunRepository, Clock, DataError, DataVersion, Direction, EngineFingerprint, Pair,
+    Timeframe,
+};
 
 /// The run-row schema tag `save_run` writes into every `backtest_run.schema_version`
 /// and that every read ASSERTS (D1b, audit C5). v1 reads only v1 and rejects the
@@ -195,6 +199,22 @@ fn parse_regime(s: &str) -> Result<Regime, DataError> {
     parse_json("trade.regime", &json_token(s))
 }
 
+/// Parse a `Timeframe` `TEXT` column, fail-closed (r1.s3.w2). `Timeframe`'s serde
+/// representation IS the Binance interval string (`15m` / `4h`), so the same
+/// quote-and-decode trick the enum columns use round-trips it exactly — no second
+/// text mapping to keep in sync with `binance_interval()`.
+fn parse_timeframe(column: &str, s: &str) -> Result<Timeframe, DataError> {
+    parse_json(column, &json_token(s))
+}
+
+/// Parse a `FundingConfig` `TEXT` column (`snake_case` token), fail-closed. An
+/// unknown discriminant is an error, never a silent default: a run that claims a
+/// funding source this binary does not understand is not a run this binary may
+/// report on.
+fn parse_funding(column: &str, s: &str) -> Result<FundingConfig, DataError> {
+    parse_json(column, &json_token(s))
+}
+
 /// Wrap a bare `snake_case` enum token in JSON quotes so `serde_json` can decode it
 /// (the enums serialize as `"trending_up"` etc.; the column stores the bare token
 /// `trending_up`, so we re-quote on read).
@@ -217,6 +237,7 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
     async fn save_run(
         &self,
         strategy_version_id: &VersionId,
+        inputs: &BacktestInputs,
         result: &BacktestResult,
         summary: &SummaryStats,
         starting_equity: Decimal,
@@ -276,6 +297,40 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         let skipped_leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
             .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
 
+        // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
+        // funding discriminant ride their serde tokens (`15m`/`4h`,
+        // `snapshot_rates`), matching the `direction`/`regime` precedent; the two
+        // bps values ride the same `.normalize()`d Decimal-as-TEXT every other money
+        // column uses (NFR-2). The HTF pair is written all-or-nothing — the domain
+        // cannot express half a selection, and `0006`'s trigger refuses one.
+        //
+        // The two version tags are checked BEFORE the transaction opens, so an
+        // unsafe one persists nothing at all rather than aborting a partly-built
+        // write. `DataVersion` is opaque by design but not arbitrary: the adapter
+        // joins a tag verbatim into `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and
+        // W3 will hand a decoded tag straight to `load_version`, so `../../../x`
+        // would escape the store root. Same rule, same reason, as `Pair::parse`.
+        inputs.primary.data_version.ensure_path_safe()?;
+        if let Some(htf) = inputs.htf.as_ref() {
+            htf.data_version.ensure_path_safe()?;
+        }
+
+        let pair_text = inputs.pair.as_str().to_owned();
+        let primary_timeframe = enum_token(&inputs.primary.timeframe)?;
+        let primary_data_version = inputs.primary.data_version.as_str().to_owned();
+        let htf_timeframe = inputs
+            .htf
+            .as_ref()
+            .map(|htf| enum_token(&htf.timeframe))
+            .transpose()?;
+        let htf_data_version = inputs
+            .htf
+            .as_ref()
+            .map(|htf| htf.data_version.as_str().to_owned());
+        let taker_fee_bps_text = decimal_text(inputs.taker_fee_bps);
+        let slippage_bps_text = decimal_text(inputs.slippage_bps);
+        let funding_config = enum_token(&inputs.funding)?;
+
         // INSERT run + ALL trades + read-back in ONE transaction (D3, mirror
         // `create_version`'s begin → insert → commit → read-back).
         let mut tx = self
@@ -308,9 +363,12 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
               funding_total, slippage_total, expectancy, win_rate, profit_factor, \
               gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
               wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
-              regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) \
+              regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
+              taker_fee_bps, slippage_bps, funding_config) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
+                     ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
             run_id,
             version_id_str,
             schema_version,
@@ -343,6 +401,14 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             skipped_sub_lot,
             skipped_sub_notional,
             skipped_leverage_capped,
+            pair_text,
+            primary_timeframe,
+            primary_data_version,
+            htf_timeframe,
+            htf_data_version,
+            taker_fee_bps_text,
+            slippage_bps_text,
+            funding_config,
         )
         .execute(&mut *tx)
         .await
@@ -460,7 +526,15 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
                  regime_breakdown        AS "regime_breakdown?: String",
                  skipped_sub_lot         AS "skipped_sub_lot?: i64",
                  skipped_sub_notional    AS "skipped_sub_notional?: i64",
-                 skipped_leverage_capped AS "skipped_leverage_capped?: i64"
+                 skipped_leverage_capped AS "skipped_leverage_capped?: i64",
+                 pair                    AS "pair?: String",
+                 primary_timeframe       AS "primary_timeframe?: String",
+                 primary_data_version    AS "primary_data_version?: String",
+                 htf_timeframe           AS "htf_timeframe?: String",
+                 htf_data_version        AS "htf_data_version?: String",
+                 taker_fee_bps           AS "taker_fee_bps?: String",
+                 slippage_bps            AS "slippage_bps?: String",
+                 funding_config          AS "funding_config?: String"
                FROM backtest_run WHERE id = ?1"#,
             id_str,
         )
@@ -570,9 +644,26 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             sortino: parse_opt_f64("backtest_run.sortino", r.sortino.as_deref())?,
         };
 
+        // r1.s3.w2 (#110): rehydrate the input provenance under the four-shape rule
+        // (all-NULL legacy, complete-without-HTF, complete-with-HTF, anything else
+        // is an error). Decoded AFTER the tamper guard so a corrupt row fails on the
+        // hash first, which is the more specific diagnosis.
+        let inputs = decode_inputs(
+            &r.id,
+            r.pair.as_deref(),
+            r.primary_timeframe.as_deref(),
+            r.primary_data_version.as_deref(),
+            r.htf_timeframe.as_deref(),
+            r.htf_data_version.as_deref(),
+            r.taker_fee_bps.as_deref(),
+            r.slippage_bps.as_deref(),
+            r.funding_config.as_deref(),
+        )?;
+
         Ok(Some(PersistedRun {
             id: BacktestRunId::new(r.id),
             strategy_version_id: VersionId::new(r.strategy_version_id),
+            inputs,
             schema_version: r.schema_version,
             created_at: r.created_at,
             engine_fingerprint: r.engine_fingerprint,
@@ -833,6 +924,107 @@ struct ListRunRow {
 
 /// Convert an `Option<i64>` count column to `usize`, fail-closed on NULL or a
 /// negative value (a count column should never be NULL/negative — a corrupt row).
+/// Rehydrate [`BacktestInputs`] from the eight migration-`0006` columns, fail-closed
+/// (r1.s3.w2, #110).
+///
+/// Exactly four shapes are legal and every other combination is an error:
+///
+/// 1. **all eight NULL** → `Ok(None)`. A row written before `0006`. It cannot be
+///    backfilled truthfully (nothing stored recovers the snapshot identity) and
+///    ADR-0018 forbids inventing facts on immutable records, so it reads as an
+///    explicit "provenance unavailable".
+/// 2. **six required present, both HTF NULL** → `Some`, `htf: None` — a genuine
+///    single-timeframe run.
+/// 3. **six required present, both HTF present** → `Some`, `htf: Some`.
+/// 4. **anything else** → [`DataError::Db`].
+///
+/// Shape 4 is the point. A half-populated row is not a run with some provenance; it
+/// is a row whose provenance cannot be trusted, and a partial projection would let
+/// a caller replay against the wrong snapshot while believing it had the right one.
+/// The same applies to an unknown timeframe or funding discriminant, an invalid
+/// pair, a `data_version` that is not a safe single path component, or a Decimal
+/// that will not parse — all refuse rather than degrade. The version check is not
+/// cosmetic: W3 hands a decoded tag to `CandleStore::load_version`, which joins it
+/// into the snapshot path, so a stored `../../../x` that decoded cleanly would
+/// escape the store root.
+#[allow(clippy::too_many_arguments)]
+fn decode_inputs(
+    run_id: &str,
+    pair: Option<&str>,
+    primary_timeframe: Option<&str>,
+    primary_data_version: Option<&str>,
+    htf_timeframe: Option<&str>,
+    htf_data_version: Option<&str>,
+    taker_fee_bps: Option<&str>,
+    slippage_bps: Option<&str>,
+    funding_config: Option<&str>,
+) -> Result<Option<BacktestInputs>, DataError> {
+    let required = [
+        pair,
+        primary_timeframe,
+        primary_data_version,
+        taker_fee_bps,
+        slippage_bps,
+        funding_config,
+    ];
+    let present = required.iter().filter(|v| v.is_some()).count();
+    let htf_present = [htf_timeframe, htf_data_version]
+        .iter()
+        .filter(|v| v.is_some())
+        .count();
+
+    // Shape 1: the legacy row. ALL eight must be NULL — a row with no required
+    // provenance but a stray HTF value is corrupt, not legacy.
+    if present == 0 && htf_present == 0 {
+        return Ok(None);
+    }
+    if present != required.len() {
+        return Err(DataError::Db(format!(
+            "run `{run_id}` has partial input provenance ({present}/{} required columns present): \
+             a partially-populated row cannot be trusted to name the snapshot it ran against \
+             (#110)",
+            required.len()
+        )));
+    }
+    if htf_present == 1 {
+        return Err(DataError::Db(format!(
+            "run `{run_id}` has a half-present HTF selection: htf_timeframe and htf_data_version \
+             must both be present or both absent (#110)"
+        )));
+    }
+
+    let pair = require_col("backtest_run.pair", pair)?;
+    let primary_timeframe = require_col("backtest_run.primary_timeframe", primary_timeframe)?;
+    let primary_data_version =
+        require_col("backtest_run.primary_data_version", primary_data_version)?;
+    let taker_fee_bps = require_col("backtest_run.taker_fee_bps", taker_fee_bps)?;
+    let slippage_bps = require_col("backtest_run.slippage_bps", slippage_bps)?;
+    let funding_config = require_col("backtest_run.funding_config", funding_config)?;
+
+    let htf = match (htf_timeframe, htf_data_version) {
+        (Some(tf), Some(version)) => Some(SnapshotSelection {
+            timeframe: parse_timeframe("backtest_run.htf_timeframe", tf)?,
+            // `parse`, not `new`: a stored tag is untrusted on the way back out.
+            data_version: DataVersion::parse(version)?,
+        }),
+        _ => None,
+    };
+
+    Ok(Some(BacktestInputs {
+        // `Pair::parse` (not `Pair::new`): the stored symbol is joined verbatim into
+        // candle-store paths on replay, so a corrupt value must refuse here.
+        pair: Pair::parse(pair.to_owned())?,
+        primary: SnapshotSelection {
+            timeframe: parse_timeframe("backtest_run.primary_timeframe", primary_timeframe)?,
+            data_version: DataVersion::parse(primary_data_version)?,
+        },
+        htf,
+        taker_fee_bps: parse_decimal("backtest_run.taker_fee_bps", taker_fee_bps)?,
+        slippage_bps: parse_decimal("backtest_run.slippage_bps", slippage_bps)?,
+        funding: parse_funding("backtest_run.funding_config", funding_config)?,
+    }))
+}
+
 fn usize_from(column: &str, value: Option<i64>) -> Result<usize, DataError> {
     let v = value
         .ok_or_else(|| DataError::Db(format!("NULL in count column `{column}` (corrupt row)")))?;
@@ -853,12 +1045,15 @@ mod tests {
     use crate::adapters::clock::FakeClock;
     use crate::adapters::db::{Db, MIGRATOR};
     use crate::domain::backtest::{
-        BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill, Regime, RegimeBreakdown,
-        SummaryStats, Trade, TradeSource,
+        BacktestInputs, BacktestResult, BacktestRunId, EquityCurve, ExitReason, Fill,
+        FundingConfig, Regime, RegimeBreakdown, SnapshotSelection, SummaryStats, Trade,
+        TradeSource,
     };
     use crate::domain::sizing::SkippedEntryCounts;
     use crate::domain::strategy::VersionId;
-    use crate::domain::{BacktestRunRepository, Direction, EngineFingerprint};
+    use crate::domain::{
+        BacktestRunRepository, DataVersion, Direction, EngineFingerprint, Pair, Timeframe,
+    };
     use rust_decimal::Decimal;
     use sqlx::SqlitePool;
     use tempfile::TempDir;
@@ -908,6 +1103,24 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert strategy_version");
+    }
+
+    /// The input provenance every fresh save now carries (r1.s3.w2, #110). These
+    /// tests are about the run/trade projection, not about provenance, so they all
+    /// use the same complete single-timeframe tuple; `tests/backtest_provenance.rs`
+    /// owns the provenance shapes themselves.
+    fn sample_inputs() -> BacktestInputs {
+        BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("v-primary"),
+            },
+            htf: None,
+            taker_fee_bps: d(4, 0),
+            slippage_bps: d(1, 0),
+            funding: FundingConfig::SnapshotRates,
+        }
     }
 
     fn d(value: i64, scale: u32) -> Decimal {
@@ -1129,7 +1342,13 @@ mod tests {
             result_from(vec![trade.clone()], breakdown, SkippedEntryCounts::new());
 
         let id = repo
-            .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
             .await
             .expect("save_run");
 
@@ -1160,7 +1379,13 @@ mod tests {
         breakdown.record(trade.regime, trade.realized_pnl);
         let (result, summary) = result_from(vec![trade], breakdown, SkippedEntryCounts::new());
         let id = repo
-            .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
             .await
             .expect("save_run");
 
@@ -1179,9 +1404,12 @@ mod tests {
               funding_total, slippage_total, trade_count, wins, losses, breakeven, \
               max_win_streak, max_loss_streak, win_rate, expectancy, gross_profit, \
               gross_loss, avg_win, avg_loss, max_drawdown, regime_breakdown, \
-              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) \
+              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
              VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, '10000', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, \
-                     '0', '0', '0', '0', '0', '0', '0', ?7, 0, 0, 0)",
+                     '0', '0', '0', '0', '0', '0', '0', ?7, 0, 0, 0, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
         )
         .bind(bad_run)
         .bind("ver-1")
@@ -1220,6 +1448,7 @@ mod tests {
         let err = repo
             .save_run(
                 &VersionId::new("ver-does-not-exist"),
+                &sample_inputs(),
                 &result,
                 &summary,
                 d(10_000, 0),
@@ -1260,7 +1489,13 @@ mod tests {
         {
             let repo = SqliteBacktestRunRepo::with_deps(pool.clone(), FakeClock::at(*ms));
             let id = repo
-                .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+                .save_run(
+                    &VersionId::new("ver-1"),
+                    &sample_inputs(),
+                    &result,
+                    &summary,
+                    d(10_000, 0),
+                )
                 .await
                 .unwrap_or_else(|e| panic!("save_run #{i} failed: {e:?}"));
             latest_id = Some(id);
@@ -1299,9 +1534,15 @@ mod tests {
         );
 
         // One GOOD run via save_run.
-        repo.save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
-            .await
-            .expect("save good run");
+        repo.save_run(
+            &VersionId::new("ver-1"),
+            &sample_inputs(),
+            &result,
+            &summary,
+            d(10_000, 0),
+        )
+        .await
+        .expect("save good run");
 
         // One CORRUPT summary row: an unsupported schema_version (99) → row_to_run_summary
         // returns Err → skip-with-warning, NOT a whole-list failure.
@@ -1309,9 +1550,12 @@ mod tests {
             "INSERT INTO backtest_run \
              (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
               engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
-              funding_total, slippage_total, expectancy, trade_count) \
+              funding_total, slippage_total, expectancy, trade_count, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
              VALUES ('run-corrupt', 'ver-1', 99, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
-                     'hash', '10000', '0', '0', '0', '0', '0', 0)",
+                     'hash', '10000', '0', '0', '0', '0', '0', 0, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
         )
         .execute(&pool)
         .await
@@ -1338,7 +1582,13 @@ mod tests {
         breakdown.record(trade.regime, trade.realized_pnl);
         let (result, summary) = result_from(vec![trade], breakdown, SkippedEntryCounts::new());
         let id = repo
-            .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
             .await
             .expect("save_run");
 
@@ -1389,10 +1639,13 @@ mod tests {
               funding_total, slippage_total, trade_count, wins, losses, breakeven, \
               max_win_streak, max_loss_streak, win_rate, expectancy, gross_profit, \
               gross_loss, avg_win, avg_loss, max_drawdown, regime_breakdown, \
-              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped) \
+              skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+              pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+              funding_config) \
              VALUES ('run-newschema', 'ver-1', 2, '2026-06-30T00:00:00.000Z', 'fp', 'tgt', \
                      'hash', '10000', '0', '0', '0', '0', 0, 0, 0, 0, 0, 0, '0', '0', '0', '0', \
-                     '0', '0', '0', ?1, 0, 0, 0)",
+                     '0', '0', '0', ?1, 0, 0, 0, \
+                     'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
         )
         .bind(serde_json::to_string(&RegimeBreakdown::default()).unwrap())
         .execute(&pool)
@@ -1435,7 +1688,13 @@ mod tests {
         );
 
         let id = repo
-            .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
             .await
             .expect("save_run with Some sharpe/sortino");
         let run = repo.get_run(&id).await.expect("get_run").expect("present");
@@ -1456,7 +1715,13 @@ mod tests {
         assert_eq!(summary2.sharpe, None);
         assert_eq!(summary2.sortino, None);
         let id2 = repo
-            .save_run(&VersionId::new("ver-1"), &result2, &summary2, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result2,
+                &summary2,
+                d(10_000, 0),
+            )
             .await
             .expect("save_run with None sharpe/sortino");
         let run2 = repo.get_run(&id2).await.expect("get_run").expect("present");
@@ -1481,7 +1746,13 @@ mod tests {
         let stored_hash = result.result_content_hash();
 
         let id = repo
-            .save_run(&VersionId::new("ver-1"), &result, &summary, d(10_000, 0))
+            .save_run(
+                &VersionId::new("ver-1"),
+                &sample_inputs(),
+                &result,
+                &summary,
+                d(10_000, 0),
+            )
             .await
             .expect("save nontrivial run");
 

@@ -32,7 +32,7 @@ use crate::adapters::db::Db;
 use crate::adapters::db::SqliteBacktestRunRepo;
 use crate::domain::backtest::EquityCurve;
 use crate::domain::strategy::VersionId;
-use crate::domain::{BacktestRunId, BacktestRunRepository, DataError};
+use crate::domain::{BacktestInputs, BacktestRunId, BacktestRunRepository, DataError};
 
 use super::backtest::{TRADE_HEADER, dec, dec_opt, f64_opt, render_trade_row};
 
@@ -141,6 +141,10 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
         persisted.result_content_hash,
     );
 
+    // r1.s3.w2 (#110): what the run CONSUMED, on its own stable line. A legacy row
+    // says so in words rather than printing blanks that read like zeros.
+    println!("{}", render_inputs(persisted.inputs.as_ref()));
+
     // Run-level money totals (the cost readout, FR-6).
     println!(
         "totals\tstarting_equity={}\tnet_pnl={}\tfees_total={}\tfunding_total={}\tslippage_total={}",
@@ -199,6 +203,48 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
         println!("{}", render_trade_row(trade));
     }
     Ok(())
+}
+
+/// Render the run's input provenance as one stable tab-separated line
+/// (r1.s3.w2, #110).
+///
+/// A run with no higher timeframe prints `htf=none`, which is a fact about the run
+/// rather than a gap in the record. A row written before migration `0006` prints
+/// `inputs unavailable (legacy run)` — the honest statement. It deliberately does
+/// NOT print empty fields: a blank `data_version` reads like a value, and the whole
+/// point of #110 is that a run either names the snapshot it used or admits it
+/// cannot.
+fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
+    let Some(i) = inputs else {
+        return "inputs\tunavailable (legacy run, predates migration 0006)".to_owned();
+    };
+    let htf = i.htf.as_ref().map_or_else(
+        || "htf=none".to_owned(),
+        |htf| {
+            format!(
+                "htf={} htf_data_version={}",
+                htf.timeframe.binance_interval(),
+                htf.data_version
+            )
+        },
+    );
+    format!(
+        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}",
+        i.pair,
+        i.primary.timeframe.binance_interval(),
+        i.primary.data_version,
+        dec(i.taker_fee_bps),
+        dec(i.slippage_bps),
+        funding_token(i.funding),
+    )
+}
+
+/// The stable display token for the funding discriminant — the same
+/// `snake_case` string the column stores, so the CLI and the database agree.
+fn funding_token(funding: crate::domain::FundingConfig) -> &'static str {
+    match funding {
+        crate::domain::FundingConfig::SnapshotRates => "snapshot_rates",
+    }
 }
 
 #[cfg(test)]

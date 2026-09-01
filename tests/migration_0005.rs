@@ -8,7 +8,9 @@
 //! version is already higher than its own. `src/adapters/db/migrate.rs` compares
 //! applied version SETS rather than maxima for exactly this reason (PR #115);
 //! until now that support was proved against a synthetic probe migration, and this
-//! binary proves it against the real one.
+//! binary proves it against the real one. `r1.s3`'s `0006` has since landed the
+//! same way — `tests/backtest_provenance.rs` is its equivalent proof — so the
+//! reserved-number window is now closed and the shipped set is contiguous.
 //!
 //! Offline (`SQLX_OFFLINE=true` + the in-process `MIGRATOR`), `TempDir`-isolated —
 //! the suite never touches the real `pulse.db`.
@@ -130,12 +132,19 @@ async fn seed_parents(pool: &SqlitePool) {
     .await
     .expect("seed child strategy_version");
 
+    // r1.s3.w2: `0006`'s BEFORE INSERT completeness trigger requires every fresh row
+    // to name its input provenance. This binary is about `0005`'s schema, so the
+    // tuple is a plain complete one — the trigger only asks that it be present and
+    // internally consistent.
     sqlx::query(
         "INSERT INTO backtest_run \
          (id, strategy_version_id, schema_version, created_at, engine_fingerprint, engine_target, \
-          result_content_hash, starting_equity, net_pnl, fees_total, funding_total, slippage_total) \
+          result_content_hash, starting_equity, net_pnl, fees_total, funding_total, slippage_total, \
+          pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+          funding_config) \
          VALUES ('run-1', 'ver-1', '1', '2026-08-29T00:00:00.000Z', 'fp-1', 'test-target', \
-                 'rch-1', '10000', '0', '0', '0', '0')",
+                 'rch-1', '10000', '0', '0', '0', '0', \
+                 'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
     )
     .execute(pool)
     .await

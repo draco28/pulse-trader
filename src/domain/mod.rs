@@ -76,7 +76,9 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // projections the `BacktestRunRepository` port returns; re-exported so `lib.rs`
 // can curate the crate surface — an un-re-exported public domain type is a
 // `dead_code` BUILD error under `deny(warnings)`.
-pub use backtest::{BacktestRunId, PersistedRun, RunSummary};
+pub use backtest::{
+    BacktestInputs, BacktestRunId, FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
+};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
