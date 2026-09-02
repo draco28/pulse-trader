@@ -222,7 +222,7 @@ fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
         || "htf=none".to_owned(),
         |htf| {
             format!(
-                "htf={} htf_data_version={}",
+                "htf={}\thtf_data_version={}",
                 htf.timeframe.binance_interval(),
                 htf.data_version
             )
@@ -293,6 +293,49 @@ mod tests {
             after.db.as_deref().map(std::path::Path::to_str),
             Some(Some("/tmp/y.db")),
             "global --db parses AFTER the verb too"
+        );
+    }
+
+    /// The provenance line is ONE tab-separated record per the doc contract on
+    /// `render_inputs` — every field, including the HTF pair, is its own
+    /// `\t`-delimited field. (The HTF branch shipped space-separated for a round;
+    /// this pin is why it cannot again.)
+    #[test]
+    fn render_inputs_separates_every_field_with_a_tab() {
+        use crate::domain::{
+            BacktestInputs, DataVersion, FundingConfig, Pair, SnapshotSelection, Timeframe,
+        };
+        use rust_decimal::Decimal;
+
+        let inputs = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("primarytag"),
+            },
+            htf: Some(SnapshotSelection {
+                timeframe: Timeframe::H4,
+                data_version: DataVersion::new("htftag"),
+            }),
+            taker_fee_bps: Decimal::new(5, 2),
+            slippage_bps: Decimal::new(2, 2),
+            funding: FundingConfig::SnapshotRates,
+        };
+
+        assert_eq!(
+            super::render_inputs(Some(&inputs)),
+            "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\
+             \thtf=4h\thtf_data_version=htftag\tfee_bps=0.05\tslippage_bps=0.02\
+             \tfunding=snapshot_rates"
+        );
+
+        // The htf=none contrast: same tab discipline, no second snapshot field.
+        let mut single = inputs;
+        single.htf = None;
+        assert_eq!(
+            super::render_inputs(Some(&single)),
+            "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\thtf=none\
+             \tfee_bps=0.05\tslippage_bps=0.02\tfunding=snapshot_rates"
         );
     }
 }
