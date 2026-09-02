@@ -37,14 +37,28 @@ operations (`load_head`, `load_version`, `commit`), with the content hash, Parqu
 codec, path layout and atomic-write internals left inside the adapter — and the
 fetch, indicator and backtest use cases consume it generically.
 
-**The composition-root qualification stands.** "Only composition roots choose a
-concrete adapter" is the rule, not "no module ever names one": `src/cli/mod.rs`
-still constructs `CandleStore` (from the default root or a `--store` / `--base-dir`
-argument) and hands it to the use cases, exactly as it constructs `BinanceDataSource`
-and the `sqlx` repositories. That is the decision being satisfied, not a residue of
-the old exception. `tests/candle_repository.rs` is the standing guard: it scans the
+**The composition-root qualification stands, and there are two roots.** "Only
+composition roots choose a concrete adapter" is the rule, not "no module ever names
+one". `src/cli/mod.rs` constructs `CandleStore` (from the default root or a
+`--store` / `--base-dir` argument) and hands it to the use cases, exactly as it
+constructs `BinanceDataSource` and the `sqlx` repositories. Since **r1.s3.w3**,
+`src/tauri/commands.rs`'s `DesktopState` is the desktop's equivalent: it owns the
+pool and the candle store for the app's lifetime and injects both into the shared
+use case. Naming it here is compliance with this qualification, not a second
+exception — a delivery adapter that resolved its own store inside each command would
+be the violation. `tests/candle_repository.rs` is the standing guard: it scans the
 three use-case modules for a concrete-store mention in code, and asserts the
 deterministic engine names neither the adapter nor the port.
+
+**Orchestration lives in an application ring, not in a delivery adapter (r1.s3.w3).**
+`src/application/` holds use cases that are generic over the domain ports and name no
+adapter, no `tauri`, no `specta` and no `sqlx`. The version-id backtest flow lives
+there because the debug CLI and the desktop command must run the *same* sequence —
+its FR-7 compare-before-insert ordering is a correctness rule that only reads as one
+if it exists once. The ring is also where the backtest-only posture is enforced
+structurally: its dependency set is strategy, candle, exchange and run repositories,
+with no order or broker capability reachable, which is what discharges the risk
+gate's kill-switch control by construction rather than by a flag.
 
 **The domain invariant is "zero I/O", not "zero dependencies"** — `src/domain/mod.rs`
 states that policy explicitly. Domain types freely use `serde`, `rust_decimal`,

@@ -480,11 +480,18 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
 
-        // Read-back (D3, mirror `create_version`): the run header is reconstructed +
-        // re-validated through the same #39 fetch-trades-and-re-derive path.
-        self.get_run(&BacktestRunId::new(run_id.clone()))
-            .await?
-            .ok_or_else(|| DataError::Db("saved run vanished on read-back".to_owned()))?;
+        // r1.s3.w3: `save_run` ends HERE, at the commit, and returns the minted id.
+        //
+        // It used to run `self.get_run(..)` at this point. That read executed AFTER
+        // `tx.commit()`, on a different pooled connection — so it was never part of
+        // the transaction the doc claimed it was, and, worse, it returned a bare
+        // `DataError` that DISCARDED the id of a row that had already committed. A
+        // caller could not then say "the run was saved but could not be read", which
+        // is exactly the guarantee the desktop command owes its user.
+        //
+        // Nothing is lost: the #39 re-validate-on-read tamper guard lives in
+        // `get_run`, every read path still runs it, and W3's use case calls `get_run`
+        // immediately after this returns — with the id in hand.
         Ok(BacktestRunId::new(run_id))
     }
 
