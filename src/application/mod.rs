@@ -8,10 +8,16 @@
 //! that only reads as one if it exists once.
 //!
 //! **What belongs here.** Orchestration of domain ports, and nothing else. This ring
-//! names no adapter, no `tauri`, no `specta`, no `sqlx`, and no filesystem type; it
-//! is generic over the ports in `crate::domain::port` and returns domain values plus
-//! its own typed errors. `src/cli/mod.rs` and `src/tauri/commands.rs::DesktopState`
-//! are the composition roots that choose implementations (ADR-0015).
+//! names no infrastructure adapter — no `tauri`, no `specta`, no `sqlx`, and no
+//! filesystem type — and is generic over the ports in `crate::domain::port`,
+//! returning domain values plus its own typed errors. The one deliberate adapter
+//! import is the deterministic engine itself,
+//! `crate::adapters::backtest::run_backtest`: it owns no I/O (its `adapters`
+//! address is namespace, not infrastructure — it lives there because it owns the
+//! concrete `IndicatorEngine`), so running it from the ring breaks no boundary the
+//! hexagonal scan enforces. `src/cli/mod.rs` and
+//! `src/tauri/commands.rs::DesktopState` are the composition roots that choose
+//! implementations (ADR-0015).
 //!
 //! **What deliberately does not belong here.** Any order, broker or execution
 //! capability. r1 is backtest-only, and the risk gate's kill-switch and

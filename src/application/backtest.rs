@@ -730,14 +730,26 @@ fn inputs_from_run(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        BacktestAppError, HISTOGRAM_BIN_COUNT, ReadBackFailure, ReadBackStage, histogram_bin_width,
-        project_histogram,
+        BacktestAppError, HISTOGRAM_BIN_COUNT, HISTOGRAM_BIN_WIDTH_STR, ReadBackFailure,
+        ReadBackStage, histogram_bin_width, project_histogram,
     };
     use crate::domain::{BacktestRunId, DataError};
     use rust_decimal::Decimal;
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()
+    }
+
+    /// The wire-pinned string and the arithmetic width are two spellings of one
+    /// fact; this pin is the only thing that fails when someone widens the domain
+    /// (bin count × width) without updating the string the DTO contract re-exports.
+    #[test]
+    fn the_wire_bin_width_string_equals_the_arithmetic_width() {
+        assert_eq!(
+            HISTOGRAM_BIN_WIDTH_STR,
+            histogram_bin_width().to_string(),
+            "the DTO string and histogram_bin_width() drifted apart"
+        );
     }
 
     #[test]

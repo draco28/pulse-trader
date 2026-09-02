@@ -369,9 +369,10 @@ pub trait BacktestRunRepository {
     /// name the pair, the exact primary and optional HTF snapshot identities, and
     /// the cost/funding configuration it actually ran with. The `Option` on
     /// [`PersistedRun::inputs`] is a READ-side accommodation for rows written
-    /// before migration `0006`, never a write-side choice. Taking it by value here
-    /// is what makes "a fresh run with no provenance" unrepresentable at the port,
-    /// before the database trigger has to catch it.
+    /// before migration `0006`, never a write-side choice. Requiring the value —
+    /// no `Option` in this signature — is what makes "a fresh run with no
+    /// provenance" unrepresentable at the port, before the database trigger has to
+    /// catch it.
     ///
     /// # Errors
     ///
