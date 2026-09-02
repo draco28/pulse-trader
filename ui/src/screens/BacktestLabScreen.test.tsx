@@ -1,0 +1,732 @@
+// The Backtest Lab screen's focused suite (r1.s3.w4, AC-1) — authored BEFORE
+// the screen exists and driven RED, mirroring `LibraryScreen.test.tsx`'s
+// `vi.mock("../bindings")` pattern: fixtures mirror the generated types in
+// `ui/src/bindings.ts` exactly, and no command answers except through the
+// mock. Every value asserted below is a fixture string, so a pass means the
+// screen rendered the DTO's own exact strings — never a number the frontend
+// computed, formatted or invented.
+//
+// Covers the spec's focused-suite list: catalog loading/error/empty/success,
+// zero `runBacktestVersion` invocations from mount (StrictMode included),
+// the indeterminate running label, `BusError` rendering incl. the structured
+// `run_id`, selector-change clearing, the fresh-DTO render (provenance, KPIs,
+// equity, regimes, both histograms, all 18 trade columns), table twins,
+// pointer/keyboard tooltip parity with Left/Right/Home/End traversal, the
+// focusable trade-table scroll region, and the ≥24px inline hit targets.
+
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { StrictMode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../bindings", () => ({
+  commands: {
+    libraryOverview: vi.fn(),
+    runBacktestVersion: vi.fn(),
+  },
+}));
+
+import { commands } from "../bindings";
+import type {
+  BacktestRunDto,
+  BusError,
+  HistogramBinDto,
+  LibraryOverview,
+  LibraryVersion,
+} from "../bindings";
+import BacktestLabScreen from "./BacktestLabScreen";
+import { RouteContent } from "../App";
+import { resolveRoute } from "../routes";
+
+const catalogMock = vi.mocked(commands.libraryOverview);
+const runMock = vi.mocked(commands.runBacktestVersion);
+
+// ---------------------------------------------------------------------------
+// Fixtures — shaped exactly like the generated types, values chosen to be
+// distinct so a verbatim assertion can only pass on the real payload path.
+// ---------------------------------------------------------------------------
+
+function catalogVersion(id: string, parentId: string | null): LibraryVersion {
+  return {
+    id,
+    parentId,
+    createdAt: "2026-08-20T10:00:00.000Z",
+    dsl: {
+      name: "RSI Oversold",
+      direction: "long",
+      entry: ["rsi(14) < 30"],
+      filters: [],
+      exits: ["stop loss 5%", "take profit 2R"],
+      risk: ["risk per trade 1%", "max leverage 3x"],
+    },
+    stats: null,
+    deltaVsParent: null,
+    recentRuns: [],
+  };
+}
+
+const CATALOG: LibraryOverview = {
+  strategies: [
+    {
+      id: "strat-alpha",
+      name: "Alpha Wave",
+      createdAt: "2026-08-01T09:00:00.000Z",
+      pinnedVersionId: null,
+      versions: [catalogVersion("v-alpha-1", null), catalogVersion("v-alpha-2", "v-alpha-1")],
+    },
+    {
+      id: "strat-beta",
+      name: "Beta Break",
+      createdAt: "2026-08-10T09:00:00.000Z",
+      pinnedVersionId: null,
+      versions: [catalogVersion("v-beta-1", null)],
+    },
+  ],
+};
+
+const MFE_COUNTS = [0, 1, 0, 2, 1, 3, 1, 0, 1, 0, 0, 0];
+const MAE_COUNTS = [1, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+
+function bins(counts: readonly number[]): HistogramBinDto[] {
+  return counts.map((count, i) => ({
+    lower: (i * 0.25).toFixed(2),
+    upper: ((i + 1) * 0.25).toFixed(2),
+    count,
+  }));
+}
+
+const SEEDED_RUN: BacktestRunDto = {
+  runId: "run-9f2c41ab",
+  strategyVersionId: "v-alpha-1",
+  schemaVersion: 3,
+  createdAt: "2026-09-02T10:15:30.123Z",
+  pair: "BTCUSDT",
+  primaryTimeframe: "15m",
+  primaryDataVersion: "btcusdt-15m-v7",
+  htfTimeframe: "4h",
+  htfDataVersion: "btcusdt-4h-v3",
+  firstOpenTimeMs: "1735689600000",
+  lastCloseTimeMs: "1756684800000",
+  startingEquity: "10000.00",
+  takerFeeBps: "4.0000",
+  slippageBps: "2.0000",
+  funding: "snapshot_rates",
+  engineFingerprint: "sha256:abc123def456",
+  engineTarget: "aarch64-apple-darwin",
+  resultContentHash: "sha256:9876fedcba",
+  fingerprintWarning: null,
+  netPnl: "-84.125",
+  feesTotal: "26.400",
+  fundingTotal: "-3.115",
+  slippageTotal: "13.200",
+  expectancy: "-4.20625",
+  winRate: "0.4375",
+  profitFactor: null,
+  grossProfit: "180.000",
+  grossLoss: "264.125",
+  avgWin: "22.500",
+  avgLoss: "33.016",
+  maxDrawdown: "412.750",
+  tradeCount: 8,
+  winCount: 3,
+  lossCount: 5,
+  maxWinStreak: 2,
+  maxLossStreak: 3,
+  sharpe: null,
+  sortino: null,
+  skippedSubLot: 1,
+  skippedSubNotional: 2,
+  skippedLeverageCapped: 0,
+  equity: [
+    { timeMs: "1735689600000", equity: "10000.00" },
+    { timeMs: "1736294400000", equity: "10042.75" },
+    { timeMs: "1736899200000", equity: "9910.50" },
+    { timeMs: "1737504000000", equity: "9915.875" },
+  ],
+  regimes: [
+    { regime: "trending_up", tradeCount: 3, netPnl: "180.000" },
+    { regime: "trending_down", tradeCount: 4, netPnl: "-294.250" },
+    { regime: "ranging", tradeCount: 1, netPnl: "30.125" },
+    { regime: "unknown", tradeCount: 0, netPnl: "0.000" },
+  ],
+  mfe: { binWidth: "0.25", bins: bins(MFE_COUNTS), underflow: 1, overflow: 2 },
+  mae: { binWidth: "0.25", bins: bins(MAE_COUNTS), underflow: 2, overflow: 0 },
+  trades: [
+    {
+      direction: "long",
+      qty: "0.01500000",
+      entryPrice: "64250.50",
+      exitPrice: "63100.25",
+      entrySignalTime: "1735690500000",
+      entryFillTime: "1735691400000",
+      exitSignalTime: "1735950300000",
+      exitFillTime: "1735951200000",
+      feesTotal: "6.600",
+      fundingTotal: "-0.780",
+      slippageTotal: "3.300",
+      realizedPnl: "-166.396250",
+      realizedR: "-1.658",
+      mfeR: "0.6215",
+      maeR: "-1.7025",
+      exitReason: "stop_loss",
+      source: "signal",
+      regime: "trending_down",
+    },
+    {
+      direction: "short",
+      qty: "0.01000000",
+      entryPrice: "64000.00",
+      exitPrice: "62680.00",
+      entrySignalTime: "1736980500000",
+      entryFillTime: "1736981400000",
+      exitSignalTime: "1737240300000",
+      exitFillTime: "1737241200000",
+      feesTotal: "6.330",
+      fundingTotal: "-0.455",
+      slippageTotal: "3.165",
+      realizedPnl: "129.545000",
+      realizedR: "1.290",
+      mfeR: "1.4515",
+      maeR: "-0.4025",
+      exitReason: "take_profit",
+      source: "signal",
+      regime: "ranging",
+    },
+  ],
+};
+
+/** A second fresh run, differing exactly where the null/warning paths need
+ * coverage: htf pair null, a non-null `fingerprintWarning`, and the ratio
+ * fields non-null. */
+const WARN_RUN: BacktestRunDto = {
+  ...SEEDED_RUN,
+  runId: "run-77aa88bb",
+  strategyVersionId: "v-alpha-2",
+  htfTimeframe: null,
+  htfDataVersion: null,
+  fingerprintWarning: "engine fingerprint changed since the prior run",
+  profitFactor: "0.681",
+  sharpe: -0.42,
+  sortino: -0.31,
+};
+
+const RUN_ERROR: BusError = {
+  // The message deliberately does NOT contain the run id — the saved-as line
+  // can only pass through the structured `run_id` field, never prose parsing.
+  code: "data",
+  message: "The saved run could not be read back.",
+  run_id: "run-51234",
+};
+
+const CATALOG_ERROR: BusError = {
+  code: "internal",
+  message: "The library read failed.",
+  run_id: null,
+};
+
+/** Render + wait for the catalog to land, then click Run on the seeded
+ * payload. Returns the container for scoped class queries. */
+async function renderRun(
+  run: BacktestRunDto | BusError,
+  catalog: LibraryOverview = CATALOG,
+) {
+  catalogMock.mockResolvedValue({ status: "ok", data: catalog });
+  const isDto = "netPnl" in run;
+  const settles: { status: "ok"; data: BacktestRunDto } | { status: "error"; error: BusError } =
+    isDto ? { status: "ok", data: run } : { status: "error", error: run };
+  const awaitText = isDto ? run.runId : run.message;
+  runMock.mockResolvedValue(settles);
+  const { container } = render(<BacktestLabScreen />);
+  fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+  await screen.findByText(awaitText);
+  return container;
+}
+
+beforeEach(() => {
+  catalogMock.mockReset();
+  runMock.mockReset();
+});
+
+// ---------------------------------------------------------------------------
+// Catalog states
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (catalog states)", () => {
+  it("renders a loading state while the catalog read is in flight", () => {
+    catalogMock.mockImplementation(() => new Promise(() => {}));
+
+    render(<BacktestLabScreen />);
+
+    expect(screen.getByText(/loading/i)).toBeTruthy();
+    // No option exists in any state except a real persisted version.
+    expect(screen.queryByRole("option")).toBeNull();
+  });
+
+  it("renders the catalog BusError with its code family and message", async () => {
+    catalogMock.mockResolvedValue({ status: "error", error: CATALOG_ERROR });
+
+    render(<BacktestLabScreen />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("internal");
+    expect(alert.textContent).toContain(CATALOG_ERROR.message);
+    expect(screen.queryByRole("option")).toBeNull();
+  });
+
+  it("renders an honest empty state naming the Strategy Designer, and no sample option", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+
+    render(<BacktestLabScreen />);
+
+    expect(await screen.findByText(/no strategies yet/i)).toBeTruthy();
+    expect(screen.getByText(/strategy designer/i)).toBeTruthy();
+    expect(screen.queryByRole("option")).toBeNull();
+    expect(screen.queryByText(/sample/i)).toBeNull();
+  });
+
+  it("lists exactly the catalog's real (strategy, version) pairs with version ids as values", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+
+    render(<BacktestLabScreen />);
+
+    const select = await screen.findByRole("combobox");
+    const options = within(select).getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual([
+      "Alpha Wave · v1",
+      "Alpha Wave · v2",
+      "Beta Break · v1",
+    ]);
+    expect(options.map((o) => o.getAttribute("value"))).toEqual([
+      "v-alpha-1",
+      "v-alpha-2",
+      "v-beta-1",
+    ]);
+    expect((select as HTMLSelectElement).value).toBe("v-alpha-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Run state machine
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (run state machine)", () => {
+  it("never invokes runBacktestVersion from mount — including a StrictMode double mount — before the Run click", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock.mockResolvedValue({ status: "ok", data: SEEDED_RUN });
+
+    render(
+      <StrictMode>
+        <BacktestLabScreen />
+      </StrictMode>,
+    );
+    await screen.findByRole("combobox");
+    // Flush microtasks so an erroneous mount-effect run would have landed.
+    await Promise.resolve();
+
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
+  it("invokes runBacktestVersion exactly once per click, with the currently selected version id", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock
+      .mockResolvedValueOnce({ status: "ok", data: SEEDED_RUN })
+      .mockResolvedValueOnce({
+        status: "ok",
+        data: { ...SEEDED_RUN, runId: "run-beta-001", strategyVersionId: "v-beta-1" },
+      });
+    render(<BacktestLabScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+    await screen.findByText("run-9f2c41ab");
+    expect(runMock).toHaveBeenCalledTimes(1);
+    expect(runMock).toHaveBeenLastCalledWith({ versionId: "v-alpha-1" });
+
+    // A different version selected, then Run: the call uses the new id, and
+    // the fresh DTO that lands is the new run's.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+    fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
+    await screen.findByText("run-beta-001");
+    expect(screen.queryByText("run-9f2c41ab")).toBeNull();
+    expect(runMock).toHaveBeenCalledTimes(2);
+    expect(runMock).toHaveBeenLastCalledWith({ versionId: "v-beta-1" });
+  });
+
+  it("shows an indeterminate running label with the button disabled — no percentage, no cancel", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    let resolveRun: (value: { status: "ok"; data: BacktestRunDto }) => void = () => {};
+    runMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    render(<BacktestLabScreen />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /run backtest/i }));
+
+    const button = screen.getByRole("button", { name: /running…/i }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(screen.queryByText(/cancel/i)).toBeNull();
+    expect(screen.queryByText(/\d+\s*%/)).toBeNull();
+
+    resolveRun({ status: "ok", data: SEEDED_RUN });
+    await screen.findByText("run-9f2c41ab");
+    expect(screen.queryByRole("button", { name: /running…/i })).toBeNull();
+  });
+
+  it("renders a run BusError's code and message, and the structured run_id as a saved-run id — never parsed prose", async () => {
+    await renderRun(RUN_ERROR);
+
+    const alerts = screen.getAllByRole("alert");
+    const runAlert = alerts.find((a) => a.textContent?.includes(RUN_ERROR.message));
+    expect(runAlert).toBeDefined();
+    expect(runAlert?.textContent).toContain("data");
+    // The saved-run truth reads the `run_id` FIELD: the id renders even though
+    // the message does not contain it, and names it as a run id.
+    expect(screen.getByText("Saved as run run-51234")).toBeTruthy();
+  });
+
+  it("clears a rendered result when the selector changes — a stale result is not attributable to the new version", async () => {
+    await renderRun(SEEDED_RUN);
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-alpha-2" } });
+
+    expect(screen.queryByText("run-9f2c41ab")).toBeNull();
+    expect(screen.queryByText("BTCUSDT")).toBeNull();
+    expect(screen.queryByText("sha256:abc123def456")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The fresh-DTO render
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (fresh result render)", () => {
+  it("renders the provenance band verbatim — pair, timeframes + data versions, date range, costs, engine, identity", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const band = container.querySelector(".bt-provenance");
+    expect(band).not.toBeNull();
+    const text = (band as HTMLElement).textContent ?? "";
+
+    for (const exact of [
+      "BTCUSDT",
+      "15m",
+      "btcusdt-15m-v7",
+      "4h",
+      "btcusdt-4h-v3",
+      "1735689600000",
+      "1756684800000",
+      "10000.00",
+      "4.0000",
+      "2.0000",
+      "snapshot_rates",
+      "sha256:abc123def456",
+      "aarch64-apple-darwin",
+      "sha256:9876fedcba",
+      "run-9f2c41ab",
+      "v-alpha-1",
+      "3",
+      "2026-09-02T10:15:30.123Z",
+    ]) {
+      expect(text).toContain(exact);
+    }
+    // The null fingerprintWarning renders no warning UI and no warning text.
+    expect(container.querySelector(".bt-fp-warning")).toBeNull();
+    expect(text).not.toContain("fingerprint changed");
+  });
+
+  it("renders every KPI tile from the DTO, with an em dash for null ratio fields", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const tiles = container.querySelector(".bt-kpis");
+    expect(tiles).not.toBeNull();
+    const text = (tiles as HTMLElement).textContent ?? "";
+
+    for (const exact of [
+      "-84.125",
+      "-4.20625",
+      "0.4375",
+      "180.000",
+      "264.125",
+      "22.500",
+      "33.016",
+      "412.750",
+      "26.400",
+      "-3.115",
+      "13.200",
+    ]) {
+      expect(text).toContain(exact);
+    }
+    // tradeCount / winCount / lossCount / streaks / skipped counters.
+    for (const label of ["Trades", "Wins", "Losses", "Max win streak", "Max loss streak",
+      "Skipped sub-lot", "Skipped sub-notional", "Skipped leverage-capped"]) {
+      expect(within(tiles as HTMLElement).getByText(label)).toBeTruthy();
+    }
+    // profitFactor / sharpe / sortino are null in this run → em dash, never 0.
+    const tileFor = (label: string) =>
+      within(tiles as HTMLElement)
+        .getByText(label)
+        .closest(".bt-kpi") as HTMLElement;
+    for (const label of ["Profit factor", "Sharpe", "Sortino"]) {
+      expect(tileFor(label).textContent).toContain("—");
+      expect(tileFor(label).textContent).not.toMatch(/\d/);
+    }
+  });
+
+  it("renders the equity chart: one line over the DTO's points plus the starting-equity reference", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const chart = container.querySelector(".bt-equity");
+    expect(chart).not.toBeNull();
+    const inChart = within(chart as HTMLElement);
+
+    // One polyline series (not two), a quiet area fill, and the reference line.
+    expect((chart as HTMLElement).querySelectorAll("polyline")).toHaveLength(1);
+    expect((chart as HTMLElement).querySelectorAll("polygon")).toHaveLength(1);
+    const ref = (chart as HTMLElement).querySelector(".bt-eq-ref");
+    expect(ref).not.toBeNull();
+    // The reference is labelled with the DTO's own exact string, and the
+    // readout shows the traversed point's exact strings (point[0] before any
+    // traversal; the full point-to-point path is the parity test below).
+    expect(inChart.getAllByText("10000.00").length).toBeGreaterThan(0);
+    expect(inChart.getByText("1735689600000")).toBeTruthy();
+  });
+
+  it("renders the four regime rows in the DTO's fixed order with fixed human labels, legend and direct labels", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const section = container.querySelector(".bt-regimes");
+    expect(section).not.toBeNull();
+
+    const rows = Array.from((section as HTMLElement).querySelectorAll(".bt-regime-row"));
+    expect(rows.map((r) => r.querySelector(".bt-regime-name")?.textContent)).toEqual([
+      "Trending up",
+      "Trending down",
+      "Ranging",
+      "Unknown",
+    ]);
+    // Each row carries its own tradeCount and exact netPnl string.
+    const trendingDown = within(rows[1] as HTMLElement);
+    expect(trendingDown.getByText("4")).toBeTruthy();
+    expect(trendingDown.getByText("-294.250")).toBeTruthy();
+
+    // A compact 4-swatch legend, same fixed labels.
+    const legend = (section as HTMLElement).querySelector(".bt-legend");
+    expect(legend).not.toBeNull();
+    expect(
+      Array.from((legend as HTMLElement).querySelectorAll(".bt-legend-item")).map(
+        (i) => i.textContent,
+      ),
+    ).toEqual(["Trending up", "Trending down", "Ranging", "Unknown"]);
+  });
+
+  it("renders MFE and MAE as separate single-hue histograms with the pinned column order and labels", async () => {
+    const container = await renderRun(SEEDED_RUN);
+
+    for (const [cls, hist] of [
+      [".bt-mfe", SEEDED_RUN.mfe],
+      [".bt-mae", SEEDED_RUN.mae],
+    ] as const) {
+      const chart = container.querySelector(cls);
+      expect(chart).not.toBeNull();
+      const columns = Array.from((chart as HTMLElement).querySelectorAll(".bt-col"));
+      // underflow + 12 finite bins + overflow = 14 columns.
+      expect(columns).toHaveLength(14);
+
+      const labels = columns.map((c) => c.querySelector(".bt-col-label")?.textContent);
+      expect(labels[0]).toBe("< 0 R");
+      expect(labels[13]).toBe("≥ 3 R");
+      // The finite labels interpolate the DTO's own bound strings, verbatim.
+      expect(labels[1]).toBe(`[${hist.bins[0].lower}, ${hist.bins[0].upper}) R`);
+      expect(labels[12]).toBe(`[${hist.bins[11].lower}, ${hist.bins[11].upper}) R`);
+
+      // Every column is the same hue (slot 1) — never cycled by rank.
+      for (const bar of (chart as HTMLElement).querySelectorAll(".bt-col-bar")) {
+        expect(bar.classList.contains("bt-slot-1")).toBe(true);
+      }
+
+      // Heights are the DTO's counts, shown as direct labels: the underflow
+      // and overflow counts appear in their own columns.
+      const under = within(columns[0] as HTMLElement).getByText(String(hist.underflow));
+      const over = within(columns[13] as HTMLElement).getByText(String(hist.overflow));
+      expect(under).toBeTruthy();
+      expect(over).toBeTruthy();
+    }
+
+    // The two charts are separate — never one overlaid chart.
+    expect(container.querySelectorAll(".bt-histogram")).toHaveLength(2);
+  });
+
+  it("renders the trade table: one row per trade in seq order with all 18 DTO columns, exact strings", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const region = container.querySelector(".bt-table-scroll");
+    expect(region).not.toBeNull();
+
+    const table = (region as HTMLElement).querySelector("table");
+    expect(table).not.toBeNull();
+    const headers = Array.from((table as HTMLElement).querySelectorAll("th")).map(
+      (h) => h.textContent,
+    );
+    expect(headers).toEqual([
+      "direction", "qty", "entryPrice", "exitPrice", "entrySignalTime", "entryFillTime",
+      "exitSignalTime", "exitFillTime", "feesTotal", "fundingTotal", "slippageTotal",
+      "realizedPnl", "realizedR", "mfeR", "maeR", "exitReason", "source", "regime",
+    ]);
+
+    const rows = Array.from((table as HTMLElement).querySelectorAll("tbody tr"));
+    expect(rows).toHaveLength(2);
+    // Seq order, exact strings.
+    expect(within(rows[0] as HTMLElement).getAllByText("stop_loss").length).toBeGreaterThan(0);
+    expect(within(rows[0] as HTMLElement).getByText("-166.396250")).toBeTruthy();
+    expect(within(rows[0] as HTMLElement).getByText("0.01500000")).toBeTruthy();
+    expect(within(rows[1] as HTMLElement).getByText("take_profit")).toBeTruthy();
+    expect(within(rows[1] as HTMLElement).getByText("129.545000")).toBeTruthy();
+  });
+
+  it("renders an em dash for a null HTF pair and visibly flags a non-null fingerprintWarning", async () => {
+    const container = await renderRun(WARN_RUN);
+    const band = container.querySelector(".bt-provenance") as HTMLElement;
+    const text = band.textContent ?? "";
+
+    // htfTimeframe/htfDataVersion null → em dash beside the primary pair,
+    // never a guessed timeframe. The primary pair still renders.
+    expect(text).toContain("15m");
+    expect(text).toContain("—");
+    expect(text).not.toContain("4h");
+
+    // The warning is the pre-save comparison's, flagged as such.
+    const warning = container.querySelector(".bt-fp-warning");
+    expect(warning).not.toBeNull();
+    expect((warning as HTMLElement).textContent).toContain(
+      "engine fingerprint changed since the prior run",
+    );
+    // And the non-null ratio fields render their values, not em dashes.
+    const tiles = container.querySelector(".bt-kpis") as HTMLElement;
+    expect(within(tiles).getByText("0.681")).toBeTruthy();
+    expect(within(tiles).getByText("-0.42")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Table twins, parity, focus, hit targets
+// ---------------------------------------------------------------------------
+
+describe("BacktestLabScreen (twins, parity, focus, hit targets)", () => {
+  it("carries an in-DOM table twin for every chart with the same exact values", async () => {
+    const container = await renderRun(SEEDED_RUN);
+
+    // Equity twin: one row per point, exact strings.
+    const eqTwin = container.querySelector(".bt-twin-equity") as HTMLElement;
+    expect(eqTwin).not.toBeNull();
+    for (const p of SEEDED_RUN.equity) {
+      expect(within(eqTwin).getAllByText(p.timeMs).length).toBeGreaterThan(0);
+      expect(within(eqTwin).getAllByText(p.equity).length).toBeGreaterThan(0);
+    }
+
+    // Regime twin: four rows, label + tradeCount + netPnl.
+    const rgTwin = container.querySelector(".bt-twin-regimes") as HTMLElement;
+    expect(rgTwin).not.toBeNull();
+    for (const cell of SEEDED_RUN.regimes) {
+      const row = rgTwin.querySelector(`[data-regime="${cell.regime}"]`);
+      expect(row).not.toBeNull();
+      expect((row as HTMLElement).textContent).toContain(String(cell.tradeCount));
+      expect((row as HTMLElement).textContent).toContain(cell.netPnl);
+    }
+
+    // Histogram twins: underflow + 12 bins + overflow with their counts.
+    for (const [cls, hist] of [
+      [".bt-twin-mfe", SEEDED_RUN.mfe],
+      [".bt-twin-mae", SEEDED_RUN.mae],
+    ] as const) {
+      const twin = container.querySelector(cls) as HTMLElement;
+      expect(twin).not.toBeNull();
+      const rows = twin.querySelectorAll("tbody tr");
+      expect(rows).toHaveLength(14);
+      expect(rows[0].textContent).toContain(String(hist.underflow));
+      expect(rows[13].textContent).toContain(String(hist.overflow));
+      expect(rows[1].textContent).toContain(`[${hist.bins[0].lower}, ${hist.bins[0].upper}) R`);
+      expect(rows[1].textContent).toContain(String(hist.bins[0].count));
+    }
+  });
+
+  it("exposes identical exact-string readouts for keyboard and pointer on the equity plot", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    const chart = container.querySelector(".bt-equity") as HTMLElement;
+    const plot = chart.querySelector(".bt-eq-plot") as HTMLElement;
+    const readout = chart.querySelector(".bt-eq-readout") as HTMLElement;
+    expect(plot).not.toBeNull();
+    expect(readout).not.toBeNull();
+
+    // Keyboard: Left/Right step point-to-point, Home/End jump to first/last.
+    plot.focus();
+    fireEvent.keyDown(plot, { key: "ArrowRight" });
+    expect(readout.textContent).toContain("1736294400000");
+    expect(readout.textContent).toContain("10042.75");
+    fireEvent.keyDown(plot, { key: "End" });
+    expect(readout.textContent).toContain("1737504000000");
+    fireEvent.keyDown(plot, { key: "Home" });
+    expect(readout.textContent).toContain("1735689600000");
+    fireEvent.keyDown(plot, { key: "ArrowRight" });
+    fireEvent.keyDown(plot, { key: "ArrowLeft" });
+    expect(readout.textContent).toContain("1735689600000");
+
+    // Pointer: hovering the third point's hit marker drives the SAME readout
+    // element with the same exact strings — parity is structural.
+    const hits = chart.querySelectorAll(".bt-eq-hit");
+    expect(hits).toHaveLength(SEEDED_RUN.equity.length);
+    fireEvent.mouseOver(hits[2]);
+    expect(readout.textContent).toContain("1736899200000");
+    expect(readout.textContent).toContain("9910.50");
+  });
+
+  it("makes the equity plot and the trade-table scroll region focus stops in visual order", async () => {
+    const container = await renderRun(SEEDED_RUN);
+
+    const select = screen.getByRole("combobox");
+    const run = screen.getByRole("button", { name: /run backtest/i });
+    const plot = container.querySelector(".bt-eq-plot") as HTMLElement;
+    const region = container.querySelector(".bt-table-scroll") as HTMLElement;
+
+    for (const el of [plot, region]) {
+      expect(el.tabIndex).toBe(0);
+    }
+    // Focus order follows visual order: selector → Run → plot → table region.
+    const follows = (a: HTMLElement, b: HTMLElement) =>
+      (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    expect(follows(select, run)).toBe(true);
+    expect(follows(run, plot)).toBe(true);
+    expect(follows(plot, region)).toBe(true);
+
+    // The scroll region is named, and scrolls rather than clips.
+    expect(region.getAttribute("role")).toBe("region");
+    expect(region.getAttribute("aria-label")).toBeTruthy();
+    expect(region.className).toContain("bt-table-scroll");
+  });
+
+  it("gives every histogram column and regime row an interactive-dimension hit target of at least 24px", async () => {
+    const container = await renderRun(SEEDED_RUN);
+
+    const columns = container.querySelectorAll(".bt-col");
+    expect(columns.length).toBeGreaterThan(0);
+    for (const col of columns) {
+      expect(parseFloat((col as HTMLElement).style.minWidth)).toBeGreaterThanOrEqual(24);
+    }
+    const rows = container.querySelectorAll(".bt-regime-row");
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(parseFloat((row as HTMLElement).style.minHeight)).toBeGreaterThanOrEqual(24);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Route registration (the real ROUTES table)
+// ---------------------------------------------------------------------------
+
+describe("the backtest route entry (the real ROUTES table)", () => {
+  it("mounts the screen through RouteContent", async () => {
+    const route = resolveRoute("/backtest");
+    expect(route).toBeDefined();
+    expect(route?.element).toBeDefined();
+
+    catalogMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
+    render(<RouteContent route={route} />);
+    expect(await screen.findByText(/no strategies yet/i)).toBeTruthy();
+  });
+});
