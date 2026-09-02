@@ -549,7 +549,9 @@ fn an_edited_snapshot_with_forged_provenance_is_refused() {
         version: a.series.version.clone(),
         candles: b.series.candles.clone(),
     };
-    let bytes = store.encode_snapshot(&forged).expect("encode forged snapshot");
+    let bytes = store
+        .encode_snapshot(&forged)
+        .expect("encode forged snapshot");
     std::fs::write(store.snapshot_path(&pair, tf, &a.series.version), bytes)
         .expect("plant forged snapshot");
 
