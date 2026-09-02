@@ -373,6 +373,38 @@ describe("BacktestLabScreen (run state machine)", () => {
     expect(screen.queryByRole("button", { name: /running…/i })).toBeNull();
   });
 
+  it("locks the selector while a run is in flight — a mid-run selection cannot re-enable Run", async () => {
+    // The race this pins: a selector change resets the run state to idle, which
+    // re-enables the Run button while the original uncancellable request is
+    // still executing — a second click would launch an overlapping engine run
+    // whose persisted result the token check silently drops. Locking the
+    // selector for the duration removes the reachable path.
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    let resolveRun: (value: { status: "ok"; data: BacktestRunDto }) => void = () => {};
+    runMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    render(<BacktestLabScreen />);
+
+    const select = (await screen.findByRole("combobox")) as HTMLSelectElement;
+    expect(select.disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: /run backtest/i }));
+
+    expect(
+      (screen.getByRole("button", { name: /running…/i }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(select.disabled).toBe(true);
+
+    resolveRun({ status: "ok", data: SEEDED_RUN });
+    await screen.findByText("run-9f2c41ab");
+    // Settled: the selector unlocks alongside the button.
+    expect(select.disabled).toBe(false);
+  });
+
   it("renders a run BusError's code and message, and the structured run_id as a saved-run id — never parsed prose", async () => {
     await renderRun(RUN_ERROR);
 

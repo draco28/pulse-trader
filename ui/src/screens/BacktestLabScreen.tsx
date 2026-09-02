@@ -148,7 +148,11 @@ export default function BacktestLabScreen() {
   const currentId = selectedId ?? options[0]?.value ?? null;
 
   /** Selecting a version clears any rendered result: a stale result must not
-   * appear attributable to the newly selected version. */
+   * appear attributable to the newly selected version. The selector is disabled
+   * while a run is in flight (see the `<select>` below): a mid-run change here
+   * would reset the state to `idle` and re-enable Run while the original,
+   * uncancellable request was still executing — a second click would launch an
+   * overlapping engine run whose persisted result the token check then drops. */
   function onSelectorChange(id: string) {
     runToken.current += 1;
     setSelectedId(id);
@@ -186,8 +190,8 @@ export default function BacktestLabScreen() {
         <div className="ctool-left">
           <h1 className="ctool-title">Backtest Lab</h1>
           <span className="ctool-count">
-            Select a persisted strategy version and run it against the seeded
-            BTCUSDT snapshots
+            Select a persisted strategy version and run it against the persisted
+            BTCUSDT candle snapshots
           </span>
         </div>
       </div>
@@ -222,6 +226,7 @@ export default function BacktestLabScreen() {
             className="bt-select"
             value={currentId ?? ""}
             onChange={(event) => onSelectorChange(event.target.value)}
+            disabled={run.kind === "running"}
           >
             {options.map((option) => (
               <option key={option.value} value={option.value}>
