@@ -157,7 +157,13 @@ impl CandleStore {
     ///
     /// # Errors
     ///
-    /// Returns [`DataError`] if the snapshot is absent or cannot be decoded.
+    /// Returns [`DataError`] if the snapshot is absent, cannot be decoded, or
+    /// fails the stored-content guard: the bytes at `<version>.parquet` must
+    /// still *be* that version — embedded provenance naming the requested tag,
+    /// and candles re-hashing to it — so a file replaced or edited under a
+    /// surviving name is a [`DataError::Parse`], never a clean decode of the
+    /// wrong data (the read-side twin of [`Self::write_snapshot`]'s mismatch
+    /// refusal).
     pub fn read_snapshot(
         &self,
         pair: &Pair,
@@ -168,6 +174,33 @@ impl CandleStore {
         let bytes =
             fs::read(&path).map_err(|e| io(&format!("read snapshot {}", path.display()), &e))?;
         let candles = parquet::decode_candles(&bytes)?;
+        // Stored-content guard (#6): the store is content-addressed, so the file
+        // at `<version>.parquet` is only that version if the file itself says so.
+        // Without this, a snapshot replaced with another valid Parquet payload
+        // (rename, copy, restore-from-backup mixup) would decode cleanly while the
+        // caller keeps the requested identity — and a run would replay different
+        // market data under the old content hash. Two checks: the embedded
+        // provenance tag (a swapped whole file trips this), then the re-derived
+        // content hash under the snapshot's own schema version (an edit that also
+        // forged the provenance trips this).
+        let provenance = parquet::decode_provenance(&bytes)?;
+        if provenance.data_version != version.as_str() {
+            return Err(DataError::Parse(format!(
+                "snapshot at {} is not version {version}: its embedded provenance names {} \
+                 (the file was replaced or renamed; the store is content-addressed)",
+                path.display(),
+                provenance.data_version
+            )));
+        }
+        let derived =
+            Self::content_version_with_schema(pair, tf, provenance.schema_version, &candles);
+        if &derived != version {
+            return Err(DataError::Parse(format!(
+                "snapshot at {} does not hash to its requested version {version}: the candles \
+                 re-derive to {derived} (the file was edited; the store is content-addressed)",
+                path.display()
+            )));
+        }
         Ok(CandleSeries {
             pair: pair.clone(),
             timeframe: tf,
@@ -248,7 +281,10 @@ impl CandleStore {
     /// # Errors
     ///
     /// Returns [`DataError::Io`] on a filesystem error other than absence, or
-    /// [`DataError::Parse`] if the pointer body is empty or not valid UTF-8.
+    /// [`DataError::Parse`] if the pointer body is empty, not valid UTF-8, or is
+    /// not a safe single path component — a stored tag is joined verbatim into
+    /// the snapshot path by [`CandleSeriesRepository::load_head`], so it crosses
+    /// the trust boundary `DataVersion::parse` guards.
     pub fn read_head(&self, pair: &Pair, tf: Timeframe) -> Result<Option<DataVersion>, DataError> {
         let path = self.head_path(pair, tf);
         match fs::read(&path) {
@@ -262,7 +298,13 @@ impl CandleStore {
                         path.display()
                     )));
                 }
-                Ok(Some(DataVersion::new(tag)))
+                // The tag came off disk, not from this store's hash derivation, so
+                // it takes the checked constructor: `DataVersion::new` here would
+                // let a corrupted or hand-edited `HEAD` (`../../tmp/other`) reach
+                // `snapshot_path`'s join unchecked.
+                DataVersion::parse(tag)
+                    .map(Some)
+                    .map_err(|e| DataError::Parse(format!("HEAD at {}: {e}", path.display())))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io(&format!("read HEAD {}", path.display()), &e)),
@@ -473,14 +515,16 @@ fn parent_of(path: &Path) -> Result<&Path, DataError> {
 }
 
 /// Extract the `data_version` from a `<version>.parquet` file path, skipping
-/// hidden temp files and non-parquet entries.
+/// hidden temp files, non-parquet entries, and stems that fail the path-safety
+/// rule (a directory listing is stored input like `HEAD` is, so the tag goes
+/// through `DataVersion::parse`, not the unchecked constructor).
 fn snapshot_version_of(path: &Path) -> Option<DataVersion> {
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.') {
         return None;
     }
     let stem = name.strip_suffix(".parquet")?;
-    Some(DataVersion::new(stem))
+    DataVersion::parse(stem).ok()
 }
 
 /// Two snapshots are content-equivalent if their writer-normalized bytes match

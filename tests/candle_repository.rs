@@ -443,6 +443,126 @@ fn load_version_never_falls_back_to_head() {
 }
 
 // ---------------------------------------------------------------------------
+// Stored-integrity guards: a tag or file that came off disk is input, not truth.
+// ---------------------------------------------------------------------------
+
+/// A corrupted `HEAD` holding a traversal tag must be refused at the read, before
+/// `load_head` can join it into a snapshot path that escapes the store root — and
+/// the refusal is an error, never `Ok(None)` (which would read as "first run" and
+/// trigger a silent full re-fetch).
+#[test]
+fn a_traversal_head_tag_is_refused_before_any_path_join() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let tf = Timeframe::M15;
+    store.commit(&pair, tf, candles(4)).expect("commit");
+
+    // Hand-corrupt the pointer the way a stray edit or bad restore would.
+    std::fs::write(store.head_path(&pair, tf), b"../../../tmp/other").expect("corrupt HEAD");
+
+    let err = store
+        .read_head(&pair, tf)
+        .expect_err("a traversal HEAD tag must be refused, not returned unchecked");
+    assert!(
+        matches!(err, DataError::Parse(_)),
+        "expected a Parse refusal for the unsafe tag, got {err:?}"
+    );
+    let err = store
+        .load_head(&pair, tf)
+        .expect_err("load_head must propagate the refusal — Ok(None) would mean 'first run'");
+    assert!(matches!(err, DataError::Parse(_)), "{err:?}");
+}
+
+/// The same rule on the listing side: a directory entry whose stem is not a safe
+/// single path component is skipped by `latest_version`, never surfaced as a tag.
+#[test]
+fn latest_version_skips_a_filename_that_is_not_a_safe_component() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let tf = Timeframe::M15;
+    let committed = store.commit(&pair, tf, candles(4)).expect("commit");
+
+    let tf_dir = store
+        .snapshot_path(&pair, tf, &committed.series.version)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // A backslash stem is a legal POSIX filename but not a portable path
+    // component; `latest_version` must report only the sane snapshot.
+    std::fs::write(tf_dir.join("bad\\name.parquet"), b"junk").expect("plant unsafe filename");
+
+    assert_eq!(
+        store.latest_version(&pair, tf).expect("latest_version"),
+        Some(committed.series.version),
+        "the unsafe filename is skipped, the real snapshot still wins"
+    );
+}
+
+/// A snapshot file replaced with another *valid* snapshot (wrong content under a
+/// surviving name) must be refused, not decoded as the requested version — the
+/// persisted-provenance flow would otherwise display and replay market data that
+/// does not match the content hash it reports (closes #6).
+#[test]
+fn a_swapped_snapshot_file_is_refused_not_served() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let tf = Timeframe::M15;
+    let a = store.commit(&pair, tf, candles(5)).expect("commit A");
+    let b = store.commit(&pair, tf, candles(9)).expect("commit B");
+
+    // Swap: B's bytes now sit at A's content-addressed path.
+    std::fs::copy(
+        store.snapshot_path(&pair, tf, &b.series.version),
+        store.snapshot_path(&pair, tf, &a.series.version),
+    )
+    .expect("swap the file");
+
+    let err = store
+        .load_version(&pair, tf, &a.series.version)
+        .expect_err("a swapped snapshot must be refused, not served as A");
+    assert!(
+        matches!(err, DataError::Parse(ref msg) if msg.contains("embedded provenance")),
+        "the refusal names the embedded-tag mismatch, got {err:?}"
+    );
+    // The untouched snapshot still reads: the guard verifies, it does not lock.
+    store
+        .load_version(&pair, tf, &b.series.version)
+        .expect("the un-swapped snapshot still loads");
+}
+
+/// The deeper forgery: a file re-encoded so its embedded provenance *claims* the
+/// requested tag while its candles hash elsewhere. The re-derived content hash —
+/// the read-side twin of `write_snapshot`'s check — is what refuses it.
+#[test]
+fn an_edited_snapshot_with_forged_provenance_is_refused() {
+    let (store, _tmp) = store();
+    let pair = btc();
+    let tf = Timeframe::M15;
+    let a = store.commit(&pair, tf, candles(5)).expect("commit A");
+    let b = store.commit(&pair, tf, candles(9)).expect("commit B");
+
+    // B's candles wearing A's tag: `encode_snapshot` embeds `series.version`
+    // verbatim, so the provenance lies exactly the way a tamperer would want.
+    let forged = CandleSeries {
+        pair: pair.clone(),
+        timeframe: tf,
+        version: a.series.version.clone(),
+        candles: b.series.candles.clone(),
+    };
+    let bytes = store.encode_snapshot(&forged).expect("encode forged snapshot");
+    std::fs::write(store.snapshot_path(&pair, tf, &a.series.version), bytes)
+        .expect("plant forged snapshot");
+
+    let err = store
+        .read_snapshot(&pair, tf, &a.series.version)
+        .expect_err("content that re-hashes elsewhere must be refused");
+    assert!(
+        matches!(err, DataError::Parse(ref msg) if msg.contains("re-derive")),
+        "the refusal names the re-derived hash mismatch, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The boundary scan: code, not comments.
 // ---------------------------------------------------------------------------
 
