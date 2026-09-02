@@ -75,6 +75,18 @@ describe("<App /> shell navigation", () => {
     }
   });
 
+  // r1.s3.w4: the Backtest Lab's ROUTES entry makes the existing nav row live
+  // through `isNavBuilt` alone — the "Soon" badge disappears with no nav-side
+  // edit, while still-unbuilt rows keep theirs (the flip is a derivation, not
+  // a blanket badge removal).
+  it("shows the Backtest Lab nav row live once its ROUTES entry lands", async () => {
+    render(<App />);
+    const backtestRow = await screen.findByRole("link", { name: /backtest lab/i });
+    expect(within(backtestRow).queryByText("Soon")).toBeNull();
+    const deployRow = screen.getByRole("link", { name: /deployment dashboard/i });
+    expect(within(deployRow).getByText("Soon")).toBeTruthy();
+  });
+
   it("keeps the credential banner mounted regardless of the active route", async () => {
     setHash("#/settings");
     render(<App />);
