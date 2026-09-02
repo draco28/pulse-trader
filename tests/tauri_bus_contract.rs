@@ -28,9 +28,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use pulse::{
-    BUS_COMMANDS, BacktestError, BusError, BusErrorCode, BusEvent, ComposerError, DataError,
-    DesktopState, EventSink, ExchangeError, LlmError, RunId, StrategyRepository, demo_stream_core,
-    shell_info_core,
+    BUS_COMMANDS, BacktestAppError, BacktestError, BacktestRunId, BusError, BusErrorCode, BusEvent,
+    ComposerError, DataError, DesktopState, EventSink, ExchangeError, LlmError, ReadBackFailure,
+    ReadBackStage, RunId, StrategyRepository, demo_stream_core, shell_info_core,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tempfile::TempDir;
@@ -198,6 +198,32 @@ fn domain_error_maps_to_one_serializable_shape() {
             "shape {i} differs from the first -- that is more than one error shape crossing"
         );
     }
+
+    // The one crossable error that CAN name a persisted run. The loop above only
+    // ever sees a null run_id, so without this case the with_run_id serialization
+    // path -- the exact string the Backtest Lab screen shows as "saved, but could
+    // not be read back" -- is unpinned by this suite: same key set, non-null id.
+    let saved: BusError = BacktestAppError::SavedButReadBackFailed {
+        run_id: BacktestRunId::new("run-1"),
+        stage: ReadBackStage::Trades,
+        failure: ReadBackFailure::Missing,
+    }
+    .into();
+    assert_eq!(saved.code, BusErrorCode::Data);
+    let value = serde_json::to_value(&saved).unwrap();
+    let object = value.as_object().expect("the saved case is an object too");
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
+        "the saved-but-unreadable case keeps the ONE shape"
+    );
+    assert_eq!(
+        object["run_id"],
+        serde_json::json!("run-1"),
+        "run_id serializes as the bare id, not a wrapper object"
+    );
 
     // The shape survives a full round trip, so the generated TypeScript type is a
     // faithful description of the wire format and not merely of the Rust type.
