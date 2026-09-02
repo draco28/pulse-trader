@@ -14,7 +14,9 @@
 //! 5. build [`BacktestInputs`] from the series the engine actually consumed;
 //! 6. save, receiving a fresh [`BacktestRunId`];
 //! 7. reload that run, its trades, and the primary/HTF snapshots **named by the
-//!    persisted inputs** — never `HEAD`, which may have moved;
+//!    persisted inputs** — never `HEAD`, which may have moved — with the snapshot
+//!    loads off the async runtime (`spawn_blocking`), exactly like step 3: they
+//!    are the same filesystem I/O + Parquet decode;
 //! 8. answer from those reloaded values alone.
 //!
 //! **Step 7 is the point of the whole item.** A response assembled from the
@@ -37,9 +39,9 @@ use crate::domain::backtest::{BacktestResult, EquityCurve};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
-    CandleSeriesRepository, CompiledStrategy, DataError, EngineFingerprint, ExchangeAdapter,
-    ExchangeError, FundingConfig, Pair, PersistedRun, SnapshotSelection, StrategyRepository,
-    SymbolFilters, Timeframe, Trade, ValidationErrors, compile, validate,
+    CandleSeriesRepository, CompiledStrategy, DataError, DataVersion, EngineFingerprint,
+    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, SnapshotSelection,
+    StrategyRepository, SymbolFilters, Timeframe, Trade, ValidationErrors, compile, validate,
 };
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
@@ -503,18 +505,18 @@ where
         .map_err(BacktestAppError::Persist)?;
 
     // 7-8. From here every failure names the row that exists.
-    read_back(candles, runs, run_id, fingerprint_warning).await
+    read_back(candles.clone(), runs, run_id, fingerprint_warning).await
 }
 
 /// Steps 7-8: reload the saved run, its trades and its exact snapshots.
 async fn read_back<C, R>(
-    candles: &C,
+    candles: C,
     runs: &R,
     run_id: BacktestRunId,
     fingerprint_warning: Option<String>,
 ) -> Result<BacktestOutcome, BacktestAppError>
 where
-    C: CandleSeriesRepository,
+    C: CandleSeriesRepository + Clone + Send + 'static,
     R: BacktestRunRepository,
 {
     let saved =
@@ -540,15 +542,17 @@ where
         .map_err(|e| saved(ReadBackStage::Trades, ReadBackFailure::Data(e)))?;
 
     // The identities come from the SAVED row, never from HEAD — HEAD may already
-    // point somewhere else, which is the whole reason #110 exists.
-    let primary = candles
-        .load_version(
-            &inputs.pair,
-            inputs.primary.timeframe,
-            &inputs.primary.data_version,
-        )
-        .map_err(|e| saved(ReadBackStage::PrimarySnapshot, ReadBackFailure::Data(e)))?
-        .series;
+    // point somewhere else, which is the whole reason #110 exists. Both loads go
+    // through the blocking pool (see `load_version_offthread`): same filesystem
+    // I/O + Parquet decode as step 3, so the same off-runtime rule.
+    let primary = load_version_offthread(
+        candles.clone(),
+        inputs.pair.clone(),
+        inputs.primary.timeframe,
+        inputs.primary.data_version.clone(),
+    )
+    .await
+    .map_err(|e| saved(ReadBackStage::PrimarySnapshot, ReadBackFailure::Data(e)))?;
     if primary.candles.is_empty() {
         // An empty reload cannot produce a truthful date range, and fabricating one
         // is exactly what the provenance header exists to prevent.
@@ -560,10 +564,14 @@ where
 
     let htf = match inputs.htf.as_ref() {
         Some(selection) => Some(
-            candles
-                .load_version(&inputs.pair, selection.timeframe, &selection.data_version)
-                .map_err(|e| saved(ReadBackStage::HtfSnapshot, ReadBackFailure::Data(e)))?
-                .series,
+            load_version_offthread(
+                candles,
+                inputs.pair.clone(),
+                selection.timeframe,
+                selection.data_version.clone(),
+            )
+            .await
+            .map_err(|e| saved(ReadBackStage::HtfSnapshot, ReadBackFailure::Data(e)))?,
         ),
         None => None,
     };
@@ -582,6 +590,35 @@ where
         fingerprint_warning,
         mfe,
         mae,
+    })
+}
+
+/// One read-back `load_version`, off the async runtime. Step 3's rule applies to
+/// step 7 unchanged: the load is filesystem I/O plus Parquet decode — hundreds of
+/// milliseconds on a real multi-year snapshot — and running it on a Tokio worker
+/// stalls every other command on the bus. The closure owns the repo clone and the
+/// identity; nothing is borrowed across the await.
+async fn load_version_offthread<C>(
+    candles: C,
+    pair: Pair,
+    timeframe: Timeframe,
+    version: DataVersion,
+) -> Result<CandleSeries, DataError>
+where
+    C: CandleSeriesRepository + Send + 'static,
+{
+    // Rendered before the move so the JoinError formatter can name the load.
+    let label = format!("{pair}/{}/{version}", timeframe.binance_interval());
+    tokio::task::spawn_blocking(move || {
+        candles
+            .load_version(&pair, timeframe, &version)
+            .map(|stored| stored.series)
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(DataError::Io(format!(
+            "blocking snapshot load for {label} panicked: {join_err}"
+        )))
     })
 }
 
