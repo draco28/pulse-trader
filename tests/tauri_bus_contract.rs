@@ -199,17 +199,35 @@ fn domain_error_maps_to_one_serializable_shape() {
         );
     }
 
-    // The one crossable error that CAN name a persisted run. The loop above only
-    // ever sees a null run_id, so without this case the with_run_id serialization
-    // path -- the exact string the Backtest Lab screen shows as "saved, but could
-    // not be read back" -- is unpinned by this suite: same key set, non-null id.
+    // The shape survives a full round trip, so the generated TypeScript type is a
+    // faithful description of the wire format and not merely of the Rust type.
+    let err = BusError::from(DataError::Io("disk full".to_owned()));
+    let json = serde_json::to_string(&err).unwrap();
+    let back: BusError = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back, err,
+        "BusError must round-trip through serde unchanged"
+    );
+}
+
+/// The one crossable error that CAN name a persisted run. The shape test above
+/// loops only the domain-family errors, every one of which serializes `run_id`
+/// as null — so without this case the `with_run_id` serialization path, the exact
+/// payload the Backtest Lab renders as "saved, but could not be read back", is
+/// unpinned by this suite: same key set, non-null id.
+#[test]
+fn the_saved_but_unreadable_case_keeps_the_one_shape_with_a_named_run() {
     let saved: BusError = BacktestAppError::SavedButReadBackFailed {
         run_id: BacktestRunId::new("run-1"),
         stage: ReadBackStage::Trades,
         failure: ReadBackFailure::Missing,
     }
     .into();
-    assert_eq!(saved.code, BusErrorCode::Data);
+    assert_eq!(
+        saved.code,
+        BusErrorCode::Data,
+        "the saved case maps to the Data family"
+    );
     let value = serde_json::to_value(&saved).unwrap();
     let object = value.as_object().expect("the saved case is an object too");
     let mut keys: Vec<String> = object.keys().cloned().collect();
@@ -223,16 +241,6 @@ fn domain_error_maps_to_one_serializable_shape() {
         object["run_id"],
         serde_json::json!("run-1"),
         "run_id serializes as the bare id, not a wrapper object"
-    );
-
-    // The shape survives a full round trip, so the generated TypeScript type is a
-    // faithful description of the wire format and not merely of the Rust type.
-    let err = BusError::from(DataError::Io("disk full".to_owned()));
-    let json = serde_json::to_string(&err).unwrap();
-    let back: BusError = serde_json::from_str(&json).unwrap();
-    assert_eq!(
-        back, err,
-        "BusError must round-trip through serde unchanged"
     );
 }
 
