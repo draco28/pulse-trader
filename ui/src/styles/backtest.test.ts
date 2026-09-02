@@ -37,11 +37,31 @@ const backtestCss: string = fs.readFileSync(
 
 import { describe, expect, it } from "vitest";
 
-/** The body of a `{ ... }` block for a selector, or null when absent. */
-function block(selector: string): string | null {
+/** The body of the first `{ ... }` block after `selector` in `css`, brace-balanced,
+ * or null when the selector is absent. At-rule bodies (`@media … { … }`) hold
+ * NESTED rules, so stopping at the first `}` would return only the first nested
+ * rule and silently make every later assertion order-dependent within the block;
+ * this walks to the MATCHING closing brace instead. */
+function blockOf(css: string, selector: string): string | null {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = backtestCss.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
-  return match === null ? null : match[1];
+  const match = css.match(new RegExp(`${escaped}\\s*\\{`));
+  if (match === null || match.index === undefined) return null;
+  const open = match.index + match[0].length;
+  let depth = 1;
+  for (let i = open; i < css.length; i++) {
+    if (css[i] === "{") depth++;
+    else if (css[i] === "}") {
+      depth--;
+      if (depth === 0) return css.slice(open, i);
+    }
+  }
+  // Unterminated block: malformed CSS is a failure, not an implicit full-tail.
+  return null;
+}
+
+/** The body of a `{ ... }` block in the sheet under test, or null when absent. */
+function block(selector: string): string | null {
+  return blockOf(backtestCss, selector);
 }
 
 /** A `--var: value;` assignment inside a block, or null when absent. */
@@ -137,5 +157,51 @@ describe("backtest.css (pinned accessibility content)", () => {
     expect(print).not.toBeNull();
     expect(print).toContain(".bt-twin");
     expect(print).toMatch(/position\s*:\s*static/);
+  });
+});
+
+describe("blockOf (the extractor the pins above stand on)", () => {
+  // The controls the pinned suites cannot give themselves: the extractor must
+  // return a WHOLE at-rule body — every nested rule, whatever their order —
+  // because the old first-`}` cut made each @media pin pass only while its
+  // target declaration happened to sit in the first nested rule.
+
+  it("returns the whole at-rule body, not just the first nested rule", () => {
+    const nested = [
+      "@media (prefers-reduced-motion: reduce) {",
+      "  .bt-lab { transition: none; }",
+      "  .bt-chart { animation: none; }",
+      "}",
+    ].join("\n");
+    const body = blockOf(nested, "@media (prefers-reduced-motion: reduce)");
+    expect(body).not.toBeNull();
+    expect(body).toContain("transition: none");
+    // The second nested rule: exactly what a first-`}` cut drops.
+    expect(body).toContain(".bt-chart");
+    expect(body).toContain("animation: none");
+  });
+
+  it("is order-independent inside the at-rule body", () => {
+    const reordered = [
+      "@media print {",
+      "  .bt-lab { position: static; }",
+      "  .bt-twin { display: block; }",
+      "}",
+    ].join("\n");
+    const body = blockOf(reordered, "@media print");
+    expect(body).not.toBeNull();
+    expect(body).toContain(".bt-twin");
+    expect(body).toContain("position: static");
+  });
+
+  it("returns null for an absent selector, and for an unterminated block", () => {
+    expect(blockOf(".bt-absent { color: red; }", ".bt-elsewhere")).toBeNull();
+    // A missing closing brace must fail closed (null), never swallow the tail.
+    expect(blockOf(".bt-broken { color: red;", ".bt-broken")).toBeNull();
+  });
+
+  it("still returns the plain body of a non-nested rule", () => {
+    const flat = ".bt-col { min-width: 24px; }";
+    expect(blockOf(flat, ".bt-col")).toBe(" min-width: 24px; ");
   });
 });
