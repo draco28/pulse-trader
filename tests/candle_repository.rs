@@ -22,7 +22,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pulse::{
     Candle, CandleSeries, CandleSeriesRepository, CandleStore, DataError, DataVersion, Pair,
@@ -30,6 +30,9 @@ use pulse::{
 };
 use rust_decimal::Decimal;
 use tempfile::TempDir;
+
+mod source_scan;
+use source_scan::{blank_comments, read_source};
 
 /// One M15 bar in milliseconds.
 const M15_MS: i64 = 900_000;
@@ -449,77 +452,6 @@ const CONSUMER_MODULES: [&str; 3] = [
     "src/cli/indicators.rs",
     "src/cli/backtest.rs",
 ];
-
-fn read_source(relative: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-/// Blank `//` line comments and `/* */` block comments, leaving string literals
-/// intact. A doc comment that merely *mentions* `CandleStore` is prose, not a
-/// dependency — scanning raw source would fail on the module docs that explain
-/// the boundary.
-fn blank_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_line_comment = false;
-    let mut block_depth = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(c) = chars.next() {
-        if in_line_comment {
-            if c == '\n' {
-                in_line_comment = false;
-                out.push(c);
-            }
-        } else if block_depth > 0 {
-            if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                block_depth -= 1;
-            } else if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                block_depth += 1;
-            } else if c == '\n' {
-                out.push(c);
-            }
-        } else if in_string {
-            out.push(c);
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-        } else if c == '"' {
-            in_string = true;
-            out.push(c);
-        } else if c == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            in_line_comment = true;
-        } else if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            block_depth = 1;
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-#[test]
-fn blank_comments_strips_comments_and_keeps_code() {
-    let src = "// CandleStore in a line comment\nlet x = 1; /* CandleStore in a block */\nlet s = \"CandleStore in a string\";\n";
-    let code = blank_comments(src);
-    assert!(!code.contains("CandleStore in a line comment"));
-    assert!(!code.contains("CandleStore in a block"));
-    assert!(
-        code.contains("CandleStore in a string"),
-        "string literals are code, not comments: {code}"
-    );
-    assert!(code.contains("let x = 1;"), "code survives: {code}");
-}
 
 #[test]
 fn consumer_modules_depend_on_the_port_not_the_concrete_store() {
