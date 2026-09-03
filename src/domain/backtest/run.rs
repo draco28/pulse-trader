@@ -29,8 +29,76 @@ use serde::{Deserialize, Serialize};
 
 use super::regime::RegimeBreakdown;
 use super::stats::SummaryStats;
+use crate::domain::pair::Pair;
 use crate::domain::sizing::SkippedEntryCounts;
 use crate::domain::strategy::VersionId;
+use crate::domain::timeframe::Timeframe;
+use crate::domain::version::DataVersion;
+
+/// One immutable candle snapshot a run consumed: which timeframe, and which exact
+/// content-addressed version of it (r1.s3.w2, #110).
+///
+/// It names a `data_version`, never `HEAD`. `HEAD` is a mutable pointer that
+/// `fetch-data` advances, so recording it would record "whatever is current when
+/// someone asks" — which is the bug this type exists to close. ADR-0009's identity
+/// is immutable, so this selection resolves to the same bytes forever.
+///
+/// `Eq` is derivable here (unlike [`PersistedRun`]) — no `f64` anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSelection {
+    /// The candle interval this snapshot holds.
+    pub timeframe: Timeframe,
+    /// The exact immutable snapshot identity (ADR-0009's content hash).
+    pub data_version: DataVersion,
+}
+
+/// How a run sourced its funding rates (r1.s3.w2, #110).
+///
+/// **One variant on purpose, and a real type rather than a string.** The engine
+/// reads funding off the loaded snapshot's `funding_rate` and r1 offers no
+/// alternative, so this records existing behaviour rather than adding a control the
+/// product does not have. It is still a typed discriminant: the column has to carry
+/// *something*, and a bare domain `String` is the shape that quietly stays untyped
+/// when a second source (a configured flat rate, a funding-free mode) arrives.
+/// Fail-closed read decoding rejects any token that is not a known variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingConfig {
+    /// Funding accrues from the rates embedded in the loaded candle snapshot.
+    SnapshotRates,
+}
+
+/// Everything a persisted run CONSUMED (r1.s3.w2, #110).
+///
+/// [`PersistedRun`] has always recorded what a run produced: `engine_fingerprint`
+/// pinned the engine and `result_content_hash` detected tampering with the result.
+/// Neither pinned the *data*, so once `HEAD` advanced nothing identified which
+/// snapshot produced a stored row, and the reproducibility claim rested on a link
+/// that was not stored. These are that link.
+///
+/// One shared [`Pair`] (a run is single-pair), one required primary selection, one
+/// optional HTF selection, the exact cost bps the engine ran with — settings, not
+/// the `fees_total` / `slippage_total` OUTCOMES already on the run — and the
+/// funding discriminant.
+///
+/// `Eq` is derivable here (unlike [`PersistedRun`]) — every field is `Eq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BacktestInputs {
+    /// The single trading pair the run used.
+    pub pair: Pair,
+    /// The primary timeframe's exact snapshot.
+    pub primary: SnapshotSelection,
+    /// The higher timeframe's exact snapshot, when the run used one. `None` is a
+    /// genuine single-timeframe run, not missing data — the debug CLI may omit
+    /// `--htf`, while the r1 app path always records M15+H4.
+    pub htf: Option<SnapshotSelection>,
+    /// Taker fee in basis points, exactly as passed to the engine.
+    pub taker_fee_bps: Decimal,
+    /// Adverse-fill slippage in basis points, exactly as passed to the engine.
+    pub slippage_bps: Decimal,
+    /// How funding rates were sourced.
+    pub funding: FundingConfig,
+}
 
 /// Identifier of a persisted [`PersistedRun`] — a `#[serde(transparent)]`
 /// `String` newtype (mirror [`StrategyId`](crate::domain::strategy::StrategyId) /
@@ -74,6 +142,16 @@ pub struct PersistedRun {
     pub id: BacktestRunId,
     /// The `strategy_version` this run was produced against (FK).
     pub strategy_version_id: VersionId,
+    /// What the run CONSUMED (r1.s3.w2, #110): the pair, the exact primary and
+    /// optional HTF snapshot identities, and the cost/funding configuration.
+    ///
+    /// `None` **only** for a row written before migration `0006`, whose eight
+    /// provenance columns are all NULL. Those rows cannot be backfilled truthfully
+    /// and ADR-0018 forbids rewriting immutable records with invented facts, so
+    /// they read back as an explicit "provenance unavailable" rather than a guess.
+    /// Every fresh save carries `Some`; a partially-populated row is a read error,
+    /// never a partially-trusted projection.
+    pub inputs: Option<BacktestInputs>,
     /// The run-row schema tag (#68 / D1b) — `RUN_SCHEMA_VERSION` for a v1 row.
     pub schema_version: i64,
     /// The injected-Clock run timestamp (RFC3339 UTC ms text on the column; D7).

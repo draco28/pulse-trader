@@ -76,7 +76,9 @@ pub use backtest::{EquityCurve, EquityPoint, SummaryStats};
 // projections the `BacktestRunRepository` port returns; re-exported so `lib.rs`
 // can curate the crate surface — an un-re-exported public domain type is a
 // `dead_code` BUILD error under `deny(warnings)`.
-pub use backtest::{BacktestRunId, PersistedRun, RunSummary};
+pub use backtest::{
+    BacktestInputs, BacktestRunId, FundingConfig, PersistedRun, RunSummary, SnapshotSelection,
+};
 pub use candle::Candle;
 pub use clock::Clock;
 // VS-1.1.3 work-3.01: the streaming `Indicator` port (FR-5) — the seam every
@@ -123,8 +125,8 @@ pub use pair::Pair;
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, CoachingRepository, ExchangeAdapter, LlmCallRepository, LlmProvider,
-    MarketDataSource, StrategyRepository,
+    BacktestRunRepository, CandleSeriesRepository, CoachingRepository, ExchangeAdapter,
+    LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
 };
 // VS-1.3.2 slice-close FIX C: the shared secret-token heuristic. `pub(crate)` (an
 // internal cross-ring utility, not a public API surface) — used by the composer
@@ -166,7 +168,7 @@ pub use llm_call::{LlmCall, LlmCallId};
 // NOT re-exported — it bypasses the exchange constraints, so it stays
 // crate-internal (used only by `compute_position_size` + the in-module proptests).
 pub use exchange::ExchangeError;
-pub use series::{CandleSeries, Gap};
+pub use series::{CandleSeries, Gap, StoredCandleSeries};
 pub use sizing::{
     SizingOutcome, SkipReason, SkippedEntryCounts, SymbolFilters, compute_position_size,
 };

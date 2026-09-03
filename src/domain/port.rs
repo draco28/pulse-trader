@@ -1,6 +1,11 @@
 //! Domain ports — the hexagonal seams the outer rings implement.
 //!
 //! - [`MarketDataSource`] — historical/incremental candle data (WI-02 onward).
+//! - [`CandleSeriesRepository`] — the candle-snapshot persistence port (r1.s3.w1,
+//!   #112); `CandleStore` (`adapters/store`) implements it, and the fetch,
+//!   indicator and backtest use cases consume it generically. Synchronous, unlike
+//!   its siblings, because its only implementor is. It closes ADR-0015's one
+//!   named hexagonal exception.
 //! - [`StrategyRepository`] — the strategy-tree persistence port (VS-1.1.4,
 //!   FR-4 / FR-11); the `sqlx` adapter (1.03) implements it, the CLI (1.05) and
 //!   agent layer consume it generically (`<R: StrategyRepository>`).
@@ -25,7 +30,9 @@
 use std::future::Future;
 
 use crate::domain::backtest::SummaryStats;
-use crate::domain::backtest::{BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade};
+use crate::domain::backtest::{
+    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade,
+};
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{CoachingSession, CoachingSessionId, Disposition};
 use crate::domain::error::DataError;
@@ -33,10 +40,11 @@ use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
 use crate::domain::llm_call::{LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
-use crate::domain::series::CandleSeries;
+use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
 use crate::domain::strategy::{NewVersion, Strategy, StrategyId, StrategyVersion, VersionId};
 use crate::domain::timeframe::Timeframe;
+use crate::domain::version::DataVersion;
 use rust_decimal::Decimal;
 
 /// The exchange-metadata port (VS-1.2.2, FR-5 / NFR-3) — audit C3 / C5.
@@ -91,6 +99,89 @@ pub trait MarketDataSource {
         tf: Timeframe,
         since_ms: i64,
     ) -> impl Future<Output = Result<Vec<Candle>, DataError>> + Send;
+}
+
+/// The candle-snapshot persistence port (r1.s3.w1, #112).
+///
+/// ADR-0015 named exactly one hexagonal exception: candle storage had no port, so
+/// the fetch, indicator and backtest use cases imported and constructed the
+/// concrete `CandleStore` adapter. This trait closes that exception. The Parquet
+/// adapter implements it; the use cases consume it generically
+/// (`<R: CandleSeriesRepository>`), never as `dyn`, and only `src/cli/mod.rs` (the
+/// composition root) still chooses a concrete implementation.
+///
+/// **Synchronous, unlike the sibling ports.** The only implementor is the existing
+/// synchronous Parquet adapter, and the debug CLI already drives it that way;
+/// stating `async` here would buy nothing and force every consumer into a runtime
+/// it does not need. Offloading the blocking read from a Tauri command is `r1.s3`'s
+/// `w3` problem, not this port's.
+///
+/// **Deep, not shallow (ADR-0012).** Three semantic operations, and deliberately
+/// no content-version, path, encode, raw HEAD-write, provenance-decoder, existence,
+/// latest-version or temp-file method. Those are adapter internals — re-exposing
+/// them here would recreate `CandleStore` as a trait and close nothing.
+pub trait CandleSeriesRepository {
+    /// Load the current snapshot for `(pair, timeframe)` — the `HEAD` pointer and
+    /// the exact snapshot it names, resolved as ONE caller operation.
+    ///
+    /// `Ok(None)` means no `HEAD` exists yet (a first run, before anything was
+    /// committed). A `HEAD` that names an absent or unreadable snapshot is an
+    /// **error**, never `Ok(None)`: "nothing here yet" and "the pointer is broken"
+    /// are different facts and a caller must not confuse them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when `HEAD` is unreadable or malformed, or when the
+    /// snapshot it names is absent or cannot be decoded.
+    fn load_head(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+    ) -> Result<Option<StoredCandleSeries>, DataError>;
+
+    /// Load precisely the immutable snapshot identified by `version`.
+    ///
+    /// It never falls back to `HEAD`: an unknown version is an error, because a
+    /// caller asking for an exact identity (a replayed run, a provenance check)
+    /// is worse served by silently different data than by a refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when no snapshot exists for `version` or it cannot be
+    /// decoded.
+    fn load_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> Result<StoredCandleSeries, DataError>;
+
+    /// Publish `candles` as the current snapshot for `(pair, timeframe)`.
+    ///
+    /// There is **no version parameter**: the repository derives the canonical
+    /// identity (ADR-0009's content hash) from the content itself, constructs the
+    /// series and validates it. A caller-supplied identity that disagrees with the
+    /// content is therefore unrepresentable rather than merely rejected.
+    ///
+    /// For a non-empty commit the immutable snapshot is written/reconciled
+    /// **first** and `HEAD` advanced **second** (ADR-0018's crash-safe ordering), and
+    /// `storage_location` is `Some(..)`. A failure to advance `HEAD` returns an
+    /// error and may leave an already-valid orphan snapshot behind — the existing
+    /// contract, preserved.
+    ///
+    /// For **zero** candles nothing is written, `HEAD` is left exactly where it was,
+    /// and the derived identity comes back with `storage_location: None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] on a structurally invalid series, a same-identity
+    /// different-content collision, or any storage failure.
+    fn commit(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: Vec<Candle>,
+    ) -> Result<StoredCandleSeries, DataError>;
 }
 
 /// The strategy-tree persistence port (VS-1.1.4, FR-4 / FR-11).
@@ -263,9 +354,25 @@ pub trait BacktestRunRepository {
     /// Persist a finished run + all its trades (FR-6, #39 ownership-on-write).
     ///
     /// Asserts the `strategy_version_id` row exists (FK + an explicit `SELECT 1`
-    /// guard INSIDE the transaction); INSERTs the run + every trade + reads the
-    /// run header back in ONE transaction; stores the `result_content_hash`. The
+    /// guard INSIDE the transaction), then INSERTs the run + every trade in that
+    /// ONE transaction and commits; stores the `result_content_hash`. The
     /// `created_at` is sourced from the injected `Clock`.
+    ///
+    /// **It returns the minted id and reads nothing back (r1.s3.w3).** A read after
+    /// the commit is not part of the transaction — it runs on another connection —
+    /// and an implementation that failed there could only report a bare error,
+    /// discarding the id of a row that already exists. A caller that wants the
+    /// persisted projection calls [`get_run`](Self::get_run) itself, with the id in
+    /// hand, and can therefore say "saved, but unreadable" rather than "failed".
+    ///
+    /// **`inputs` is required, not optional (r1.s3.w2, #110).** A fresh run must
+    /// name the pair, the exact primary and optional HTF snapshot identities, and
+    /// the cost/funding configuration it actually ran with. The `Option` on
+    /// [`PersistedRun::inputs`] is a READ-side accommodation for rows written
+    /// before migration `0006`, never a write-side choice. Requiring the value —
+    /// no `Option` in this signature — is what makes "a fresh run with no
+    /// provenance" unrepresentable at the port, before the database trigger has to
+    /// catch it.
     ///
     /// # Errors
     ///
@@ -275,6 +382,7 @@ pub trait BacktestRunRepository {
     fn save_run(
         &self,
         strategy_version_id: &VersionId,
+        inputs: &BacktestInputs,
         result: &BacktestResult,
         summary: &SummaryStats,
         starting_equity: Decimal,
@@ -898,10 +1006,14 @@ mod repository_tests {
 mod backtest_run_repository_tests {
     use super::BacktestRunRepository;
     use crate::domain::backtest::{
-        BacktestResult, BacktestRunId, PersistedRun, RunSummary, SummaryStats, Trade,
+        BacktestInputs, BacktestResult, BacktestRunId, FundingConfig, PersistedRun, RunSummary,
+        SnapshotSelection, SummaryStats, Trade,
     };
     use crate::domain::error::DataError;
+    use crate::domain::pair::Pair;
     use crate::domain::strategy::VersionId;
+    use crate::domain::timeframe::Timeframe;
+    use crate::domain::version::DataVersion;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::future::Future;
@@ -930,6 +1042,7 @@ mod backtest_run_repository_tests {
         fn save_run(
             &self,
             strategy_version_id: &VersionId,
+            inputs: &BacktestInputs,
             result: &BacktestResult,
             summary: &SummaryStats,
             starting_equity: Decimal,
@@ -938,6 +1051,10 @@ mod backtest_run_repository_tests {
             let persisted = PersistedRun {
                 id: id.clone(),
                 strategy_version_id: strategy_version_id.clone(),
+                // The fake stores what it was given: `save_run` takes inputs by
+                // value, so a fresh run with no provenance is unrepresentable here
+                // too, not merely rejected by the database.
+                inputs: Some(inputs.clone()),
                 schema_version: 1,
                 created_at: "2026-06-30T00:00:00.000Z".to_owned(),
                 engine_fingerprint: result.engine_fingerprint.as_str().to_owned(),
@@ -1043,9 +1160,21 @@ mod backtest_run_repository_tests {
             summary: SummaryStats::default(),
             equity_curve: crate::domain::backtest::EquityCurve::default(),
         };
+        let inputs = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("v-primary"),
+            },
+            htf: None,
+            taker_fee_bps: Decimal::new(4, 0),
+            slippage_bps: Decimal::new(1, 0),
+            funding: FundingConfig::SnapshotRates,
+        };
         let id = repo
             .save_run(
                 &version_id,
+                &inputs,
                 &result,
                 &SummaryStats::default(),
                 Decimal::ZERO,

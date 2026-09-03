@@ -10,6 +10,11 @@ pub(crate) mod domain;
 
 mod adapters;
 mod agent;
+// r1.s3.w3: the application ring — use cases shared by the CLI and the desktop
+// command. Private like `adapters`; `lib.rs` curates what crosses the crate
+// boundary, and the composition roots (`cli::mod`, `tauri::commands::DesktopState`)
+// choose the implementations it is generic over.
+mod application;
 mod cli;
 // r1.s1.w1 (ADR-0020): the argv dispatch that decides GUI vs CLI. Kept OUT of
 // `cli` on purpose -- it runs BEFORE any surface is chosen, so it cannot live
@@ -27,6 +32,13 @@ pub use domain::{
     CANDLE_SCHEMA_VERSION, Candle, CandleSeries, Clock, DataError, DataVersion, Gap,
     MarketDataSource, Pair, Timeframe, ValidationError,
 };
+
+// r1.s3.w1 (#112): the candle-snapshot persistence port + the value it returns.
+// Re-exported beside `CandleStore` so the contract target
+// (`tests/candle_repository.rs`) can drive BOTH a zero-I/O double and the real
+// Parquet adapter through the same bound — which is what proves the port, not the
+// adapter, is what the use cases depend on (ADR-0015's named exception, closed).
+pub use domain::{CandleSeriesRepository, StoredCandleSeries};
 
 // VS-1.2.3 work-3.01: the build-time `EngineFingerprint` domain newtype (FR-7 /
 // NFR-2). `current()` is the sha2-256 hex baked in by `build.rs`; `target()` is the
@@ -377,7 +389,24 @@ pub use domain::{EquityCurve, EquityPoint, SummaryStats};
 // REQUIRED under `deny(warnings)` + `pub(crate) mod domain` — an un-re-exported
 // public domain type is a `dead_code` build error, not a warning. 4.05's CLI
 // consumes `save_run`/`get_run`/`latest_run_for_version` through the port.
-pub use domain::{BacktestRunId, BacktestRunRepository, PersistedRun, RunSummary};
+// r1.s3.w2 (#110): the durable INPUT provenance value types ride the same
+// re-export (an un-re-exported public domain type is a `dead_code` BUILD error
+// under `deny(warnings)`), so `tests/backtest_provenance.rs` and W3's DTO can
+// name them.
+pub use domain::{
+    BacktestInputs, BacktestRunId, BacktestRunRepository, FundingConfig, PersistedRun, RunSummary,
+    SnapshotSelection,
+};
+
+// r1.s3.w3: the shared version-id backtest use case (#110's consumer, ledger line
+// `d11`). Re-exported because `tests/tauri_backtest.rs` injects post-save read
+// failures through the real ports, and because the desktop adapter maps this exact
+// error taxonomy onto `BusError`. The module itself stays private.
+pub use application::backtest::{
+    BacktestAppError, BacktestOutcome, BacktestRequest, HISTOGRAM_BIN_COUNT,
+    HISTOGRAM_BIN_WIDTH_STR, Histogram, HistogramBin, ReadBackFailure, ReadBackStage,
+    histogram_bin_width, project_histogram, run_version_backtest,
+};
 
 // VS-1.3.1 work-1.01: the LLM domain ring (FR-23 / FR-24, README C1–C5). The
 // PulseTrader-OWNED `LlmProvider` port + the message/response/usage/config value
@@ -485,11 +514,13 @@ pub use entry::{LaunchMode, launch_mode, launch_mode_from_env};
 // `mod tauri` -- a `pub` item unused outside its private module is a `dead_code` BUILD
 // error, not a warning (the harvested gotcha).
 pub use crate::tauri::{
-    BUS_COMMANDS, BusError, BusErrorCode, BusEvent, BusEventPayload, ComposeDeps,
-    ComposeDslSummary, ComposeResult, ComposeStrategySummary, DesktopState, DslSummary, EventSink,
-    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RunId, ShellInfo,
-    StreamOutcome, VersionStats, compose_strategy_core, demo_stream_core, export_bindings,
-    library_overview_core, run_desktop, shell_info_core,
+    BUS_COMMANDS, BacktestRunDto, BacktestRunRequest, BusError, BusErrorCode, BusEvent,
+    BusEventPayload, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
+    DesktopState, DslSummary, EquityPointDto, EventSink, HistogramBinDto, HistogramDto,
+    LibraryOverview, LibraryRunSummary, LibraryStrategy, LibraryVersion, RegimeCellDto, RunId,
+    ShellInfo, StreamOutcome, TradeRowDto, VersionStats, backtest_run_dto, compose_strategy_core,
+    demo_stream_core, export_bindings, library_overview_core, run_backtest_version_core,
+    run_desktop, shell_info_core,
 };
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).

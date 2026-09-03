@@ -19,7 +19,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::domain::CANDLE_SCHEMA_VERSION;
-use crate::domain::{Candle, CandleSeries, DataError, DataVersion, Pair, Timeframe};
+use crate::domain::{
+    Candle, CandleSeries, CandleSeriesRepository, DataError, DataVersion, Pair, StoredCandleSeries,
+    Timeframe,
+};
 
 /// The per-`(pair,tf)` `HEAD` pointer file name (audit C6 — a bare file holding
 /// the current `data_version`).
@@ -154,7 +157,13 @@ impl CandleStore {
     ///
     /// # Errors
     ///
-    /// Returns [`DataError`] if the snapshot is absent or cannot be decoded.
+    /// Returns [`DataError`] if the snapshot is absent, cannot be decoded, or
+    /// fails the stored-content guard: the bytes at `<version>.parquet` must
+    /// still *be* that version — embedded provenance naming the requested tag,
+    /// and candles re-hashing to it — so a file replaced or edited under a
+    /// surviving name is a [`DataError::Parse`], never a clean decode of the
+    /// wrong data (the read-side twin of [`Self::write_snapshot`]'s mismatch
+    /// refusal).
     pub fn read_snapshot(
         &self,
         pair: &Pair,
@@ -165,6 +174,33 @@ impl CandleStore {
         let bytes =
             fs::read(&path).map_err(|e| io(&format!("read snapshot {}", path.display()), &e))?;
         let candles = parquet::decode_candles(&bytes)?;
+        // Stored-content guard (#6): the store is content-addressed, so the file
+        // at `<version>.parquet` is only that version if the file itself says so.
+        // Without this, a snapshot replaced with another valid Parquet payload
+        // (rename, copy, restore-from-backup mixup) would decode cleanly while the
+        // caller keeps the requested identity — and a run would replay different
+        // market data under the old content hash. Two checks: the embedded
+        // provenance tag (a swapped whole file trips this), then the re-derived
+        // content hash under the snapshot's own schema version (an edit that also
+        // forged the provenance trips this).
+        let provenance = parquet::decode_provenance(&bytes)?;
+        if provenance.data_version != version.as_str() {
+            return Err(DataError::Parse(format!(
+                "snapshot at {} is not version {version}: its embedded provenance names {} \
+                 (the file was replaced or renamed; the store is content-addressed)",
+                path.display(),
+                provenance.data_version
+            )));
+        }
+        let derived =
+            Self::content_version_with_schema(pair, tf, provenance.schema_version, &candles);
+        if &derived != version {
+            return Err(DataError::Parse(format!(
+                "snapshot at {} does not hash to its requested version {version}: the candles \
+                 re-derive to {derived} (the file was edited; the store is content-addressed)",
+                path.display()
+            )));
+        }
         Ok(CandleSeries {
             pair: pair.clone(),
             timeframe: tf,
@@ -245,7 +281,10 @@ impl CandleStore {
     /// # Errors
     ///
     /// Returns [`DataError::Io`] on a filesystem error other than absence, or
-    /// [`DataError::Parse`] if the pointer body is empty or not valid UTF-8.
+    /// [`DataError::Parse`] if the pointer body is empty, not valid UTF-8, or is
+    /// not a safe single path component — a stored tag is joined verbatim into
+    /// the snapshot path by [`CandleSeriesRepository::load_head`], so it crosses
+    /// the trust boundary `DataVersion::parse` guards.
     pub fn read_head(&self, pair: &Pair, tf: Timeframe) -> Result<Option<DataVersion>, DataError> {
         let path = self.head_path(pair, tf);
         match fs::read(&path) {
@@ -259,7 +298,13 @@ impl CandleStore {
                         path.display()
                     )));
                 }
-                Ok(Some(DataVersion::new(tag)))
+                // The tag came off disk, not from this store's hash derivation, so
+                // it takes the checked constructor: `DataVersion::new` here would
+                // let a corrupted or hand-edited `HEAD` (`../../tmp/other`) reach
+                // `snapshot_path`'s join unchecked.
+                DataVersion::parse(tag)
+                    .map(Some)
+                    .map_err(|e| DataError::Parse(format!("HEAD at {}: {e}", path.display())))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io(&format!("read HEAD {}", path.display()), &e)),
@@ -300,6 +345,90 @@ impl CandleStore {
             }
         }
         Ok(newest.map(|(_, v)| v))
+    }
+
+    /// The display locator this adapter reports for a persisted snapshot: the
+    /// snapshot's ABSOLUTE path (ADR-0017 — the debug CLI's `path` field is locked
+    /// to it). Owned, and converted here so the domain never sees a `PathBuf`.
+    fn locator(&self, pair: &Pair, tf: Timeframe, version: &DataVersion) -> String {
+        self.snapshot_path(pair, tf, version).display().to_string()
+    }
+}
+
+/// The [`CandleSeriesRepository`] implementation (r1.s3.w1, #112) — three semantic
+/// operations composed from the inherent primitives above, which stay public for
+/// focused adapter tests and tooling. No hash, Parquet codec, path layout or
+/// atomic-write helper moves into the domain; only these three behaviours cross.
+impl CandleSeriesRepository for CandleStore {
+    fn load_head(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+    ) -> Result<Option<StoredCandleSeries>, DataError> {
+        let Some(version) = self.read_head(pair, timeframe)? else {
+            // No HEAD yet: a first run, not a fault.
+            return Ok(None);
+        };
+        // A HEAD that names an absent or corrupt snapshot propagates the read
+        // error — it must NOT collapse into `Ok(None)`, which would read as
+        // "nothing stored yet" and silently trigger a full re-fetch.
+        self.load_version(pair, timeframe, &version).map(Some)
+    }
+
+    fn load_version(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        version: &DataVersion,
+    ) -> Result<StoredCandleSeries, DataError> {
+        let series = self.read_snapshot(pair, timeframe, version)?;
+        Ok(StoredCandleSeries {
+            storage_location: Some(self.locator(pair, timeframe, version)),
+            series,
+        })
+    }
+
+    fn commit(
+        &self,
+        pair: &Pair,
+        timeframe: Timeframe,
+        candles: Vec<Candle>,
+    ) -> Result<StoredCandleSeries, DataError> {
+        // Identity is DERIVED here, from the content (ADR-0009). The port takes no
+        // version argument, so a caller cannot state a stale or wrong one.
+        let version = Self::content_version(pair, timeframe, &candles);
+        let series = CandleSeries {
+            pair: pair.clone(),
+            timeframe,
+            version,
+            candles,
+        };
+        // Structural corruption (unsorted / duplicate `open_time`) is refused here
+        // rather than at encode time; reported gaps are information, not a failure
+        // (audit C2), so they are deliberately dropped.
+        series.validate()?;
+
+        if series.candles.is_empty() {
+            // The existing zero-candle first-run outcome: write no snapshot, leave
+            // HEAD untouched (else the next run reads an empty prior and back-fills
+            // from epoch), and report the derived identity with no locator.
+            return Ok(StoredCandleSeries {
+                series,
+                storage_location: None,
+            });
+        }
+
+        // Snapshot FIRST (atomic temp→rename), HEAD SECOND (atomic) — audit C1 /
+        // ADR-0018. A crash between the two leaves a valid orphan and a consistent
+        // HEAD, and a HEAD-write failure surfaces as an error with the orphan in
+        // place, which is the pre-existing contract.
+        self.write_snapshot(&series)?;
+        self.write_head(pair, timeframe, &series.version)?;
+        let storage_location = Some(self.locator(pair, timeframe, &series.version));
+        Ok(StoredCandleSeries {
+            series,
+            storage_location,
+        })
     }
 }
 
@@ -386,14 +515,16 @@ fn parent_of(path: &Path) -> Result<&Path, DataError> {
 }
 
 /// Extract the `data_version` from a `<version>.parquet` file path, skipping
-/// hidden temp files and non-parquet entries.
+/// hidden temp files, non-parquet entries, and stems that fail the path-safety
+/// rule (a directory listing is stored input like `HEAD` is, so the tag goes
+/// through `DataVersion::parse`, not the unchecked constructor).
 fn snapshot_version_of(path: &Path) -> Option<DataVersion> {
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.') {
         return None;
     }
     let stem = name.strip_suffix(".parquet")?;
-    Some(DataVersion::new(stem))
+    DataVersion::parse(stem).ok()
 }
 
 /// Two snapshots are content-equivalent if their writer-normalized bytes match

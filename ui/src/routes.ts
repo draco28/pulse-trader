@@ -34,6 +34,8 @@ import type { ReactNode } from "react";
 // `element: () => <DesignerScreen />` literal would.
 import { createElement } from "react";
 
+import BacktestLabScreen from "./screens/BacktestLabScreen";
+
 import DesignerScreen from "./screens/DesignerScreen";
 
 import LibraryScreen from "./screens/LibraryScreen";
@@ -85,6 +87,17 @@ export const ROUTES: readonly Route[] = [
     title: "Strategy Designer",
     nav: "designer",
     element: () => createElement(DesignerScreen),
+  },
+  // r1.s3.w4: the Backtest Lab goes live the same way — one appended entry
+  // and the existing `backtest` nav row's derived "Soon" badge disappears on
+  // its own (`isNavBuilt`, G8), with zero nav-side edits. `details` stays
+  // unset: the screen is single-track (provenance band → result), not a
+  // two-pane reader like the Library.
+  {
+    path: "/backtest",
+    title: "Backtest Lab",
+    nav: "backtest",
+    element: BacktestLabScreen,
   },
 ];
 

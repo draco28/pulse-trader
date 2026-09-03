@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::ComposerError;
+use crate::application::backtest::BacktestAppError;
 use crate::domain::{BacktestError, DataError, ExchangeError, LlmError, ValidationErrors};
 
 /// Which family a [`BusError`] came from — a closed set the frontend can branch on.
@@ -49,21 +50,49 @@ pub enum BusErrorCode {
 
 /// The single serializable error shape that crosses the Tauri boundary.
 ///
-/// Two fields, always both present, so the TypeScript type generated from this struct
-/// describes every error the frontend can receive.
+/// **Three fields, always all present** (r1.s3.w3 added `run_id`), so the TypeScript
+/// type generated from this struct describes every error the frontend can receive and
+/// one rendering path handles all of them. An ordinary error serializes
+/// `run_id: null` — the field is never skipped, because a field that sometimes
+/// vanishes reaches TypeScript as `undefined` while its generated type says
+/// `string | null`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct BusError {
     /// The family this error came from.
     pub code: BusErrorCode,
     /// The source error's `Display` rendering — prose, safe to show a user.
     pub message: String,
+    /// The id of a backtest run that **is persisted** despite this error
+    /// (r1.s3.w3).
+    ///
+    /// `Some` only when a run was saved and something afterwards could not be read
+    /// back. The message says so too, but a screen must not have to parse prose to
+    /// tell a user "your run is saved, here is its id" — so the id crosses the bus
+    /// as a field. `None` for every other error, including a save that never
+    /// committed: reporting an id for a row that does not exist would be worse than
+    /// reporting none.
+    pub run_id: Option<String>,
 }
 
 impl BusError {
     /// Construct a [`BusError`] directly. Prefer the `From` impls for domain errors.
     #[must_use]
     pub fn new(code: BusErrorCode, message: String) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            run_id: None,
+        }
+    }
+
+    /// The same, for an error that a persisted run survives (r1.s3.w3).
+    #[must_use]
+    pub fn with_run_id(code: BusErrorCode, message: String, run_id: String) -> Self {
+        Self {
+            code,
+            message,
+            run_id: Some(run_id),
+        }
     }
 
     /// A shell-level failure that is not a domain error family.
@@ -104,6 +133,39 @@ bus_error_from! {
     ExchangeError => BusErrorCode::Exchange,
     LlmError => BusErrorCode::Llm,
     ComposerError => BusErrorCode::Composer,
+}
+
+/// The application ring's backtest failures (r1.s3.w3).
+///
+/// Hand-written rather than macro-generated because this is the one family where the
+/// mapping is not "one type, one code": the variants fan out across four existing
+/// codes, and exactly one of them additionally carries a run id. **No new
+/// `BusErrorCode` variant is added** — the code set is a closed discriminant every
+/// existing screen already branches on, and "saved but unreadable" is a `data`
+/// failure that happens to know something extra, not a new family.
+impl From<BacktestAppError> for BusError {
+    fn from(err: BacktestAppError) -> Self {
+        let code = match &err {
+            BacktestAppError::DslInvalid(_) | BacktestAppError::CompileFailed(_) => {
+                BusErrorCode::Validation
+            }
+            BacktestAppError::ExchangeFilters(_) => BusErrorCode::Exchange,
+            BacktestAppError::Engine(_) => BusErrorCode::Backtest,
+            BacktestAppError::Internal(_) => BusErrorCode::Internal,
+            BacktestAppError::VersionNotFound(_)
+            | BacktestAppError::SnapshotMissing { .. }
+            | BacktestAppError::SeriesGapped { .. }
+            | BacktestAppError::PreSaveRead { .. }
+            | BacktestAppError::Persist(_)
+            | BacktestAppError::SavedButReadBackFailed { .. } => BusErrorCode::Data,
+        };
+        let run_id = err.persisted_run_id().map(|id| id.as_str().to_owned());
+        let message = err.to_string();
+        match run_id {
+            Some(run_id) => Self::with_run_id(code, message, run_id),
+            None => Self::new(code, message),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -49,6 +49,14 @@ use chrono::SecondsFormat;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::adapters::backtest::BacktestConfig;
+use crate::adapters::broker::BinanceAdapter;
+use crate::adapters::store::CandleStore;
+use crate::application::backtest::{BacktestRequest, run_version_backtest};
+use crate::domain::strategy::VersionId;
+use crate::domain::{Pair, Timeframe};
+
+use super::backtest::{BacktestRunDto, BacktestRunRequest, backtest_run_dto};
 use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use super::library::{
@@ -103,6 +111,7 @@ pub const BUS_COMMANDS: &[&str] = &[
     "library_overview",
     "compose_strategy",
     "compose_cancel",
+    "run_backtest_version",
 ];
 
 // ---------------------------------------------------------------------------
@@ -122,6 +131,14 @@ pub const BUS_COMMANDS: &[&str] = &[
 /// invocation and can name the run only by id.
 pub struct DesktopState {
     db: Db,
+    /// The candle store every backtest reads through (r1.s3.w3).
+    ///
+    /// Injected here rather than resolved inside the command, for the same reason
+    /// `db` is: this struct IS the desktop composition root (ADR-0015), and the
+    /// application ring stays generic over `CandleSeriesRepository`. It is also what
+    /// lets `tests/tauri_backtest.rs` point the real command at the committed
+    /// fixture instead of the user's Application Support directory.
+    candles: CandleStore,
     /// Every compose run currently streaming → its cancellation latch (the same
     /// `Arc<AtomicBool>` [`RefusingProvider`] reads before each model turn).
     ///
@@ -141,9 +158,24 @@ impl DesktopState {
     ///
     /// Returns a [`BusError`] if the migration or the pool open fails.
     pub async fn open(path: &Path) -> Result<Self, BusError> {
+        let candles = CandleStore::with_default_base_dir()?;
+        Self::open_with_store(path, candles).await
+    }
+
+    /// Open the database at `path` against an explicit candle store.
+    ///
+    /// The production constructors resolve the platform store; this one takes it, so
+    /// a test can drive the REAL command over the committed Parquet fixture in a
+    /// temp directory. Same composition root, injected dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BusError`] if the migration or the pool open fails.
+    pub async fn open_with_store(path: &Path, candles: CandleStore) -> Result<Self, BusError> {
         let db = open_migrated(path).await?;
         Ok(Self {
             db,
+            candles,
             compose_runs: Mutex::new(HashMap::new()),
         })
     }
@@ -156,6 +188,12 @@ impl DesktopState {
     pub async fn open_default() -> Result<Self, BusError> {
         let path = default_db_path()?;
         Self::open(&path).await
+    }
+
+    /// The candle store this desktop session reads snapshots through.
+    #[must_use]
+    pub fn candles(&self) -> CandleStore {
+        self.candles.clone()
     }
 
     /// A strategy repository over the shared pool.
@@ -1150,6 +1188,65 @@ pub async fn compose_cancel(
     run_id: String,
 ) -> Result<bool, BusError> {
     Ok(state.cancel_compose_run(&run_id))
+}
+
+/// Run one persisted strategy version and answer from the row it just wrote
+/// (r1.s3.w3) — the drivable core, split from the `#[tauri::command]` wrapper so a
+/// test reaches it without a webview (the `library_overview_core` pattern).
+///
+/// **The request carries only a version id.** r1's Lab runs the fixed BTCUSDT
+/// M15+H4 / default-cost configuration; those are product defaults, and a field the
+/// user cannot vary would be a control that does not exist.
+///
+/// **A normal request/response command, not a `Channel`.** The r1 target is under
+/// five seconds, there is no meaningful progress to report, and a percentage bar
+/// over an opaque engine loop would be fiction. There is likewise no cancellation
+/// path: cancelling between the commit and the read-back would produce exactly the
+/// ambiguous half-state this item exists to eliminate.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]. When the run was saved but could not be read back, its
+/// `run_id` field carries the persisted id.
+pub async fn run_backtest_version_core(
+    state: &DesktopState,
+    request: BacktestRunRequest,
+) -> Result<BacktestRunDto, BusError> {
+    let strategies = state.strategy_repo();
+    let runs = state.backtest_run_repo();
+    let candles = state.candles();
+    let app_request = BacktestRequest {
+        version_id: VersionId::new(request.version_id),
+        pair: Pair::new("BTCUSDT"),
+        primary_timeframe: Timeframe::M15,
+        htf_timeframe: Some(Timeframe::H4),
+        config: BacktestConfig::default(),
+    };
+    let outcome = run_version_backtest(
+        &strategies,
+        &candles,
+        &BinanceAdapter::new(),
+        &runs,
+        &app_request,
+    )
+    .await?;
+    // The projection is fallible on purpose: a saved value that will not fit the wire
+    // refuses, and the refusal still names the run that exists.
+    Ok(backtest_run_dto(&outcome)?)
+}
+
+/// `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`run_backtest_version_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn run_backtest_version(
+    state: tauri::State<'_, DesktopState>,
+    request: BacktestRunRequest,
+) -> Result<BacktestRunDto, BusError> {
+    run_backtest_version_core(&state, request).await
 }
 
 #[cfg(test)]

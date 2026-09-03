@@ -39,14 +39,16 @@ use std::path::PathBuf;
 use rust_decimal::Decimal;
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
+// r1.s3.w3: the shared version-id use case. `src/cli/mod.rs` stays the composition
+// root; this module only builds the request and renders the persisted answer.
 use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::db::{Db, SqliteBacktestRunRepo, SqliteStrategyRepo};
-use crate::adapters::store::CandleStore;
+use crate::application::backtest::{BacktestOutcome, BacktestRequest, run_version_backtest};
 use crate::domain::strategy::VersionId;
 use crate::domain::{
-    BacktestResult, BacktestRunRepository, CandleSeries, CompiledStrategy, Direction,
+    BacktestResult, CandleSeries, CandleSeriesRepository, CompiledStrategy, Direction,
     EngineFingerprint, ExchangeAdapter as _, ExitReason, Migrator, Pair, Regime, StrategyDsl,
-    StrategyRepository, SummaryStats, Timeframe, Trade, compile, validate,
+    Timeframe, Trade, compile, validate,
 };
 
 use super::parse_one_tf;
@@ -138,7 +140,14 @@ pub struct BacktestArgs {
 /// validation, a compile error, an invalid pair/timeframe, a missing candle
 /// snapshot, an engine error (e.g. `NoStopLoss`), or a persistence failure. Every
 /// path surfaces a clear message + non-zero exit; nothing panics.
-pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::Result<()> {
+pub async fn run_backtest_cli<R>(
+    db: Option<&Db>,
+    repo: &R,
+    args: &BacktestArgs,
+) -> anyhow::Result<()>
+where
+    R: CandleSeriesRepository + Clone + Send + 'static,
+{
     let pair = Pair::parse(args.pair.clone())
         .map_err(|e| anyhow::anyhow!("invalid pair argument: {e}"))?;
     let tf = parse_one_tf(&args.tf)?;
@@ -160,19 +169,21 @@ pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::R
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid cost configuration: {e}"))?;
 
-    // Resolve the compiled strategy from whichever load path the args selected.
-    // The clap ArgGroup guarantees EXACTLY ONE of --dsl / --version is present.
-    let loaded = load_strategy(db, args).await?;
+    // r1.s3.w3: the `--version` path is now ONE shared use case, the same one the
+    // desktop command runs. Only `--dsl` stays here: it has no `VersionId`, so it
+    // cannot save a version-attributed run and cannot go through a flow that ends in
+    // `save_run`. It remains persistence-free and comparison-free (README C7).
+    if let Some(version) = args.version.as_ref() {
+        let db =
+            db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
+        return run_versioned(db, repo, args, version, &pair, tf, htf, config).await;
+    }
 
-    let store = match &args.store {
-        Some(dir) => CandleStore::with_base_dir(dir.clone()),
-        None => CandleStore::with_default_base_dir()
-            .map_err(|e| anyhow::anyhow!("resolve default candle-store dir: {e}"))?,
-    };
+    let compiled = load_dsl_strategy(args)?;
 
-    let primary = load_series(&store, &pair, tf)?;
+    let primary = load_series(repo, &pair, tf)?;
     let htf_series = match htf {
-        Some(htf_tf) => Some(load_series(&store, &pair, htf_tf)?),
+        Some(htf_tf) => Some(load_series(repo, &pair, htf_tf)?),
         None => None,
     };
 
@@ -183,25 +194,8 @@ pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::R
         .symbol_filters(&pair)
         .map_err(|e| anyhow::anyhow!("resolve exchange filters for {pair}: {e}"))?;
 
-    let result = run_backtest(
-        &loaded.compiled,
-        &primary,
-        htf_series.as_ref(),
-        &config,
-        &filters,
-    )
-    .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
-
-    // FR-7 + persistence: the `--version` path FR-7-compares the prior run BEFORE
-    // inserting (warning to STDERR), then ALWAYS persists. The `--dsl` path does
-    // neither — it stays silent + persistence-free (README C7, D1). This happens
-    // BEFORE rendering so a persistence failure surfaces a non-zero exit without
-    // a misleading "success" footer on stdout.
-    if let Some(version_id) = loaded.persist {
-        let db =
-            db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
-        persist_and_compare(db, &version_id, &result, config.starting_equity).await?;
-    }
+    let result = run_backtest(&compiled, &primary, htf_series.as_ref(), &config, &filters)
+        .map_err(|e| anyhow::anyhow!("backtest failed: {e}"))?;
 
     if args.json {
         render_json(&result)?;
@@ -211,121 +205,95 @@ pub async fn run_backtest_cli(db: Option<&Db>, args: &BacktestArgs) -> anyhow::R
     Ok(())
 }
 
-/// A compiled strategy plus, for the `--version` path, the `VersionId` to persist
-/// the run against. `persist` is `None` for the `--dsl` path (persistence-free).
-struct LoadedStrategy {
-    compiled: CompiledStrategy,
-    /// `Some(version_id)` ⇒ persist + FR-7-compare (the `--version` path);
-    /// `None` ⇒ silent persistence-free (the `--dsl` path).
-    persist: Option<VersionId>,
+/// The `--version` path: run the shared application use case, surface its FR-7
+/// warning on stderr, and render the **persisted** result.
+///
+/// Rendering from the read-back rather than from memory is deliberate and is what
+/// the desktop command does too: the versioned run's whole purpose is the row it
+/// leaves behind, so the numbers the operator reads should be the numbers that were
+/// stored. The `--dsl` path, which stores nothing, still renders its in-memory
+/// result — there is nothing else it could render.
+#[allow(clippy::too_many_arguments)]
+async fn run_versioned<R>(
+    db: &Db,
+    repo: &R,
+    args: &BacktestArgs,
+    version: &str,
+    pair: &Pair,
+    tf: Timeframe,
+    htf: Option<Timeframe>,
+    config: BacktestConfig,
+) -> anyhow::Result<()>
+where
+    R: CandleSeriesRepository + Clone + Send + 'static,
+{
+    let strategies = SqliteStrategyRepo::new(db.pool().clone());
+    let runs = SqliteBacktestRunRepo::new(db.pool().clone());
+    let request = BacktestRequest {
+        version_id: VersionId::new(version.to_owned()),
+        pair: pair.clone(),
+        primary_timeframe: tf,
+        htf_timeframe: htf,
+        config,
+    };
+    let outcome = run_version_backtest(&strategies, repo, &BinanceAdapter::new(), &runs, &request)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // STDERR only (D4): stdout carries the byte-pinned footer/JSON.
+    if let Some(warning) = outcome.fingerprint_warning.as_ref() {
+        eprintln!("warning: {warning}");
+    }
+
+    let rendered = persisted_result(&outcome);
+    if args.json {
+        render_json(&rendered)?;
+    } else {
+        render_human(&rendered);
+    }
+    Ok(())
 }
 
-/// Resolve the compiled strategy from whichever load path the args selected.
+/// Rebuild a renderable [`BacktestResult`] from the SAVED run and trades.
 ///
-/// The clap `ArgGroup` (`required(true)`, mutually exclusive) guarantees exactly
-/// one of `--dsl` / `--version` is set; the unreachable both/neither arms still
-/// fail-closed with a clear `anyhow` error rather than panic (#65).
+/// Every field is a persisted column or a pure projection of the persisted trades —
+/// nothing here is carried over from the pre-save in-memory value.
+fn persisted_result(outcome: &BacktestOutcome) -> BacktestResult {
+    let run = &outcome.run;
+    BacktestResult {
+        trades: outcome.trades.clone(),
+        net_pnl: run.net_pnl,
+        fees_total: run.fees_total,
+        funding_total: run.funding_total,
+        slippage_total: run.slippage_total,
+        regime_breakdown: run.regime_breakdown,
+        skipped_entries: run.skipped_entries,
+        engine_fingerprint: EngineFingerprint::from_stored(run.engine_fingerprint.clone()),
+        summary: run.summary.clone(),
+        equity_curve: outcome.equity_curve(),
+    }
+}
+
+/// Resolve the compiled strategy for the `--dsl` path.
+///
+/// The clap `ArgGroup` (`required(true)`, mutually exclusive) guarantees exactly one
+/// of `--dsl` / `--version` is set, and `--version` returned earlier through the
+/// shared use case — so by here the only legal shape is `--dsl`. The unreachable
+/// both/neither arms still fail-closed with a clear `anyhow` error rather than panic
+/// (#65).
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] on a bad `--dsl` file, an unresolvable `--version`
-/// id (no such version row — a real error, #65), a repo failure, or (defensively)
-/// a missing db for the `--version` path.
-async fn load_strategy(db: Option<&Db>, args: &BacktestArgs) -> anyhow::Result<LoadedStrategy> {
+/// Returns an [`anyhow::Error`] on a bad `--dsl` file or, defensively, on an arg
+/// combination `clap` should already have refused.
+fn load_dsl_strategy(args: &BacktestArgs) -> anyhow::Result<CompiledStrategy> {
     match (&args.dsl, &args.version) {
-        (Some(path), None) => Ok(LoadedStrategy {
-            compiled: load_compiled_strategy(path)?,
-            persist: None,
-        }),
-        (None, Some(version)) => {
-            let db =
-                db.ok_or_else(|| anyhow::anyhow!("internal: --version path requires an open db"))?;
-            let version_id = VersionId::new(version.clone());
-            let compiled = load_compiled_from_version(db, &version_id).await?;
-            Ok(LoadedStrategy {
-                compiled,
-                persist: Some(version_id),
-            })
-        }
-        // The ArgGroup makes both these arms unreachable in practice; fail-closed
-        // (a real error, never a panic / debug_assert — #65) just in case.
+        (Some(path), None) => load_compiled_strategy(path),
         (Some(_), Some(_)) => {
             anyhow::bail!("--dsl and --version are mutually exclusive (pick one)")
         }
-        (None, None) => anyhow::bail!("exactly one of --dsl or --version is required"),
+        (None, _) => anyhow::bail!("exactly one of --dsl or --version is required"),
     }
-}
-
-/// Load + compile the DSL of a persisted strategy VERSION (the `--version` path).
-///
-/// Fetches the [`StrategyVersion`](crate::StrategyVersion) by id via the
-/// [`StrategyRepository`] port, then [`validate`]s + [`compile`]s its migrated
-/// typed `.dsl` (the repo already ran `Migrator::load` on write, so the stored
-/// `.dsl` is current-schema). A missing version id is a real error (#65), never a
-/// panic.
-///
-/// # Errors
-///
-/// Returns an [`anyhow::Error`] on a repo failure, no such version id, or a
-/// validate/compile failure of the stored DSL.
-async fn load_compiled_from_version(
-    db: &Db,
-    version_id: &VersionId,
-) -> anyhow::Result<CompiledStrategy> {
-    let repo = SqliteStrategyRepo::new(db.pool().clone());
-    let version = repo
-        .get_version(version_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("load strategy version {}: {e}", version_id.as_str()))?
-        .ok_or_else(|| anyhow::anyhow!("no such strategy version `{}`", version_id.as_str()))?;
-    let validated = validate(&version.dsl)
-        .map_err(|e| anyhow::anyhow!("stored strategy failed validation: {e}"))?;
-    compile(&validated).map_err(|e| anyhow::anyhow!("compile stored strategy: {e}"))
-}
-
-/// FR-7 compare-prior-BEFORE-insert, then ALWAYS persist (the `--version` path).
-///
-/// **Order matters (D3):** fetch `latest_run_for_version` FIRST — if `Some(prior)`,
-/// [`compare`](EngineFingerprint::compare) the new run's fingerprint against the
-/// prior's and `eprintln!` any warning to **STDERR** (never stdout — the footer/
-/// JSON byte string is test-pinned, D4) — and only THEN `save_run`, else the
-/// freshly-inserted row would become its own "prior" and the warning could never
-/// fire. Persistence is unconditional: every versioned run is recorded provenance
-/// (README C7 — no `--save` flag).
-///
-/// # Errors
-///
-/// Returns an [`anyhow::Error`] on a `latest_run_for_version` read failure or a
-/// `save_run` write failure (e.g. an absent `strategy_version_id`).
-async fn persist_and_compare(
-    db: &Db,
-    version_id: &VersionId,
-    result: &BacktestResult,
-    starting_equity: Decimal,
-) -> anyhow::Result<()> {
-    let repo = SqliteBacktestRunRepo::new(db.pool().clone());
-
-    // FR-7: compare against the prior run BEFORE inserting (D3 order invariant).
-    let prior = repo
-        .latest_run_for_version(version_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("look up prior run for FR-7 compare: {e}"))?;
-    if let Some(prior) = prior {
-        let prior_fp = EngineFingerprint::from_stored(prior.engine_fingerprint.clone());
-        if let Some(warning) = result.engine_fingerprint.compare(&prior_fp) {
-            // STDERR only (D4): stdout carries the byte-pinned footer/JSON.
-            eprintln!("warning: {warning}");
-        }
-    }
-
-    // The headline summary is already computed on `result.summary` (4.01/4.02);
-    // the repo re-stores it as the typed projection (4.04). We pass it through —
-    // never recompute (D1 / spec §9).
-    let summary: &SummaryStats = &result.summary;
-    repo.save_run(version_id, result, summary, starting_equity)
-        .await
-        .map_err(|e| anyhow::anyhow!("persist backtest run: {e}"))?;
-    Ok(())
 }
 
 /// Parse a DSL document through the **version-safe migrator** (FR-4), matching the
@@ -380,20 +348,28 @@ fn reject_if_gapped(series: &CandleSeries) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load the HEAD snapshot for `(pair, tf)` from the store, erroring clearly when
-/// no snapshot exists or when the series is not gap-free.
-fn load_series(store: &CandleStore, pair: &Pair, tf: Timeframe) -> anyhow::Result<CandleSeries> {
-    let head = store.read_head(pair, tf)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no HEAD snapshot for {pair} {} in the candle store",
-            tf.binance_interval()
-        )
-    })?;
-    let series = store
-        .read_snapshot(pair, tf, &head)
-        .map_err(|e| anyhow::anyhow!("read snapshot for {pair} {}: {e}", tf.binance_interval()))?;
-    reject_if_gapped(&series)?;
-    Ok(series)
+/// Load the `HEAD` snapshot for `(pair, tf)` through the repository port, erroring
+/// clearly when no snapshot exists or when the series is not gap-free.
+fn load_series<R>(repo: &R, pair: &Pair, tf: Timeframe) -> anyhow::Result<CandleSeries>
+where
+    R: CandleSeriesRepository,
+{
+    let stored = repo
+        .load_head(pair, tf)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "read HEAD snapshot for {pair} {}: {e}",
+                tf.binance_interval()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no HEAD snapshot for {pair} {} in the candle store",
+                tf.binance_interval()
+            )
+        })?;
+    reject_if_gapped(&stored.series)?;
+    Ok(stored.series)
 }
 
 /// The tab-separated trade-log header (names every cost column the demo reads,

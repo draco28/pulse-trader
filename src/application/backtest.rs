@@ -1,0 +1,799 @@
+//! The version-id backtest use case (r1.s3.w3) — one flow, two adapters.
+//!
+//! The debug CLI's `--version` path and the desktop `run_backtest_version` command
+//! run *this* sequence, not two copies of it:
+//!
+//! 1. load the immutable strategy version;
+//! 2. validate + compile its stored DSL;
+//! 3. **off the async runtime** (`spawn_blocking`): load the primary and optional
+//!    HTF `HEAD` snapshots, reject gapped series, resolve symbol filters, run the
+//!    synchronous deterministic engine;
+//! 4. back on the runtime: read the prior run and compare fingerprints **before**
+//!    saving — after the insert the fresh row would be its own prior and the
+//!    warning could never fire;
+//! 5. build [`BacktestInputs`] from the series the engine actually consumed;
+//! 6. save, receiving a fresh [`BacktestRunId`];
+//! 7. reload that run, its trades, and the primary/HTF snapshots **named by the
+//!    persisted inputs** — never `HEAD`, which may have moved — with the snapshot
+//!    loads off the async runtime (`spawn_blocking`), exactly like step 3: they
+//!    are the same filesystem I/O + Parquet decode;
+//! 8. answer from those reloaded values alone.
+//!
+//! **Step 7 is the point of the whole item.** A response assembled from the
+//! in-memory result would render identically today and would be a claim about
+//! memory rather than about what is stored. Reading it back proves the row is
+//! complete, decodable, and still resolves its snapshots — which is what makes the
+//! number on the screen re-derivable tomorrow.
+//!
+//! **Failures before and after the save are different facts.** [`Persist`] means no
+//! row exists. [`SavedButReadBackFailed`] means one does, and carries its id and the
+//! stage that failed, so a caller can say "saved, but could not be read back"
+//! instead of "the run failed" — which would be a lie that costs the user a run.
+//!
+//! [`Persist`]: BacktestAppError::Persist
+//! [`SavedButReadBackFailed`]: BacktestAppError::SavedButReadBackFailed
+
+use rust_decimal::Decimal;
+
+use crate::domain::backtest::{BacktestResult, EquityCurve};
+use crate::domain::strategy::VersionId;
+use crate::domain::{
+    BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
+    CandleSeriesRepository, CompiledStrategy, DataError, DataVersion, EngineFingerprint,
+    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, SnapshotSelection,
+    StrategyRepository, SymbolFilters, Timeframe, Trade, ValidationErrors, compile, validate,
+};
+
+use crate::adapters::backtest::{BacktestConfig, run_backtest};
+
+// ---------------------------------------------------------------------------
+// Request
+// ---------------------------------------------------------------------------
+
+/// What a caller asks for: one persisted version, one pair, one primary timeframe,
+/// an optional higher timeframe, and the exact cost configuration.
+///
+/// The desktop adapter builds the fixed r1 request (BTCUSDT, M15 + H4, default
+/// costs); the CLI builds one from its flags. Neither can express a strategy the
+/// database does not hold — the flow is version-id-only by construction, which is
+/// what keeps every run attributable to an immutable `StrategyVersion` (ADR-0010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacktestRequest {
+    /// The immutable strategy version to run.
+    pub version_id: VersionId,
+    /// The pair to load candles for.
+    pub pair: Pair,
+    /// The primary timeframe the engine steps over.
+    pub primary_timeframe: Timeframe,
+    /// An optional higher timeframe for MTF alignment.
+    pub htf_timeframe: Option<Timeframe>,
+    /// Starting equity and the cost model, exactly as the engine will receive it.
+    pub config: BacktestConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Which read failed **before** anything was saved.
+///
+/// Every one of these happens with no row in the database, so none of them can name
+/// a run. They are separated from [`BacktestAppError::Persist`] because that variant
+/// says "persist backtest run", and saying it for a strategy-version read or a
+/// snapshot load names an operation that never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreSaveStage {
+    /// Loading the immutable strategy version.
+    StrategyVersion,
+    /// Reading the prior run for the FR-7 fingerprint comparison.
+    PriorRun,
+    /// Loading or validating the primary `HEAD` snapshot.
+    PrimarySnapshot,
+    /// Loading or validating the HTF `HEAD` snapshot.
+    HtfSnapshot,
+}
+
+impl PreSaveStage {
+    /// A stable label naming the operation that actually failed.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreSaveStage::StrategyVersion => "the strategy version",
+            PreSaveStage::PriorRun => "the prior run",
+            PreSaveStage::PrimarySnapshot => "the primary candle snapshot",
+            PreSaveStage::HtfSnapshot => "the HTF candle snapshot",
+        }
+    }
+}
+
+/// Which read failed after the run was already saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBackStage {
+    /// Reading the saved run header.
+    Run,
+    /// Reading the saved trade log.
+    Trades,
+    /// Reloading the primary snapshot named by the persisted inputs.
+    PrimarySnapshot,
+    /// Reloading the HTF snapshot named by the persisted inputs.
+    HtfSnapshot,
+    /// Projecting the saved values onto the wire shape.
+    Projection,
+}
+
+impl ReadBackStage {
+    /// A stable lower-case label for messages and logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadBackStage::Run => "run",
+            ReadBackStage::Trades => "trades",
+            ReadBackStage::PrimarySnapshot => "primary snapshot",
+            ReadBackStage::HtfSnapshot => "htf snapshot",
+            ReadBackStage::Projection => "wire projection",
+        }
+    }
+}
+
+/// How a post-save read failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadBackFailure {
+    /// The store reported an error.
+    Data(DataError),
+    /// The store reported success but the row/snapshot was absent.
+    Missing,
+    /// The saved run read back with `inputs: None`. Only a pre-migration-`0006` row
+    /// may do that, and this run was written seconds ago — so the row is not the
+    /// legacy shape it claims to be, and nothing downstream may trust it.
+    FreshInputsMissing,
+    /// A saved value could not be represented on the wire — a count or schema tag
+    /// that does not fit the narrower wire type.
+    ///
+    /// The alternative was clamping, and clamping is how a corrupt-but-hash-consistent
+    /// row renders a plausible false number instead of refusing. A run whose stored
+    /// trade count does not fit is not a run this binary may report on.
+    Projection(String),
+}
+
+impl std::fmt::Display for ReadBackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadBackFailure::Data(source) => write!(f, "{source}"),
+            ReadBackFailure::Missing => f.write_str("no such row"),
+            ReadBackFailure::FreshInputsMissing => {
+                f.write_str("a freshly saved run read back with no input provenance")
+            }
+            ReadBackFailure::Projection(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// Everything the use case can refuse with.
+///
+/// The split that matters is [`Persist`](Self::Persist) versus
+/// [`SavedButReadBackFailed`](Self::SavedButReadBackFailed): the first means no row
+/// exists, the second means one does. Collapsing them into a generic failure is what
+/// loses a user their run.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BacktestAppError {
+    /// No such strategy version.
+    #[error("no such strategy version `{}`", .0.as_str())]
+    VersionNotFound(VersionId),
+
+    /// The stored DSL failed semantic validation.
+    #[error("stored strategy failed validation: {0}")]
+    DslInvalid(#[from] ValidationErrors),
+
+    /// The stored DSL validated but would not compile.
+    #[error("compile stored strategy: {0}")]
+    CompileFailed(String),
+
+    /// No `HEAD` snapshot exists for a requested `(pair, timeframe)`.
+    #[error("no HEAD snapshot for {pair} {} in the candle store", timeframe.binance_interval())]
+    SnapshotMissing {
+        /// The pair with no snapshot.
+        pair: Pair,
+        /// The timeframe with no snapshot.
+        timeframe: Timeframe,
+    },
+
+    /// A loaded series has a spacing gap; the engine assumes contiguity.
+    #[error(
+        "candle series for {pair} {} has a spacing gap (expected open_time {expected}, found {found}); \
+         the backtester requires a gap-free series — re-fetch the snapshot",
+        timeframe.binance_interval()
+    )]
+    SeriesGapped {
+        /// The gapped pair.
+        pair: Pair,
+        /// The gapped timeframe.
+        timeframe: Timeframe,
+        /// Where the next candle was expected.
+        expected: i64,
+        /// What was found instead.
+        found: i64,
+    },
+
+    /// Symbol filters could not be resolved.
+    #[error("resolve exchange filters: {0}")]
+    ExchangeFilters(#[from] ExchangeError),
+
+    /// The engine refused the run.
+    #[error("backtest failed: {0}")]
+    Engine(#[from] BacktestError),
+
+    /// A READ failed before anything was saved.
+    ///
+    /// Distinct from [`Persist`](Self::Persist) because that one says "persist
+    /// backtest run", and a strategy-version read or a snapshot load is not that
+    /// operation. Neither carries a run id: no row exists in either case.
+    #[error("read {} before the run was saved: {source}", stage.as_str())]
+    PreSaveRead {
+        /// Which read failed.
+        stage: PreSaveStage,
+        /// Why it failed.
+        source: DataError,
+    },
+
+    /// The **save itself** failed, so no row was committed. There is no run id
+    /// because there is no run.
+    #[error("persist backtest run: {0}")]
+    Persist(DataError),
+
+    /// The run **was saved** and then could not be read back.
+    #[error(
+        "backtest run `{}` was saved, but reading back its {} failed: {failure}",
+        run_id.as_str(),
+        stage.as_str()
+    )]
+    SavedButReadBackFailed {
+        /// The id of the row that exists.
+        run_id: BacktestRunId,
+        /// Which read failed.
+        stage: ReadBackStage,
+        /// How it failed.
+        failure: ReadBackFailure,
+    },
+
+    /// A defect in this layer.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl BacktestAppError {
+    /// The id of a run that **is** persisted, when one is.
+    ///
+    /// `Some` only for [`SavedButReadBackFailed`](Self::SavedButReadBackFailed).
+    /// Every other variant describes a state in which no row was committed, and
+    /// reporting an id there would be worse than reporting none.
+    #[must_use]
+    pub fn persisted_run_id(&self) -> Option<&BacktestRunId> {
+        match self {
+            BacktestAppError::SavedButReadBackFailed { run_id, .. } => Some(run_id),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pinned MFE/MAE histogram projection
+// ---------------------------------------------------------------------------
+
+/// The exact bin width, in R-multiples.
+pub const HISTOGRAM_BIN_WIDTH_STR: &str = "0.25";
+
+/// How many finite bins each histogram carries. 12 × `0.25R` covers `[0, 3)`.
+pub const HISTOGRAM_BIN_COUNT: usize = 12;
+
+/// The bin width as a `Decimal` (`0.25`). A function rather than a `const` because
+/// `Decimal` has no const constructor for a scaled value.
+#[must_use]
+pub fn histogram_bin_width() -> Decimal {
+    Decimal::new(25, 2)
+}
+
+/// One finite bin: `[lower, upper)` and how many normalized values fell in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistogramBin {
+    /// Inclusive lower bound, in R.
+    pub lower: Decimal,
+    /// Exclusive upper bound, in R.
+    pub upper: Decimal,
+    /// How many values landed here.
+    pub count: u32,
+}
+
+/// A deterministic excursion histogram.
+///
+/// **Pinned, not derived per run.** Bounds computed from each run's own data would
+/// make two runs' charts incomparable, which is most of what a reader wants them
+/// for. The domain comes from the strategy geometry the fixture was measured
+/// against — a 1R stop and a 2R target put MAE near `-1R` and MFE near `+2R` — with
+/// `[0, 3)` leaving a full R of headroom before anything overflows.
+///
+/// **`Decimal` throughout, and nothing is dropped.** Every value lands in exactly
+/// one of the 12 bins, `underflow` or `overflow`, so the counts always sum to the
+/// number of trades.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Histogram {
+    /// The shared bin width (`0.25`).
+    pub bin_width: Decimal,
+    /// The 12 finite bins, ascending.
+    pub bins: Vec<HistogramBin>,
+    /// Normalized values below `0` — impossible for a well-formed run, and counted
+    /// rather than hidden so an engine regression shows up as a number instead of a
+    /// silently missing trade.
+    pub underflow: u32,
+    /// Normalized values at or above `3R`.
+    pub overflow: u32,
+}
+
+/// Bin already-normalized R-multiples into the pinned histogram.
+///
+/// Callers normalize first: MFE passes `mfe_r` as-is, MAE passes `-mae_r`. That is
+/// deliberately not `abs()` — a sign-violating value (a positive MAE, a negative
+/// MFE) must stay negative so it lands in `underflow` and is visible, rather than
+/// being folded into a plausible-looking bin.
+#[must_use]
+pub fn project_histogram(values: impl Iterator<Item = Decimal>) -> Histogram {
+    let width = histogram_bin_width();
+    let upper_bound = width * Decimal::from(u32::try_from(HISTOGRAM_BIN_COUNT).unwrap_or(u32::MAX));
+    let mut bins: Vec<HistogramBin> = (0..HISTOGRAM_BIN_COUNT)
+        .map(|i| {
+            let index = Decimal::from(u32::try_from(i).unwrap_or(u32::MAX));
+            HistogramBin {
+                lower: width * index,
+                upper: width * (index + Decimal::ONE),
+                count: 0,
+            }
+        })
+        .collect();
+    let mut underflow = 0_u32;
+    let mut overflow = 0_u32;
+
+    for value in values {
+        if value < Decimal::ZERO {
+            underflow = underflow.saturating_add(1);
+        } else if value >= upper_bound {
+            overflow = overflow.saturating_add(1);
+        } else {
+            // Linear scan over 12 bins: the `[lo, hi)` rule is read straight off the
+            // bounds, so an off-by-one in index arithmetic cannot silently reclassify
+            // a boundary value.
+            for bin in &mut bins {
+                if value >= bin.lower && value < bin.upper {
+                    bin.count = bin.count.saturating_add(1);
+                    break;
+                }
+            }
+        }
+    }
+
+    Histogram {
+        bin_width: width,
+        bins,
+        underflow,
+        overflow,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outcome
+// ---------------------------------------------------------------------------
+
+/// The use case's answer — built from persisted values only, plus the one piece of
+/// control metadata that has no persisted form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BacktestOutcome {
+    /// The saved run, read back.
+    pub run: PersistedRun,
+    /// The saved run's input provenance.
+    ///
+    /// Non-optional here even though [`PersistedRun::inputs`] is an `Option`: that
+    /// `Option` exists for pre-migration-`0006` rows, and this run was written
+    /// seconds ago. The use case refuses the read-back when a fresh row comes back
+    /// without inputs, so by the time an outcome exists the value is proven — and
+    /// carrying it proven means no consumer needs an `unwrap` to reach it.
+    pub inputs: BacktestInputs,
+    /// The saved trades, read back in `seq` order.
+    pub trades: Vec<Trade>,
+    /// The primary snapshot, reloaded by the identity the run records.
+    pub primary: CandleSeries,
+    /// The HTF snapshot, reloaded the same way, when the run used one.
+    pub htf: Option<CandleSeries>,
+    /// The FR-7 fingerprint warning, if the prior run was built by another engine.
+    ///
+    /// The only field not read back from storage: the comparison must happen before
+    /// the insert (afterwards the fresh row is its own prior), and it has no column.
+    pub fingerprint_warning: Option<String>,
+    /// The pinned MFE histogram over the persisted trades.
+    pub mfe: Histogram,
+    /// The pinned MAE histogram over the persisted trades.
+    pub mae: Histogram,
+}
+
+impl BacktestOutcome {
+    /// The equity curve, rebuilt from the reloaded snapshot's first candle, the
+    /// persisted starting equity and the persisted trades — never a stored curve
+    /// (there is no such table) and never the pre-save in-memory one.
+    #[must_use]
+    pub fn equity_curve(&self) -> EquityCurve {
+        let start = self
+            .primary
+            .candles
+            .first()
+            .map_or(0, |candle| candle.open_time);
+        EquityCurve::from_trades(start, self.run.starting_equity, &self.trades)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The use case
+// ---------------------------------------------------------------------------
+
+/// What the blocking section produces.
+struct EngineOutput {
+    result: BacktestResult,
+    primary: CandleSeries,
+    htf: Option<CandleSeries>,
+}
+
+/// Run one persisted strategy version and answer from the saved row.
+///
+/// # Errors
+///
+/// Returns a [`BacktestAppError`]. Anything after `save_run` returns is
+/// [`SavedButReadBackFailed`](BacktestAppError::SavedButReadBackFailed) and carries
+/// the persisted run id.
+pub async fn run_version_backtest<S, C, E, R>(
+    strategies: &S,
+    candles: &C,
+    exchange: &E,
+    runs: &R,
+    request: &BacktestRequest,
+) -> Result<BacktestOutcome, BacktestAppError>
+where
+    S: StrategyRepository,
+    C: CandleSeriesRepository + Clone + Send + 'static,
+    E: ExchangeAdapter + Clone + Send + 'static,
+    R: BacktestRunRepository,
+{
+    // 1-2. The immutable version, validated and compiled through the existing path.
+    let version = strategies
+        .get_version(&request.version_id)
+        .await
+        .map_err(|source| BacktestAppError::PreSaveRead {
+            stage: PreSaveStage::StrategyVersion,
+            source,
+        })?
+        .ok_or_else(|| BacktestAppError::VersionNotFound(request.version_id.clone()))?;
+    let validated = validate(&version.dsl)?;
+    let compiled =
+        compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
+
+    // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
+    //    blocking thread. Both are hundreds of milliseconds on the real fixture, and
+    //    holding a Tokio worker for that stalls every other command on the bus. The
+    //    closure owns clones; nothing is borrowed across the await.
+    let engine = run_engine_offthread(candles.clone(), exchange.clone(), compiled, request).await?;
+
+    // 4. FR-7 compare BEFORE the insert (D3): afterwards the fresh row is its own
+    //    prior and the warning can never fire.
+    let prior = runs
+        .latest_run_for_version(&request.version_id)
+        .await
+        .map_err(|source| BacktestAppError::PreSaveRead {
+            stage: PreSaveStage::PriorRun,
+            source,
+        })?;
+    let fingerprint_warning = prior.and_then(|prior| {
+        let prior_fp = EngineFingerprint::from_stored(prior.engine_fingerprint);
+        engine.result.engine_fingerprint.compare(&prior_fp)
+    });
+
+    // 5-6. Provenance from the series the engine actually consumed, then save.
+    let inputs = inputs_from_run(&engine.primary, engine.htf.as_ref(), &request.config);
+    let run_id = runs
+        .save_run(
+            &request.version_id,
+            &inputs,
+            &engine.result,
+            &engine.result.summary,
+            request.config.starting_equity,
+        )
+        .await
+        .map_err(BacktestAppError::Persist)?;
+
+    // 7-8. From here every failure names the row that exists.
+    read_back(candles.clone(), runs, run_id, fingerprint_warning).await
+}
+
+/// Steps 7-8: reload the saved run, its trades and its exact snapshots.
+async fn read_back<C, R>(
+    candles: C,
+    runs: &R,
+    run_id: BacktestRunId,
+    fingerprint_warning: Option<String>,
+) -> Result<BacktestOutcome, BacktestAppError>
+where
+    C: CandleSeriesRepository + Clone + Send + 'static,
+    R: BacktestRunRepository,
+{
+    let saved =
+        |stage: ReadBackStage, failure: ReadBackFailure| BacktestAppError::SavedButReadBackFailed {
+            run_id: run_id.clone(),
+            stage,
+            failure,
+        };
+
+    let run = runs
+        .get_run(&run_id)
+        .await
+        .map_err(|e| saved(ReadBackStage::Run, ReadBackFailure::Data(e)))?
+        .ok_or_else(|| saved(ReadBackStage::Run, ReadBackFailure::Missing))?;
+    let inputs = run
+        .inputs
+        .clone()
+        .ok_or_else(|| saved(ReadBackStage::Run, ReadBackFailure::FreshInputsMissing))?;
+
+    let trades = runs
+        .get_trades(&run_id)
+        .await
+        .map_err(|e| saved(ReadBackStage::Trades, ReadBackFailure::Data(e)))?;
+
+    // The identities come from the SAVED row, never from HEAD — HEAD may already
+    // point somewhere else, which is the whole reason #110 exists. Both loads go
+    // through the blocking pool (see `load_version_offthread`): same filesystem
+    // I/O + Parquet decode as step 3, so the same off-runtime rule.
+    let primary = load_version_offthread(
+        candles.clone(),
+        inputs.pair.clone(),
+        inputs.primary.timeframe,
+        inputs.primary.data_version.clone(),
+    )
+    .await
+    .map_err(|e| saved(ReadBackStage::PrimarySnapshot, ReadBackFailure::Data(e)))?;
+    if primary.candles.is_empty() {
+        // An empty reload cannot produce a truthful date range, and fabricating one
+        // is exactly what the provenance header exists to prevent.
+        return Err(saved(
+            ReadBackStage::PrimarySnapshot,
+            ReadBackFailure::Missing,
+        ));
+    }
+
+    let htf = match inputs.htf.as_ref() {
+        Some(selection) => Some(
+            load_version_offthread(
+                candles,
+                inputs.pair.clone(),
+                selection.timeframe,
+                selection.data_version.clone(),
+            )
+            .await
+            .map_err(|e| saved(ReadBackStage::HtfSnapshot, ReadBackFailure::Data(e)))?,
+        ),
+        None => None,
+    };
+
+    let mfe = project_histogram(trades.iter().map(|t| t.mfe_r));
+    // MAE is negated, not `abs()`d: a positive MAE would be a sign violation and
+    // must surface in `underflow` rather than be folded into a plausible bin.
+    let mae = project_histogram(trades.iter().map(|t| -t.mae_r));
+
+    Ok(BacktestOutcome {
+        run,
+        inputs,
+        trades,
+        primary,
+        htf,
+        fingerprint_warning,
+        mfe,
+        mae,
+    })
+}
+
+/// One read-back `load_version`, off the async runtime. Step 3's rule applies to
+/// step 7 unchanged: the load is filesystem I/O plus Parquet decode — hundreds of
+/// milliseconds on a real multi-year snapshot — and running it on a Tokio worker
+/// stalls every other command on the bus. The closure owns the repo clone and the
+/// identity; nothing is borrowed across the await.
+async fn load_version_offthread<C>(
+    candles: C,
+    pair: Pair,
+    timeframe: Timeframe,
+    version: DataVersion,
+) -> Result<CandleSeries, DataError>
+where
+    C: CandleSeriesRepository + Send + 'static,
+{
+    // Rendered before the move so the JoinError formatter can name the load.
+    let label = format!("{pair}/{}/{version}", timeframe.binance_interval());
+    tokio::task::spawn_blocking(move || {
+        candles
+            .load_version(&pair, timeframe, &version)
+            .map(|stored| stored.series)
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(DataError::Io(format!(
+            "blocking snapshot load for {label} panicked: {join_err}"
+        )))
+    })
+}
+
+/// Step 3, off the async runtime.
+async fn run_engine_offthread<C, E>(
+    candles: C,
+    exchange: E,
+    compiled: CompiledStrategy,
+    request: &BacktestRequest,
+) -> Result<EngineOutput, BacktestAppError>
+where
+    C: CandleSeriesRepository + Send + 'static,
+    E: ExchangeAdapter + Send + 'static,
+{
+    let pair = request.pair.clone();
+    let primary_tf = request.primary_timeframe;
+    let htf_tf = request.htf_timeframe;
+    let config = request.config;
+
+    let joined = tokio::task::spawn_blocking(move || -> Result<EngineOutput, BacktestAppError> {
+        let primary = load_head_series(&candles, &pair, primary_tf, PreSaveStage::PrimarySnapshot)?;
+        let htf = match htf_tf {
+            Some(tf) => Some(load_head_series(
+                &candles,
+                &pair,
+                tf,
+                PreSaveStage::HtfSnapshot,
+            )?),
+            None => None,
+        };
+        let filters: SymbolFilters = exchange.symbol_filters(&pair)?;
+        let result = run_backtest(&compiled, &primary, htf.as_ref(), &config, &filters)?;
+        Ok(EngineOutput {
+            result,
+            primary,
+            htf,
+        })
+    })
+    .await;
+
+    match joined {
+        Ok(inner) => inner,
+        Err(e) => Err(BacktestAppError::Internal(format!(
+            "the backtest worker thread failed: {e}"
+        ))),
+    }
+}
+
+/// Load one `HEAD` snapshot and refuse it if the engine cannot interpret it.
+fn load_head_series<C>(
+    candles: &C,
+    pair: &Pair,
+    timeframe: Timeframe,
+    stage: PreSaveStage,
+) -> Result<CandleSeries, BacktestAppError>
+where
+    C: CandleSeriesRepository,
+{
+    let series = candles
+        .load_head(pair, timeframe)
+        .map_err(|source| BacktestAppError::PreSaveRead { stage, source })?
+        .ok_or_else(|| BacktestAppError::SnapshotMissing {
+            pair: pair.clone(),
+            timeframe,
+        })?
+        .series;
+    // Structural corruption and spacing gaps are both refusals: the engine and the
+    // indicator stream assume a contiguous series and neither detects nor fills a
+    // hole, so a gapped snapshot would skew signals, holding periods and funding
+    // silently rather than loudly.
+    let gaps = series
+        .validate()
+        .map_err(|source| BacktestAppError::PreSaveRead { stage, source })?;
+    if let Some(first) = gaps.first() {
+        return Err(BacktestAppError::SeriesGapped {
+            pair: pair.clone(),
+            timeframe,
+            expected: first.expected,
+            found: first.found,
+        });
+    }
+    Ok(series)
+}
+
+/// Provenance from the series the engine consumed and the config it ran with — no
+/// second `HEAD` read, which would record what is current rather than what ran.
+fn inputs_from_run(
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+    config: &BacktestConfig,
+) -> BacktestInputs {
+    BacktestInputs {
+        pair: primary.pair.clone(),
+        primary: SnapshotSelection {
+            timeframe: primary.timeframe,
+            data_version: primary.version.clone(),
+        },
+        htf: htf.map(|series| SnapshotSelection {
+            timeframe: series.timeframe,
+            data_version: series.version.clone(),
+        }),
+        taker_fee_bps: config.taker_fee_bps,
+        slippage_bps: config.slippage_bps,
+        funding: FundingConfig::SnapshotRates,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{
+        BacktestAppError, HISTOGRAM_BIN_COUNT, HISTOGRAM_BIN_WIDTH_STR, ReadBackFailure,
+        ReadBackStage, histogram_bin_width, project_histogram,
+    };
+    use crate::domain::{BacktestRunId, DataError};
+    use rust_decimal::Decimal;
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    /// The wire-pinned string and the arithmetic width are two spellings of one
+    /// fact; this pin is the only thing that fails when someone widens the domain
+    /// (bin count × width) without updating the string the DTO contract re-exports.
+    #[test]
+    fn the_wire_bin_width_string_equals_the_arithmetic_width() {
+        assert_eq!(
+            HISTOGRAM_BIN_WIDTH_STR,
+            histogram_bin_width().to_string(),
+            "the DTO string and histogram_bin_width() drifted apart"
+        );
+    }
+
+    #[test]
+    fn the_pinned_domain_is_zero_to_three_in_twelve_quarter_bins() {
+        let h = project_histogram(std::iter::empty());
+        assert_eq!(h.bins.len(), HISTOGRAM_BIN_COUNT);
+        assert_eq!(h.bin_width, histogram_bin_width());
+        assert_eq!(h.bins[0].lower, d("0"));
+        assert_eq!(h.bins.last().unwrap().upper, d("3"));
+        for pair in h.bins.windows(2) {
+            assert_eq!(pair[0].upper, pair[1].lower, "bins tile without a seam");
+        }
+    }
+
+    #[test]
+    fn a_sign_violation_underflows_rather_than_being_folded_by_abs() {
+        // A positive MAE normalizes to a NEGATIVE value. `abs()` would put it in a
+        // plausible-looking bin; the contract keeps it visible.
+        let h = project_histogram([-d("0.5")].into_iter());
+        assert_eq!(h.underflow, 1);
+        assert!(h.bins.iter().all(|b| b.count == 0));
+    }
+
+    #[test]
+    fn only_the_saved_variant_reports_a_run_id() {
+        let saved = BacktestAppError::SavedButReadBackFailed {
+            run_id: BacktestRunId::new("run-1"),
+            stage: ReadBackStage::Trades,
+            failure: ReadBackFailure::Missing,
+        };
+        assert_eq!(
+            saved.persisted_run_id().map(BacktestRunId::as_str),
+            Some("run-1")
+        );
+        let message = saved.to_string();
+        assert!(
+            message.contains("run-1") && message.contains("saved"),
+            "{message}"
+        );
+
+        let pre_save = BacktestAppError::Persist(DataError::Db("nope".to_owned()));
+        assert!(
+            pre_save.persisted_run_id().is_none(),
+            "a pre-save failure has no row to name"
+        );
+    }
+}

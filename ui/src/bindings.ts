@@ -110,20 +110,162 @@ export const commands = {
 	 *  Never. The `Result` is the bus's uniform command shape.
 	 */
 	composeCancel: (runId: string) => typedError<boolean, BusError>(__TAURI_INVOKE("compose_cancel", { runId })),
+	/**
+	 *  `run_backtest_version` — the Backtest Lab's one command (r1.s3.w3).
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`run_backtest_version_core`].
+	 */
+	runBacktestVersion: (request: BacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("run_backtest_version", { request })),
 };
 
 /* Types */
 /**
+ *  The complete Backtest Lab response.
+ * 
+ *  `PartialEq` but not `Eq` — `sharpe`/`sortino` are `f64`, the same reason
+ *  [`PersistedRun`] carries only `PartialEq`.
+ */
+export type BacktestRunDto = {
+	/**  The freshly minted run id. Every invocation creates a new one. */
+	runId: string,
+	/**  The immutable version this run is attributed to. */
+	strategyVersionId: string,
+	/**  The run-row schema tag. */
+	schemaVersion: number,
+	/**  When the run was recorded (RFC3339 UTC, millisecond precision). */
+	createdAt: string,
+	/**  The pair the run consumed. */
+	pair: string,
+	/**  The primary timeframe, Binance interval text. */
+	primaryTimeframe: string,
+	/**  The exact immutable primary snapshot identity. */
+	primaryDataVersion: string,
+	/**  The HTF timeframe, when the run used one. Paired with the next field. */
+	htfTimeframe: string | null,
+	/**  The exact immutable HTF snapshot identity. */
+	htfDataVersion: string | null,
+	/**  First candle `open_time` of the **reloaded** primary snapshot, epoch ms. */
+	firstOpenTimeMs: string,
+	/**  Last candle `close_time` of the **reloaded** primary snapshot, epoch ms. */
+	lastCloseTimeMs: string,
+	/**  Starting equity, exact decimal string. */
+	startingEquity: string,
+	/**  Taker fee in basis points. */
+	takerFeeBps: string,
+	/**  Slippage in basis points. */
+	slippageBps: string,
+	/**  How funding was sourced (`snapshot_rates`). */
+	funding: string,
+	/**  The recording engine's build fingerprint. */
+	engineFingerprint: string,
+	/**  The recording engine's target triple. */
+	engineTarget: string,
+	/**  The stored integrity hash, re-derived and checked on read. */
+	resultContentHash: string,
+	/**
+	 *  FR-7 warning from the pre-save comparison against the prior run.
+	 * 
+	 *  The one field not read back from storage — the comparison has no column and
+	 *  must happen before the insert.
+	 */
+	fingerprintWarning: string | null,
+	/**  Net P&L. */
+	netPnl: string,
+	/**  Total taker fees. */
+	feesTotal: string,
+	/**  Total signed funding. */
+	fundingTotal: string,
+	/**  Total adverse slippage. */
+	slippageTotal: string,
+	/**  Mean P&L per trade. */
+	expectancy: string,
+	/**  Fraction of trades that won. */
+	winRate: string,
+	/**  Gross profit over gross loss; `null` when there is no loss to divide by. */
+	profitFactor: string | null,
+	/**  Sum of winning P&L. */
+	grossProfit: string,
+	/**  Sum of losing P&L. */
+	grossLoss: string,
+	/**  Mean winning trade. */
+	avgWin: string,
+	/**  Mean losing trade. */
+	avgLoss: string,
+	/**  Largest peak-to-trough equity drop. */
+	maxDrawdown: string,
+	/**  Number of completed trades. */
+	tradeCount: number,
+	/**  How many won. */
+	winCount: number,
+	/**  How many lost. */
+	lossCount: number,
+	/**  Longest winning streak. */
+	maxWinStreak: number,
+	/**  Longest losing streak. */
+	maxLossStreak: number,
+	/**  Sharpe ratio; `null` when undefined for this run. */
+	sharpe: number | null,
+	/**  Sortino ratio; `null` when undefined for this run. */
+	sortino: number | null,
+	/**  Entries skipped below the lot step. */
+	skippedSubLot: number,
+	/**  Entries skipped below minimum notional. */
+	skippedSubNotional: number,
+	/**  Entries skipped by the leverage cap. */
+	skippedLeverageCapped: number,
+	/**  The equity curve, rebuilt from the persisted trades. */
+	equity: EquityPointDto[],
+	/**  The four regimes, always in this fixed order. */
+	regimes: RegimeCellDto[],
+	/**  The pinned MFE histogram. */
+	mfe: HistogramDto,
+	/**  The pinned MAE histogram (magnitude). */
+	mae: HistogramDto,
+	/**  Every persisted trade, in `seq` order, with exact values. */
+	trades: TradeRowDto[],
+};
+
+/**
+ *  What the desktop asks for: one persisted strategy version.
+ * 
+ *  Pair, timeframes and costs are **not** here. r1's Backtest Lab runs the fixed
+ *  BTCUSDT M15+H4 / default-cost request, and a field the product cannot vary would
+ *  be a control that does not exist.
+ */
+export type BacktestRunRequest = {
+	/**  The immutable strategy version to run. */
+	versionId: string,
+};
+
+/**
  *  The single serializable error shape that crosses the Tauri boundary.
  * 
- *  Two fields, always both present, so the TypeScript type generated from this struct
- *  describes every error the frontend can receive.
+ *  **Three fields, always all present** (r1.s3.w3 added `run_id`), so the TypeScript
+ *  type generated from this struct describes every error the frontend can receive and
+ *  one rendering path handles all of them. An ordinary error serializes
+ *  `run_id: null` — the field is never skipped, because a field that sometimes
+ *  vanishes reaches TypeScript as `undefined` while its generated type says
+ *  `string | null`.
  */
 export type BusError = {
 	/**  The family this error came from. */
 	code: BusErrorCode,
 	/**  The source error's `Display` rendering — prose, safe to show a user. */
 	message: string,
+	/**
+	 *  The id of a backtest run that **is persisted** despite this error
+	 *  (r1.s3.w3).
+	 * 
+	 *  `Some` only when a run was saved and something afterwards could not be read
+	 *  back. The message says so too, but a screen must not have to parse prose to
+	 *  tell a user "your run is saved, here is its id" — so the id crosses the bus
+	 *  as a field. `None` for every other error, including a save that never
+	 *  committed: reporting an id for a row that does not exist would be worse than
+	 *  reporting none.
+	 */
+	run_id: string | null,
 };
 
 /**
@@ -323,6 +465,36 @@ export type DslSummary = {
 	risk: string[],
 };
 
+/**  One point on the reconstructed equity curve. */
+export type EquityPointDto = {
+	/**  Epoch milliseconds, exact integer string. */
+	timeMs: string,
+	/**  Account equity at that point, exact decimal string. */
+	equity: string,
+};
+
+/**  One `[lower, upper)` histogram bin and its count. */
+export type HistogramBinDto = {
+	/**  Inclusive lower bound in R, exact decimal string. */
+	lower: string,
+	/**  Exclusive upper bound in R, exact decimal string. */
+	upper: string,
+	/**  How many trades landed in this bin. */
+	count: number,
+};
+
+/**  A pinned excursion histogram, ready to render without further analysis. */
+export type HistogramDto = {
+	/**  The shared bin width in R, exact decimal string (`"0.25"`). */
+	binWidth: string,
+	/**  The finite bins, ascending, covering `[0, 3)`. */
+	bins: HistogramBinDto[],
+	/**  Normalized values below `0` — a sign violation, counted rather than hidden. */
+	underflow: number,
+	/**  Normalized values at or above `3R`. */
+	overflow: number,
+};
+
 /**
  *  The `library_overview` command's whole payload: every strategy, each with its
  *  version tree.
@@ -385,6 +557,16 @@ export type LibraryVersion = {
 	recentRuns: LibraryRunSummary[],
 };
 
+/**  One regime's persisted trade count and net P&L. */
+export type RegimeCellDto = {
+	/**  `trending_up` / `trending_down` / `ranging` / `unknown`. */
+	regime: string,
+	/**  Trades that opened in this regime. */
+	tradeCount: number,
+	/**  Net P&L across them, exact decimal string. */
+	netPnl: string,
+};
+
 /**
  *  A per-invocation run identifier, minted when a streaming command starts.
  * 
@@ -420,6 +602,46 @@ export type StreamOutcome = {
 	emitted: number,
 	/**  True when the far end went away mid-run (the screen unmounted). */
 	cancelled: boolean,
+};
+
+/**  One persisted trade, exactly as stored. */
+export type TradeRowDto = {
+	/**  `long` / `short`. */
+	direction: string,
+	/**  Position size, exact decimal string. */
+	qty: string,
+	/**  Entry fill price. */
+	entryPrice: string,
+	/**  Exit fill price. */
+	exitPrice: string,
+	/**  Epoch ms the entry signalled. */
+	entrySignalTime: string,
+	/**  Epoch ms the entry filled. */
+	entryFillTime: string,
+	/**  Epoch ms the exit signalled. */
+	exitSignalTime: string,
+	/**  Epoch ms the exit filled. */
+	exitFillTime: string,
+	/**  Taker fees on this trade. */
+	feesTotal: string,
+	/**  Signed funding on this trade. */
+	fundingTotal: string,
+	/**  Adverse slippage cost. */
+	slippageTotal: string,
+	/**  Realized P&L. */
+	realizedPnl: string,
+	/**  Realized R multiple. */
+	realizedR: string,
+	/**  Maximum favourable excursion, in R — exact, unbinned. */
+	mfeR: string,
+	/**  Maximum adverse excursion, in R — exact, unbinned, sign preserved. */
+	maeR: string,
+	/**  Why the trade closed. */
+	exitReason: string,
+	/**  What opened it. */
+	source: string,
+	/**  The regime at entry. */
+	regime: string,
 };
 
 /**

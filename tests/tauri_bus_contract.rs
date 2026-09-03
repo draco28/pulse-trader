@@ -28,9 +28,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use pulse::{
-    BUS_COMMANDS, BacktestError, BusError, BusErrorCode, BusEvent, ComposerError, DataError,
-    DesktopState, EventSink, ExchangeError, LlmError, RunId, StrategyRepository, demo_stream_core,
-    shell_info_core,
+    BUS_COMMANDS, BacktestAppError, BacktestError, BacktestRunId, BusError, BusErrorCode, BusEvent,
+    ComposerError, DataError, DesktopState, EventSink, ExchangeError, LlmError, ReadBackFailure,
+    ReadBackStage, RunId, StrategyRepository, demo_stream_core, shell_info_core,
 };
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tempfile::TempDir;
@@ -141,10 +141,23 @@ fn domain_error_maps_to_one_serializable_shape() {
 
         let mut keys: Vec<String> = object.keys().cloned().collect();
         keys.sort();
+        // r1.s3.w3 widened the shape to {code, message, run_id}. The invariant this
+        // asserts is unchanged and, if anything, stronger: ONE key set for every
+        // error, so the frontend still renders with one code path. `run_id` is
+        // ALWAYS present rather than skipped-when-absent — a field that sometimes
+        // vanishes reaches TypeScript as `undefined` while its generated type says
+        // `string | null`, which is exactly the mismatch this clause exists to stop.
         assert_eq!(
             keys,
-            vec!["code".to_owned(), "message".to_owned()],
-            "{label} must serialize to exactly {{code, message}}, got {keys:?}"
+            vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
+            "{label} must serialize to exactly {{code, message, run_id}}, got {keys:?}"
+        );
+        // No DOMAIN-family error can name a persisted run: only the application
+        // ring's saved-but-unreadable case knows a run id, and it is not in this set.
+        assert!(
+            object["run_id"].is_null(),
+            "{label} must carry a null run_id — only a saved-but-unreadable backtest \
+             has a row to name"
         );
         shapes.push(keys);
 
@@ -194,6 +207,40 @@ fn domain_error_maps_to_one_serializable_shape() {
     assert_eq!(
         back, err,
         "BusError must round-trip through serde unchanged"
+    );
+}
+
+/// The one crossable error that CAN name a persisted run. The shape test above
+/// loops only the domain-family errors, every one of which serializes `run_id`
+/// as null — so without this case the `with_run_id` serialization path, the exact
+/// payload the Backtest Lab renders as "saved, but could not be read back", is
+/// unpinned by this suite: same key set, non-null id.
+#[test]
+fn the_saved_but_unreadable_case_keeps_the_one_shape_with_a_named_run() {
+    let saved: BusError = BacktestAppError::SavedButReadBackFailed {
+        run_id: BacktestRunId::new("run-1"),
+        stage: ReadBackStage::Trades,
+        failure: ReadBackFailure::Missing,
+    }
+    .into();
+    assert_eq!(
+        saved.code,
+        BusErrorCode::Data,
+        "the saved case maps to the Data family"
+    );
+    let value = serde_json::to_value(&saved).unwrap();
+    let object = value.as_object().expect("the saved case is an object too");
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
+        "the saved-but-unreadable case keeps the ONE shape"
+    );
+    assert_eq!(
+        object["run_id"],
+        serde_json::json!("run-1"),
+        "run_id serializes as the bare id, not a wrapper object"
     );
 }
 

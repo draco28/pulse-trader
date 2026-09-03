@@ -24,6 +24,8 @@
 //! nothing but adapt the transport, which is why the bus contract is testable without an
 //! app handle.
 
+// r1.s3.w3: the Backtest Lab wire contract (DTOs + the pure projection).
+pub(crate) mod backtest;
 pub(crate) mod commands;
 pub(crate) mod error;
 pub(crate) mod events;
@@ -32,10 +34,14 @@ pub(crate) mod events;
 // projection logic lives next to its own unit tests.
 pub(crate) mod library;
 
+pub use backtest::{
+    BacktestRunDto, BacktestRunRequest, EquityPointDto, HistogramBinDto, HistogramDto,
+    RegimeCellDto, TradeRowDto, backtest_run_dto,
+};
 pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
     DesktopState, ShellInfo, StreamOutcome, compose_strategy_core, demo_stream_core,
-    library_overview_core, shell_info_core,
+    library_overview_core, run_backtest_version_core, shell_info_core,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -62,6 +68,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::library_overview,
         commands::compose_strategy,
         commands::compose_cancel,
+        commands::run_backtest_version,
     ])
 }
 

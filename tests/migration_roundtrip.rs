@@ -6,13 +6,18 @@
 //! embedded migration set ships `0001_init` (tables + immutability triggers),
 //! `0002` (the `idx_strategy_name` index), `0003` (the `backtest_run` + `trade`
 //! system-of-record tables, VS-1.2.4 work-4.03), `0004` (the append-only
-//! `llm_call` ledger, VS-1.3.1 work-1.02), and `0007` (the `llm_call.key_source`
-//! provenance column, r1.s1.w2); the embedded max is therefore 7.
+//! `llm_call` ledger, VS-1.3.1 work-1.02), `0005` (the coaching schema, r1.s2.w2),
+//! `0006` (the `backtest_run` input provenance columns, r1.s3.w2) and `0007` (the
+//! `llm_call.key_source` provenance column, r1.s1.w2); the embedded max is
+//! therefore 7.
 //!
-//! The 0005/0006 GAP is deliberate, not an omission: those numbers are reserved
-//! for `r1.s2` and `r1.s3`, allocated at release planning so three spines in
-//! flight cannot collide on a migration number. sqlx does not require contiguous
-//! versions — it applies them in numeric order and records what it applied.
+//! The set is now CONTIGUOUS, and the way it got there is the point. `0005` and
+//! `0006` were reserved at release planning for `r1.s2` and `r1.s3` while `r1.s1`
+//! shipped `0007`, so both arrived at databases whose maximum applied version was
+//! already higher than their own. sqlx does not require contiguous versions — it
+//! applies them in numeric order and records what it applied — and
+//! `src/adapters/db/migrate.rs` compares applied version SETS rather than maxima
+//! so filling a reserved gap is never mistaken for "already current".
 //!
 //! §4a-4: this uses the EXPORTED `undo_to(&pool, target)` wrapper, NOT
 //! `Migrator::undo` (a crate-root name collision resolving to the DSL document

@@ -32,7 +32,7 @@ use crate::adapters::db::Db;
 use crate::adapters::db::SqliteBacktestRunRepo;
 use crate::domain::backtest::EquityCurve;
 use crate::domain::strategy::VersionId;
-use crate::domain::{BacktestRunId, BacktestRunRepository, DataError};
+use crate::domain::{BacktestInputs, BacktestRunId, BacktestRunRepository, DataError};
 
 use super::backtest::{TRADE_HEADER, dec, dec_opt, f64_opt, render_trade_row};
 
@@ -141,6 +141,10 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
         persisted.result_content_hash,
     );
 
+    // r1.s3.w2 (#110): what the run CONSUMED, on its own stable line. A legacy row
+    // says so in words rather than printing blanks that read like zeros.
+    println!("{}", render_inputs(persisted.inputs.as_ref()));
+
     // Run-level money totals (the cost readout, FR-6).
     println!(
         "totals\tstarting_equity={}\tnet_pnl={}\tfees_total={}\tfunding_total={}\tslippage_total={}",
@@ -201,6 +205,48 @@ async fn verb_runs_show<R: BacktestRunRepository>(repo: &R, run: &str) -> anyhow
     Ok(())
 }
 
+/// Render the run's input provenance as one stable tab-separated line
+/// (r1.s3.w2, #110).
+///
+/// A run with no higher timeframe prints `htf=none`, which is a fact about the run
+/// rather than a gap in the record. A row written before migration `0006` prints
+/// `inputs unavailable (legacy run)` — the honest statement. It deliberately does
+/// NOT print empty fields: a blank `data_version` reads like a value, and the whole
+/// point of #110 is that a run either names the snapshot it used or admits it
+/// cannot.
+fn render_inputs(inputs: Option<&BacktestInputs>) -> String {
+    let Some(i) = inputs else {
+        return "inputs\tunavailable (legacy run, predates migration 0006)".to_owned();
+    };
+    let htf = i.htf.as_ref().map_or_else(
+        || "htf=none".to_owned(),
+        |htf| {
+            format!(
+                "htf={}\thtf_data_version={}",
+                htf.timeframe.binance_interval(),
+                htf.data_version
+            )
+        },
+    );
+    format!(
+        "inputs\tpair={}\tprimary={}\tprimary_data_version={}\t{htf}\tfee_bps={}\tslippage_bps={}\tfunding={}",
+        i.pair,
+        i.primary.timeframe.binance_interval(),
+        i.primary.data_version,
+        dec(i.taker_fee_bps),
+        dec(i.slippage_bps),
+        funding_token(i.funding),
+    )
+}
+
+/// The stable display token for the funding discriminant — the same
+/// `snake_case` string the column stores, so the CLI and the database agree.
+fn funding_token(funding: crate::domain::FundingConfig) -> &'static str {
+    match funding {
+        crate::domain::FundingConfig::SnapshotRates => "snapshot_rates",
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -247,6 +293,49 @@ mod tests {
             after.db.as_deref().map(std::path::Path::to_str),
             Some(Some("/tmp/y.db")),
             "global --db parses AFTER the verb too"
+        );
+    }
+
+    /// The provenance line is ONE tab-separated record per the doc contract on
+    /// `render_inputs` — every field, including the HTF pair, is its own
+    /// `\t`-delimited field. (The HTF branch shipped space-separated for a round;
+    /// this pin is why it cannot again.)
+    #[test]
+    fn render_inputs_separates_every_field_with_a_tab() {
+        use crate::domain::{
+            BacktestInputs, DataVersion, FundingConfig, Pair, SnapshotSelection, Timeframe,
+        };
+        use rust_decimal::Decimal;
+
+        let inputs = BacktestInputs {
+            pair: Pair::new("BTCUSDT"),
+            primary: SnapshotSelection {
+                timeframe: Timeframe::M15,
+                data_version: DataVersion::new("primarytag"),
+            },
+            htf: Some(SnapshotSelection {
+                timeframe: Timeframe::H4,
+                data_version: DataVersion::new("htftag"),
+            }),
+            taker_fee_bps: Decimal::new(5, 2),
+            slippage_bps: Decimal::new(2, 2),
+            funding: FundingConfig::SnapshotRates,
+        };
+
+        assert_eq!(
+            super::render_inputs(Some(&inputs)),
+            "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\
+             \thtf=4h\thtf_data_version=htftag\tfee_bps=0.05\tslippage_bps=0.02\
+             \tfunding=snapshot_rates"
+        );
+
+        // The htf=none contrast: same tab discipline, no second snapshot field.
+        let mut single = inputs;
+        single.htf = None;
+        assert_eq!(
+            super::render_inputs(Some(&single)),
+            "inputs\tpair=BTCUSDT\tprimary=15m\tprimary_data_version=primarytag\thtf=none\
+             \tfee_bps=0.05\tslippage_bps=0.02\tfunding=snapshot_rates"
         );
     }
 }
