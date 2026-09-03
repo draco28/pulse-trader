@@ -51,8 +51,12 @@ three use-case modules for a concrete-store mention in code, and asserts the
 deterministic engine names neither the adapter nor the port.
 
 **Orchestration lives in an application ring, not in a delivery adapter (r1.s3.w3).**
-`src/application/` holds use cases that are generic over the domain ports and name no
-adapter, no `tauri`, no `specta` and no `sqlx`. The version-id backtest flow lives
+`src/application/` holds use cases that are generic over the domain ports and names no
+infrastructure adapter — no `tauri`, no `specta`, no `sqlx`, no filesystem type. The
+one deliberate adapter import is the deterministic engine itself,
+`crate::adapters::backtest`: it owns no I/O (its `adapters` address is namespace,
+not infrastructure), and the ring's own module doc records that exception at the
+import site. The version-id backtest flow lives
 there because the debug CLI and the desktop command must run the *same* sequence —
 its FR-7 compare-before-insert ordering is a correctness rule that only reads as one
 if it exists once. The ring is also where the backtest-only posture is enforced
@@ -105,9 +109,12 @@ supervision, no version skew between components. The cost is that everything sha
 address space and one release cadence: a component that genuinely needs independent
 deployment would force a revisit, which is this bone's trigger.
 
-With #112 closed there is **no standing exception left to read as precedent** — a
-contributor can now take any use-case module as the compliant pattern. The candle
-path in particular gains a substitutable seam: `r1.s3.w2` captures a backtest's
+With #112 closed the candle path no longer reads as an exception — a contributor can
+take any use-case module as the compliant pattern. The one standing exception is the
+application ring's deliberate import of the deterministic engine, recorded above and in
+the ring's module doc: it is I/O-free and is not a precedent for importing an
+infrastructure adapter from an inward layer. The candle path in particular gains a
+substitutable seam: `r1.s3.w2` captures a backtest's
 exact snapshot inputs through this port rather than threading provenance through a
 concrete filesystem adapter, and a future replay or remote candle source becomes an
 adapter swap instead of an edit to every consumer. The cost is one more trait to
