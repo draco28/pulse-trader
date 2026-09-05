@@ -119,6 +119,67 @@ describe("useActiveOperations (the #141 store)", () => {
     }
   });
 
+  it("records a SYNCHRONOUS throw rather than latching the key forever", async () => {
+    // `invoke()` can throw before it returns a promise — an unwired binding, a
+    // serialisation failure on the arguments. `.then` never runs on that path, so
+    // without a catch the key stays in flight and the record stays `running` for
+    // the lifetime of the app.
+    const { result } = renderHook(() => useActiveOperations(), { wrapper });
+
+    await act(async () => {
+      result.current.start(backtestKey("v1"), () => {
+        throw new Error("the binding is not wired");
+      });
+      await Promise.resolve();
+    });
+
+    const record = result.current.lookup(backtestKey("v1"));
+    expect(record?.running).toBe(false);
+    expect(record?.outcome?.status).toBe("error");
+
+    // And the key is free again: a second start is not swallowed by a latch left
+    // holding an operation that never began.
+    const second = vi.fn(() => Promise.resolve({ status: "ok" as const, data: "second" }));
+    await act(async () => {
+      result.current.start(backtestKey("v1"), second);
+      await Promise.resolve();
+    });
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it("frees the key when an IN-FLIGHT record is cleared, so the operation can start again", async () => {
+    // Clearing a SETTLED record cannot show this: the settle path already freed the
+    // key. The latch only bites while an operation is still in flight — abandon it
+    // and start over — and there `clear` dropping the record alone left the key
+    // held, so every later start for it returned early against an operation nothing
+    // was tracking any more.
+    const gate = deferred<BusResult<string>>();
+    const { result } = renderHook(() => useActiveOperations(), { wrapper });
+    const first = vi.fn(() => gate.promise);
+
+    act(() => {
+      result.current.start(backtestKey("v1"), first);
+    });
+    expect(result.current.lookup(backtestKey("v1"))?.running).toBe(true);
+
+    act(() => {
+      result.current.clear(backtestKey("v1"));
+    });
+
+    const second = vi.fn(() => Promise.resolve({ status: "ok" as const, data: "two" }));
+    await act(async () => {
+      result.current.start(backtestKey("v1"), second);
+      await Promise.resolve();
+    });
+    expect(second).toHaveBeenCalledTimes(1);
+
+    // Let the abandoned first operation finish; it must not resurrect its record.
+    await act(async () => {
+      gate.resolve({ status: "ok", data: "one" });
+      await Promise.resolve();
+    });
+  });
+
   it("keeps a settled result after the CONSUMER unmounts, and hands it back on remount", async () => {
     // The whole of #141 in one assertion: the provider lives above the route, so
     // the record survives the screen that started it.

@@ -14,7 +14,7 @@
 // pointer/keyboard tooltip parity with Left/Right/Home/End traversal, the
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1071,8 +1071,89 @@ describe("BacktestLabScreen (the coach rail)", () => {
 
     // The Lab's own selection moves to the child — the rail's second link is a
     // real affordance in THIS screen, not a second route.
+    //
+    // Awaited, because selecting the child REFETCHES the catalog first: the child
+    // was minted after the catalog was read, so selecting it against the stale
+    // list would set the selector to an id no option carries.
     fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
-    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+    await waitFor(() => {
+      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+    });
+  });
+
+  it("lets a failed turn be asked again — the recovery the card states is one the rail can perform", async () => {
+    await openRail(failedSession("interrupted", "the turn never settled", "start a new coaching session"));
+    await screen.findByText(/start a new coaching session/i);
+
+    // The card's recovery is an ACTION, not advice the rail cannot act on: the
+    // settled record is cleared and a second turn actually starts.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach again/i }));
+
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock).toHaveBeenCalledTimes(2);
+    // `interrupted` is terminal, so the retry carries a NEW session id rather than
+    // asking again under one the backend has already settled.
+    expect(coachTurnMock.mock.calls[1][0].sessionId).not.toBe(
+      coachTurnMock.mock.calls[0][0].sessionId,
+    );
+  });
+
+  it("gives an operational failure a recovery too, so no failure card is a dead end", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: { code: "internal", message: "the provider is unreachable", run_id: null },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    // No typed coach failure exists to name its own recovery — the generic one is
+    // stated rather than left blank.
+    await screen.findByText(/the provider is unreachable/i);
+    expect(screen.getByText(/what to do/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /ask the coach again/i })).toBeTruthy();
+  });
+
+  it("keeps the proposal when a decision is refused, and shows the reason on the card", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "error",
+      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
+    fireEvent.change(screen.getByLabelText(/new value/i), { target: { value: "abc" } });
+    fireEvent.click(screen.getByRole("button", { name: /re-validate|apply/i }));
+
+    // The refusal appears ON the card. The proposal it refused is still there to
+    // correct — replacing it with the message would throw away what was edited.
+    await screen.findByText(/is not a whole-number period/i);
+    expect(screen.getByText(/a slower RSI trades less often on this chop/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^accept$/i })).toBeTruthy();
+  });
+
+  it("shows a busy refusal as its own transient state with a way to check again", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: { code: "busy", message: "a coach turn for this run is already running", run_id: null },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    // Not a failure — nothing broke. Not `running` either: THIS record settled, so
+    // nothing further will arrive to move it along and the trader needs a way to
+    // pick the other invocation's result up.
+    await screen.findByText(/already running/i);
+    expect(screen.queryByText(/what to do/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /check again/i })).toBeTruthy();
+  });
+
+  it("names each decision in flight — modifying, rejecting, accepting", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockImplementation(() => new Promise(() => {}));
+
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    await screen.findByText(/recording the rejection/i);
   });
 
   it("says so when an accepted child run could not be read back, and still names both ids", async () => {

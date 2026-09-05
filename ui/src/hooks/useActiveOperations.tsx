@@ -111,12 +111,26 @@ function useOperationStore(): ActiveOperations {
       setRecords((current) => ({ ...current, [key]: { running: false, outcome, label } }));
     };
 
-    invoke().then(settle, (error: unknown) => settle(bridgeError(error)));
+    // `invoke()` can throw BEFORE it returns a promise — a binding that is not
+    // wired, a serialisation failure on the arguments. `.then` never runs on that
+    // path, so without the try/catch the key stays in `inFlight` and the record
+    // stays `running: true` for the lifetime of the app: the operation can never be
+    // started again and never shows a result.
+    try {
+      invoke().then(settle, (error: unknown) => settle(bridgeError(error)));
+    } catch (error: unknown) {
+      settle(bridgeError(error));
+    }
     },
     [],
   );
 
   const clear = useCallback((key: string) => {
+    // The in-flight ref goes with the record. Dropping only the record leaves the
+    // key latched, so the next start for it returns early against an operation
+    // nothing is tracking any more — the failure card's own retry is the caller
+    // that hits this first.
+    inFlight.current.delete(key);
     setRecords((current) => {
       const { [key]: _removed, ...rest } = current;
       return rest;

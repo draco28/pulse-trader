@@ -17,7 +17,7 @@
 // default export, zero props — the shell mounts it from the route table and
 // all state is its own.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { commands } from "../bindings";
 import type {
@@ -116,29 +116,54 @@ function runStateOf(record: OperationRecord | undefined): RunState {
 // Coach rail state (r1.s4.w3) — opt-in, beneath the selected persisted run
 // ---------------------------------------------------------------------------
 
-/** What the rail's one operation key holds: a turn, or a decision on it. */
+/**
+ * What the rail's one operation key holds: a turn, a decision on it, or a decision
+ * the backend REFUSED.
+ *
+ * The refusal rides as a settled outcome rather than an error because it is not the
+ * turn that failed — the proposal is untouched and still actionable, and dropping
+ * it to show a validation message would throw away the thing the trader was editing.
+ */
 type CoachOutcome =
   | { kind: "turn"; session: CoachSessionDto }
-  | { kind: "decision"; decision: CoachDecisionDto };
+  | { kind: "decision"; decision: CoachDecisionDto }
+  | { kind: "refused"; session: CoachSessionDto; error: BusError };
 
 /**
- * The rail's eight explicit states, and nothing outside them.
+ * The rail's explicit states, and nothing outside them.
  *
- * A `busy` refusal is a `running` state, not a failure: nothing broke, and the
- * answer the trader wants is already coming from the invocation that holds the
- * key. A non-`busy` `BusError` is a `failed` state with no named recovery, because
- * a recovery is a property of a TYPED coach failure and inventing one for a
- * transport-level error would be advice nobody stands behind.
+ * A `busy` refusal has a state of its own. It used to project onto `running`, which
+ * reads correctly — the answer IS coming from whoever holds the key — but the
+ * record it lands on has already settled, so nothing further will ever arrive to
+ * move it off `running`, and the rail sits on "Asking the coach…" for good. It is a
+ * transient state with its own retry instead.
+ *
+ * A non-`busy` `BusError` is a `failed` state. Its recovery is the generic one: a
+ * TYPED coach failure carries the backend's own named recovery, and an operational
+ * error has no such thing — but a failure card with no way forward is a dead end,
+ * so "try again" is stated rather than left blank.
  */
 type RailState =
   | { kind: "idle" }
   | { kind: "running"; note: string | null }
+  | { kind: "busy"; note: string }
   | { kind: "modifying" }
   | { kind: "rejecting" }
   | { kind: "accepting" }
-  | { kind: "proposal"; session: CoachSessionDto }
+  | { kind: "proposal"; session: CoachSessionDto; refusal: BusError | null }
   | { kind: "failed"; session: CoachSessionDto | null; error: BusError | null }
   | { kind: "completed"; session: CoachSessionDto; accepted: AcceptedCoachDto };
+
+/** The states in which something is genuinely in flight, so asking again is a
+ * duplicate rather than a retry. Everything else — including a settled failure —
+ * is a rail the trader may start over. */
+const IN_FLIGHT_KINDS = new Set<RailState["kind"]>([
+  "running",
+  "busy",
+  "modifying",
+  "rejecting",
+  "accepting",
+]);
 
 /** The label each decision runs under, so a remount can still name what is in
  * flight rather than only that something is. */
@@ -166,8 +191,14 @@ function railStateOf(record: OperationRecord | undefined): RailState {
   }
   if (outcome.status === "error") {
     return outcome.error.code === "busy"
-      ? { kind: "running", note: outcome.error.message }
+      ? { kind: "busy", note: outcome.error.message }
       : { kind: "failed", session: null, error: outcome.error };
+  }
+  // A REFUSED decision keeps its proposal: the backend rejected the edit, not the
+  // turn, so the card the trader was working in stays on screen with the reason
+  // attached rather than being replaced by it.
+  if (outcome.data.kind === "refused") {
+    return { kind: "proposal", session: outcome.data.session, refusal: outcome.data.error };
   }
   const session =
     outcome.data.kind === "turn" ? outcome.data.session : outcome.data.decision.session;
@@ -179,7 +210,7 @@ function railStateOf(record: OperationRecord | undefined): RailState {
     return { kind: "failed", session, error: null };
   }
   if (session.outcome === "proposed") {
-    return { kind: "proposal", session };
+    return { kind: "proposal", session, refusal: null };
   }
   // A `pending` session is a claim that has not settled — the honest reading is
   // that the turn is still going, which is what the trader sees.
@@ -229,36 +260,52 @@ export default function BacktestLabScreen() {
   /** Every active operation, held above the route (#141). The Lab READS it. */
   const operations = useActiveOperations();
 
-  useEffect(() => {
-    let alive = true;
-    commands
-      .libraryOverview()
-      .then((result) => {
-        if (!alive) return;
+  /**
+   * Read the catalog and project it into the selector's state.
+   *
+   * Extracted from the mount effect because an ACCEPT mints a child version that
+   * the once-fetched catalog cannot contain: selecting that child without
+   * refetching sets the selector to an id no option carries, which renders it
+   * blank, drops the rail and the result, and points Run at a version the trader
+   * cannot see.
+   *
+   * `alive` is the caller's — the mount effect passes its own cleanup flag so a
+   * response arriving after unmount sets no state.
+   */
+  const loadCatalog = useCallback(
+    async (alive: () => boolean = () => true): Promise<Set<string>> => {
+      try {
+        const result = await commands.libraryOverview();
+        if (!alive()) return new Set();
         if (result.status === "ok") {
           const options = catalogOptions(result.data);
-          setCatalog(
-            options.length === 0 ? { kind: "empty" } : { kind: "ready", options },
-          );
-        } else {
-          setCatalog({
-            kind: "error",
-            code: result.error.code,
-            message: result.error.message,
-          });
+          setCatalog(options.length === 0 ? { kind: "empty" } : { kind: "ready", options });
+          return new Set(options.map((option) => option.value));
         }
-      })
-      .catch(() => {
+        setCatalog({
+          kind: "error",
+          code: result.error.code,
+          message: result.error.message,
+        });
+      } catch {
         // The IPC call itself failing (no app handle under a non-Tauri
         // preview) — the honest error state, never fabricated options.
-        if (alive) {
+        if (alive()) {
           setCatalog({ kind: "error", code: "internal", message: "The library read failed." });
         }
-      });
+      }
+      return new Set();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    let alive = true;
+    void loadCatalog(() => alive);
     return () => {
       alive = false;
     };
-  }, []);
+  }, [loadCatalog]);
 
   const options = catalog.kind === "ready" ? catalog.options : [];
   const currentId = selectedId ?? options[0]?.value ?? null;
@@ -275,6 +322,22 @@ export default function BacktestLabScreen() {
    * coach rail is per-run, so it closes with the selection. */
   function onSelectorChange(id: string) {
     setSelectedId(id);
+  }
+
+  /**
+   * Select the child an accept just minted — after refetching the catalog.
+   *
+   * The child did not exist when the catalog was read, so selecting it against the
+   * stale list sets the selector to an id no option carries: the select renders
+   * blank, this screen's projection finds no operation for it, and Run targets a
+   * version the trader cannot see. Refetch first, and only select what the fresh
+   * catalog actually contains.
+   */
+  async function onSelectChild(versionId: string) {
+    const known = await loadCatalog();
+    if (known.has(versionId)) {
+      setSelectedId(versionId);
+    }
   }
 
   /** The screen's ONLY invocation of the backtest command — the Run button's
@@ -299,10 +362,26 @@ export default function BacktestLabScreen() {
   const runId = run.kind === "done" ? run.dto.runId : null;
   const rail = railStateOf(runId === null ? undefined : operations.lookup(coachKey(runId)));
 
-  /** "Ask the coach": the DESKTOP mints the session id, once, here. */
+  /**
+   * "Ask the coach": the DESKTOP mints the session id, once, here.
+   *
+   * A settled rail is cleared FIRST. Without that the guard below rejects every
+   * ask after the first outcome, which made the failure card's own recovery text
+   * unactionable — it told the trader to ask again on a rail that could not.
+   *
+   * The id is reused when the previous turn is one the backend can still settle
+   * against, and freshly minted when it cannot: an `interrupted` session is
+   * terminal, so asking again under its id would meet the already-settled row
+   * rather than starting a turn.
+   */
   function onAskCoach() {
-    if (runId === null || rail.kind !== "idle") return;
-    const sessionId = crypto.randomUUID();
+    if (runId === null || IN_FLIGHT_KINDS.has(rail.kind)) return;
+    const previous = sessionIdOf(rail);
+    const terminal = rail.kind === "failed" && rail.session?.failure?.kind === "interrupted";
+    const sessionId = previous === null || terminal ? crypto.randomUUID() : previous;
+    if (rail.kind !== "idle") {
+      operations.clear(coachKey(runId));
+    }
     operations.start(
       coachKey(runId),
       async () => {
@@ -320,10 +399,19 @@ export default function BacktestLabScreen() {
   function onDecide(action: CoachActionDto) {
     const sessionId = sessionIdOf(rail);
     if (runId === null || sessionId === null) return;
+    // The proposal as it stands, captured before the call: a REFUSED decision
+    // returns it unchanged rather than replacing the card with the refusal.
+    const current = rail.kind === "proposal" ? rail.session : null;
     operations.start(
       coachKey(runId),
       async () => {
         const result = await commands.coachDecide({ sessionId, action });
+        if (result.status === "error" && current !== null && result.error.code !== "busy") {
+          return {
+            status: "ok" as const,
+            data: { kind: "refused" as const, session: current, error: result.error },
+          };
+        }
         return result.status === "ok"
           ? { status: "ok" as const, data: { kind: "decision" as const, decision: result.data } }
           : result;
@@ -424,7 +512,7 @@ export default function BacktestLabScreen() {
             state={rail}
             onAsk={onAskCoach}
             onDecide={onDecide}
-            onSelectChild={onSelectorChange}
+            onSelectChild={(id) => void onSelectChild(id)}
           />
           <EquityChart
             points={run.dto.equity}
@@ -886,7 +974,12 @@ function CoachRail({
   return (
     <section className="bt-section coach-rail" aria-label="Coach rail">
       <h3 className="bt-h">Coach</h3>
-      <CoachBody state={state} onDecide={onDecide} onSelectChild={onSelectChild} />
+      <CoachBody
+        state={state}
+        onAsk={onAsk}
+        onDecide={onDecide}
+        onSelectChild={onSelectChild}
+      />
       <CoachProvenance state={state} />
     </section>
   );
@@ -902,10 +995,12 @@ const IN_FLIGHT: Record<string, string> = {
 
 function CoachBody({
   state,
+  onAsk,
   onDecide,
   onSelectChild,
 }: {
   state: RailState;
+  onAsk: () => void;
   onDecide: (action: CoachActionDto) => void;
   onSelectChild: (versionId: string) => void;
 }) {
@@ -918,18 +1013,34 @@ function CoachBody({
     return (
       <div className="coach-state dim" role="status">
         {IN_FLIGHT[state.kind]}
-        {/* A `busy` refusal is not a failure — the answer is already coming. */}
         {state.kind === "running" && state.note !== null && (
           <p className="coach-busy">{state.note}</p>
         )}
       </div>
     );
   }
+  // A `busy` refusal is not a failure — nothing broke, and the answer is coming
+  // from whoever holds the key. It is not `running` either: THIS record has
+  // settled, so nothing further will arrive to move it along, and the retry is
+  // how the trader picks the result up.
+  if (state.kind === "busy") {
+    return (
+      <div className="coach-state dim" role="status">
+        {IN_FLIGHT.running}
+        <p className="coach-busy">{state.note}</p>
+        <button type="button" className="coach-retry btn-sec" onClick={onAsk}>
+          Check again
+        </button>
+      </div>
+    );
+  }
   if (state.kind === "failed") {
-    return <FailureCard session={state.session} error={state.error} />;
+    return <FailureCard session={state.session} error={state.error} onAsk={onAsk} />;
   }
   if (state.kind === "proposal") {
-    return <ProposalCard session={state.session} onDecide={onDecide} />;
+    return (
+      <ProposalCard session={state.session} refusal={state.refusal} onDecide={onDecide} />
+    );
   }
   if (state.kind === "completed") {
     return (
@@ -946,24 +1057,36 @@ function CoachBody({
   return null;
 }
 
-/** One recorded failure: the typed kind, its detail, and the BACKEND's recovery. */
+/**
+ * One recorded failure: the typed kind, its detail, and the BACKEND's recovery.
+ *
+ * Every failure card carries a recovery AND the action that performs it. A typed
+ * coach failure names its own; an operational error has none to name, so the
+ * generic one is stated rather than left blank — a failure card with no way
+ * forward is a dead end, and the recovery text was previously advice the rail
+ * could not act on.
+ */
 function FailureCard({
   session,
   error,
+  onAsk,
 }: {
   session: CoachSessionDto | null;
   error: BusError | null;
+  onAsk: () => void;
 }) {
   const failure = session?.failure ?? null;
+  const recovery = failure?.recovery ?? "try again";
   return (
     <div className="coach-failure" role="alert">
       <p className="coach-failure-kind mono">{failure?.kind ?? error?.code ?? "internal"}</p>
       <p className="coach-failure-detail">{failure?.detail ?? error?.message ?? ""}</p>
-      {failure !== null && (
-        <p className="coach-recovery">
-          <span className="coach-recovery-label">What to do</span> {failure.recovery}
-        </p>
-      )}
+      <p className="coach-recovery">
+        <span className="coach-recovery-label">What to do</span> {recovery}
+      </p>
+      <button type="button" className="coach-retry btn-prim" onClick={onAsk}>
+        Ask the coach again
+      </button>
     </div>
   );
 }
@@ -971,9 +1094,11 @@ function FailureCard({
 /** The one proposed change, its hypothesis, and the three actions. */
 function ProposalCard({
   session,
+  refusal,
   onDecide,
 }: {
   session: CoachSessionDto;
+  refusal: BusError | null;
   onDecide: (action: CoachActionDto) => void;
 }) {
   const proposal = session.proposal;
@@ -992,6 +1117,14 @@ function ProposalCard({
         <span className="coach-change-value mono">{proposal.mutation.newValue}</span>
       </div>
       <p className="coach-hypothesis">{proposal.hypothesis}</p>
+      {/* A refused decision, shown ON the card rather than in place of it: the
+          backend rejected the edit, not the turn, so the proposal is still here
+          to correct and act on. */}
+      {refusal !== null && (
+        <p className="coach-refusal" role="alert">
+          <span className="mono">{refusal.code}</span> {refusal.message}
+        </p>
+      )}
       <p className="coach-disposition">
         <span className="coach-disposition-label">Status</span>{" "}
         <span className="mono">{proposal.disposition}</span>
