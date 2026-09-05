@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO coaching_sessions (id, backtest_run_id, strategy_version_id, created_at, llm_call_id, outcome, failure_kind, failure_detail, schema_version, request_fingerprint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "96e83c723ce9a3838e9f5fdbb5702f9772a7b803cf640eedc2d0c49f0e64072b"
+}

@@ -304,6 +304,7 @@ async fn no_persisted_artifact_of_a_turn_contains_the_canary() {
             proposal.hypothesis.as_str()
         ),
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     let call_id = outcome

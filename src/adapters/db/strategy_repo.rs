@@ -130,7 +130,11 @@ fn feed_str(hasher: &mut Sha256, s: &str) {
 /// lowercase hex digest (unlike version.rs's 16-char `data_version` truncation,
 /// this is an integrity field). Scope is position-scoped (strategy + parent), not
 /// pure-content (gate-7 C6).
-fn version_hash(
+///
+/// `pub(crate)` since r1.s4.w4: the coach's accept transaction mints a child
+/// version and must key it with the SAME hash this file computes, or the two
+/// creation paths would disagree about a version's content identity.
+pub(crate) fn version_hash(
     strategy_id: &str,
     parent: Option<&str>,
     schema_version: &str,
@@ -419,25 +423,22 @@ impl<C: Clock + Send + Sync> StrategyRepository for SqliteStrategyRepo<C> {
             .begin()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
-        sqlx::query!(
-            "INSERT INTO strategy_version \
-             (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
-              version_hash, created_by, creating_llm_call_ids, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            id,
-            strategy_id_str,
-            parent_str,
-            schema_version_str,
-            dsl_current,
-            loaded.dsl_original,
-            hash,
-            created_by_text,
-            llm_ids_json,
-            created_at,
+        insert_version_row(
+            &mut tx,
+            &VersionInsert {
+                id: &id,
+                strategy_id: &strategy_id_str,
+                parent_version_id: parent_str.as_deref(),
+                dsl_schema_version: &schema_version_str,
+                dsl: &dsl_current,
+                dsl_original: &loaded.dsl_original,
+                version_hash: &hash,
+                created_by: &created_by_text,
+                creating_llm_call_ids: &llm_ids_json,
+                created_at: &created_at,
+            },
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
+        .await?;
         tx.commit()
             .await
             .map_err(|e| DataError::Db(e.to_string()))?;
@@ -642,6 +643,78 @@ fn parent_order(mut versions: Vec<StrategyVersion>) -> Vec<StrategyVersion> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// r1.s4.w4 — the crate-private version insert mapping, extracted so the coach's
+// accept transaction can REUSE it.
+//
+// `commit_acceptance` mints the child `strategy_version` inside the same
+// transaction that writes its run. Copying this mapping there would have created a
+// second place that knows how a version becomes columns, and `strategy_version`
+// carries `version_hash` — an integrity field whose two writers drifting apart is
+// not a cosmetic problem.
+// ---------------------------------------------------------------------------
+
+/// The `strategy_version` column tuple, already canonicalized by the caller.
+///
+/// Borrowed rather than owned: every field is a `TEXT` column and both call sites
+/// already hold the rendered strings, so this is a parameter list with names
+/// instead of ten positional `&str`s (`clippy::too_many_arguments`, and the
+/// positional form is exactly how a `dsl`/`dsl_original` swap gets written).
+pub(crate) struct VersionInsert<'a> {
+    /// The minted row id.
+    pub id: &'a str,
+    /// The owning strategy.
+    pub strategy_id: &'a str,
+    /// The parent version, when this is not a root.
+    pub parent_version_id: Option<&'a str>,
+    /// The DSL schema version tag.
+    pub dsl_schema_version: &'a str,
+    /// The migrated, current-schema DSL as JSON.
+    pub dsl: &'a str,
+    /// The DSL exactly as authored, byte-for-byte.
+    pub dsl_original: &'a str,
+    /// The content-identity hash (see [`version_hash`]).
+    pub version_hash: &'a str,
+    /// The serialized `CreatedBy`.
+    pub created_by: &'a str,
+    /// The serialized creating-call id array.
+    pub creating_llm_call_ids: &'a str,
+    /// RFC3339 UTC creation timestamp.
+    pub created_at: &'a str,
+}
+
+/// Insert one `strategy_version` row on the caller's transaction.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] when the store rejects the write — including the
+/// `0001` immutability triggers and the FK on `parent_version_id`.
+pub(crate) async fn insert_version_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row: &VersionInsert<'_>,
+) -> Result<(), DataError> {
+    sqlx::query!(
+        "INSERT INTO strategy_version \
+         (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
+          version_hash, created_by, creating_llm_call_ids, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        row.id,
+        row.strategy_id,
+        row.parent_version_id,
+        row.dsl_schema_version,
+        row.dsl,
+        row.dsl_original,
+        row.version_hash,
+        row.created_by,
+        row.creating_llm_call_ids,
+        row.created_at,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]

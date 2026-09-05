@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO coaching_proposals (id, session_id, mutation, hypothesis, disposition, child_version_id, accepted_run_id, accept_failure_stage, accept_failure_detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "5493bb6a1c415a10b3e4dc8603c1e19722e4858e53a659357cd0f29237f22f51"
+}

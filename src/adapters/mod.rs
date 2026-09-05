@@ -9,6 +9,10 @@ pub(crate) mod binance;
 // WI-1.1.1.03: Clock adapters (SystemClock + FakeClock) for the closed-candle cutoff.
 pub(crate) mod clock;
 
+// r1.s4.w4: IdSource adapters (UuidIdSource + SeqIdSource) — the injected row-id
+// seam the coach accept mints its child/run identity through.
+pub(crate) mod ids;
+
 // WI-1.1.1.04: immutable, content-versioned Parquet persistence for `CandleSeries`.
 pub(crate) mod store;
 
@@ -44,3 +48,9 @@ pub(crate) mod llm;
 // AC-7). `pub(crate)` matching the sibling adapter precedent; `lib.rs` curates the
 // public re-export.
 pub(crate) mod secrets;
+
+// r1.s4.w4: in-memory adapters at product-owned seams — currently the
+// `CoachAcceptanceRepository` test adapter that lets the accept rail's decision
+// logic be driven without a database. Shipped (not `#[cfg(test)]`) because the
+// integration binaries and later work items consume it across the crate boundary.
+pub(crate) mod memory;

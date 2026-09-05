@@ -278,6 +278,7 @@ async fn a_persisted_run_yields_one_validated_mutation_with_a_hypothesis() {
             assert_eq!(proposal.disposition, Disposition::Proposed);
         }
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
     assert_eq!(&session.backtest_run_id, &run_id);
 
@@ -458,6 +459,7 @@ async fn an_empty_overlay_dir_falls_back_to_the_compiled_in_default() {
             }
         ),
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 

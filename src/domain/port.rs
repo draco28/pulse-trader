@@ -34,7 +34,11 @@ use crate::domain::backtest::{
     BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RunSummary, Trade,
 };
 use crate::domain::candle::Candle;
-use crate::domain::coaching::{CoachingSession, CoachingSessionId, Disposition};
+use crate::domain::coaching::{
+    AcceptedCoachOutcome, CoachAcceptFailure, CoachSessionClaim, CoachSessionClaimResult,
+    CoachingSession, CoachingSessionId, Disposition, InitialCoachOutcome, PreparedCoachAcceptance,
+    Proposal,
+};
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
@@ -559,8 +563,65 @@ pub trait LlmCallRepository {
 /// re-established by [`apply`](crate::domain::apply) at use time, so there is
 /// deliberately no method here that reads or writes such a fact.
 pub trait CoachingRepository {
+    /// **Reserve** a session id before the provider call (r1.s4.w4).
+    ///
+    /// This is the operation that makes a coach turn recoverable. It commits a
+    /// `pending` row keyed by the claim's opaque
+    /// [`CoachRequestFingerprint`](crate::domain::CoachRequestFingerprint) and
+    /// returns — **no write transaction is held across the network call** — so a
+    /// crash mid-turn leaves a claim to finalize instead of a silence to explain.
+    ///
+    /// The three [`CoachSessionClaimResult`]s are semantic, not mechanical.
+    /// `Claimed` means this call owns the one provider attempt. `Existing` means the
+    /// same request already settled and is the idempotent answer. `ExistingPending`
+    /// means the same request is still open — and the repository deliberately does
+    /// NOT judge whether that claim is live, because it cannot see the process that
+    /// made it. `w1`'s process-local single-flight owner decides: reattach a live
+    /// call, refuse a duplicate, or finalize a claim left by an earlier process
+    /// lifetime through [`finish_session`](CoachingRepository::finish_session) as a
+    /// typed `interrupted` — never with a second provider call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session id is reused with a DIFFERENT
+    /// run, version or fingerprint — that is a collision, never an idempotent hit —
+    /// and on any store failure.
+    fn claim_session(
+        &self,
+        claim: CoachSessionClaim,
+    ) -> impl Future<Output = Result<CoachSessionClaimResult, DataError>> + Send;
+
+    /// Settle a claimed session, exactly once (r1.s4.w4).
+    ///
+    /// It moves the one claimed `pending` row to a single initial `Proposed` or
+    /// `Failed` outcome — `interrupted` included — and attaches the ledger
+    /// correlation learned during the turn. It cannot settle an already-terminal
+    /// row, cannot attach a second proposal, and is not a route around
+    /// [`record_disposition`](CoachingRepository::record_disposition) for a later
+    /// disposition: the returned session is the initial record, not a settled one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when there is no pending claim under that id (an
+    /// absent session, or one that already settled), when the outcome is
+    /// [`SessionOutcome::Pending`](crate::domain::SessionOutcome::Pending), when it
+    /// carries an already-dispositioned proposal, or on a store failure.
+    fn finish_session(
+        &self,
+        session_id: &CoachingSessionId,
+        outcome: InitialCoachOutcome,
+    ) -> impl Future<Output = Result<CoachingSession, DataError>> + Send;
+
     /// Persist one coach turn — the session row, plus its proposal row when the
     /// turn produced one.
+    ///
+    /// **Round-1 survivor (r1.s4.w4).** Production turn creation moves to
+    /// `claim_session` + `finish_session`; this remains for the callers and tests
+    /// that still write an initial turn in one act, and it is the one path that may
+    /// still insert a terminal row with no request fingerprint. It accepts INITIAL
+    /// proposed/failed shapes only — never a claim, and never an
+    /// already-modified/accepted/rejected proposal — and `w1` retires the
+    /// production bypass.
     ///
     /// The stored `created_at` is sourced from the adapter's injected `Clock`
     /// (deterministic under test); every other field is persisted verbatim.
@@ -630,13 +691,81 @@ pub trait CoachingRepository {
     /// (an absent session, or a turn that failed), when the requested transition is
     /// not legal from the proposal's current state, when the target is
     /// [`Disposition::Proposed`] or [`Disposition::Modified`], or when the store
-    /// rejects the write — including the `0005` `CHECK` that an accepted proposal
-    /// must name its child version and nothing else may.
+    /// rejects the write — including the `0008` `CHECK`s that an accepted proposal
+    /// must name BOTH its child version and that child's `accepted_run_id`, and
+    /// that nothing else may name either.
     fn record_disposition(
         &self,
         id: &CoachingSessionId,
         disposition: &Disposition,
     ) -> impl Future<Output = Result<(), DataError>> + Send;
+}
+
+/// The coach ACCEPT persistence port (r1.s4.w4, ADR-0010 / ADR-0019 / ADR-0021).
+///
+/// A product-owned seam, separate from [`CoachingRepository`] because it answers a
+/// different question: that port records what a TURN produced, this one records
+/// what a DECISION did. Two implementations ship — the real `SQLite` adapter and a
+/// deterministic in-memory test adapter — and both are consumed generically
+/// (`<A: CoachAcceptanceRepository>`), never as `dyn`.
+///
+/// **Two semantic operations, not transaction steps.** There is deliberately no
+/// `begin`/`insert_child`/`insert_run`/`commit` on this trait. Exposing the steps
+/// would put the atomicity guarantee in the caller's hands, and the whole point of
+/// the seam is that "an accept produced a child, its run and its links, or it
+/// produced none of them" is the adapter's promise.
+///
+/// **Nothing here computes.** Validation, snapshot loading and the deterministic
+/// backtest all happen before either method is called, so no write transaction is
+/// ever open across network or CPU work.
+pub trait CoachAcceptanceRepository {
+    /// Record a typed failure of one accept attempt.
+    ///
+    /// Leaves the disposition where it was — `proposed` or `modified` — and stores
+    /// no child and no run: a failed accept mints nothing. The stored failure is
+    /// the LATEST accept outcome on the mutable proposal projection, so a second
+    /// failed attempt replaces the first rather than appending to it.
+    ///
+    /// Returns the proposal as it now stands, carrying the failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session has no proposal to fail (an
+    /// absent session, or a turn that failed), when the proposal is already settled
+    /// — `0008` refuses an accept failure on an accepted or rejected row, because
+    /// neither is an attempt that can still fail — or on a store failure.
+    fn record_accept_failure(
+        &self,
+        session_id: &CoachingSessionId,
+        failure: CoachAcceptFailure,
+    ) -> impl Future<Output = Result<Proposal, DataError>> + Send;
+
+    /// Commit one accept: child version, its run and trades, and the proposal's
+    /// links — **in a single transaction, or not at all**.
+    ///
+    /// Inside that transaction the adapter checks the session is `proposed` and has
+    /// exactly one attributable `llm_call_id`; checks the proposal is
+    /// `proposed`/`modified` with no accepted child or run; MINTS the child
+    /// `VersionId`, the [`BacktestRunId`] and `created_at` from its injected
+    /// id/clock sources; and DERIVES the strategy id, the parent version id,
+    /// `CreatedBy::CoachLlm` and the creating call id from the claimed session row.
+    /// [`PreparedCoachAcceptance`] carries no identity precisely so the caller
+    /// cannot supply provenance that disagrees with the session.
+    ///
+    /// Replaying an accept for an already-accepted session returns the EXISTING
+    /// exact child and run and inserts nothing — the session id is the accept
+    /// idempotency key, so a client that lost the response can always retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session is not a proposed turn, when it
+    /// names no single attributable call, when the proposal is rejected or already
+    /// accepted with a different child, or when any part of the write fails — in
+    /// which case the whole transaction rolls back and **no child version exists**.
+    fn commit_acceptance(
+        &self,
+        acceptance: PreparedCoachAcceptance,
+    ) -> impl Future<Output = Result<AcceptedCoachOutcome, DataError>> + Send;
 }
 
 #[cfg(test)]
