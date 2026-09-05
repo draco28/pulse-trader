@@ -22,6 +22,10 @@ vi.mock("../bindings", () => ({
   commands: {
     libraryOverview: vi.fn(),
     runBacktestVersion: vi.fn(),
+    // r1.s4.w3: the rail's two commands, mocked on the same terms — no command
+    // answers except through this mock.
+    coachTurn: vi.fn(),
+    coachDecide: vi.fn(),
   },
 }));
 
@@ -29,9 +33,12 @@ import { commands } from "../bindings";
 import type {
   BacktestRunDto,
   BusError,
+  CoachDecisionDto,
+  CoachSessionDto,
   HistogramBinDto,
   LibraryOverview,
   LibraryVersion,
+  SummaryDto,
 } from "../bindings";
 import BacktestLabScreen from "./BacktestLabScreen";
 import { RouteContent } from "../App";
@@ -760,5 +767,374 @@ describe("the backtest route entry (the real ROUTES table)", () => {
     catalogMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
     render(<RouteContent route={route} />);
     expect(await screen.findByText(/no strategies yet/i)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The coach rail (r1.s4.w3) — opt-in, one proposal or one recorded failure
+// ---------------------------------------------------------------------------
+//
+// Same discipline as the run tests above: every value asserted is a fixture
+// string, so a pass means the rail rendered the DTO's own text. The `recovery`
+// fixtures are deliberately NOT the real recovery sentences — a rail that mapped
+// failure kind to recovery text in TypeScript would render its own copy and pass
+// a laxer assertion; these can only pass by rendering the DTO's field.
+
+const PARENT_SUMMARY: SummaryDto = {
+  tradeCount: 8,
+  winCount: 3,
+  lossCount: 5,
+  winRate: "0.375",
+  grossProfit: "180.000",
+  grossLoss: "264.125",
+  netPnl: "-84.125",
+  profitFactor: null,
+  avgWin: "60.000",
+  avgLoss: "52.825",
+  expectancy: "-10.515625",
+  maxDrawdown: "412.750",
+  maxWinStreak: 2,
+  maxLossStreak: 3,
+  commissionTotal: "26.400",
+  fundingTotal: "-3.115",
+  sharpe: null,
+  sortino: null,
+};
+
+const CHILD_SUMMARY: SummaryDto = {
+  ...PARENT_SUMMARY,
+  tradeCount: 6,
+  winCount: 4,
+  lossCount: 2,
+  winRate: "0.666",
+  netPnl: "121.500",
+  expectancy: "20.250",
+};
+
+function proposedSession(overrides: Partial<CoachSessionDto> = {}): CoachSessionDto {
+  return {
+    sessionId: "sess-77",
+    runId: SEEDED_RUN.runId,
+    versionId: "v-alpha-1",
+    outcome: "proposed",
+    proposal: {
+      mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+      hypothesis: "a slower RSI trades less often on this chop",
+      disposition: "proposed",
+      childVersionId: null,
+      acceptedRunId: null,
+      acceptFailure: null,
+    },
+    failure: null,
+    llmCallId: "call-abc",
+    cost: { amount: "0.0184", currency: "CNY" },
+    promptVersion: "b7f3ac91",
+    createdAt: "2026-09-05T10:15:00.000Z",
+    ...overrides,
+  };
+}
+
+function failedSession(kind: string, detail: string, recovery: string): CoachSessionDto {
+  return {
+    ...proposedSession(),
+    outcome: "failed",
+    proposal: null,
+    failure: { kind, detail, recovery },
+  };
+}
+
+const coachTurnMock = vi.mocked(commands.coachTurn);
+const coachDecideMock = vi.mocked(commands.coachDecide);
+
+/** Render, run, then open the rail — the trader's actual sequence. */
+async function openRail(session: CoachSessionDto) {
+  const container = await renderRun(SEEDED_RUN);
+  coachTurnMock.mockResolvedValue({ status: "ok", data: session });
+  fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+  await screen.findByRole("region", { name: /coach/i });
+  return container;
+}
+
+describe("BacktestLabScreen (the coach rail)", () => {
+  beforeEach(() => {
+    coachTurnMock.mockReset();
+    coachDecideMock.mockReset();
+  });
+
+  it("is opt-in: no coach command is invoked from mount, StrictMode included, and no rail is shown", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock.mockResolvedValue({ status: "ok", data: SEEDED_RUN });
+
+    render(
+      <StrictMode>
+        <BacktestLabScreen />
+      </StrictMode>,
+    );
+    await screen.findByRole("button", { name: /run backtest/i });
+
+    expect(coachTurnMock).not.toHaveBeenCalled();
+    expect(coachDecideMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
+  });
+
+  it("offers the coach only beneath a persisted run, and mints the session id itself", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+    await screen.findByRole("region", { name: /coach/i });
+
+    expect(coachTurnMock).toHaveBeenCalledTimes(1);
+    const request = coachTurnMock.mock.calls[0][0];
+    expect(request.runId).toBe(SEEDED_RUN.runId);
+    // A UUID minted by the DESKTOP — the backend never mints one.
+    expect(request.sessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(container).toBeTruthy();
+  });
+
+  it("shows exactly ONE proposed change with its hypothesis and the three actions", async () => {
+    await openRail(proposedSession());
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(within(rail).getByText("entry.lhs.indicator.rsi.period")).toBeTruthy();
+    expect(within(rail).getByText("21")).toBeTruthy();
+    expect(within(rail).getByText(/a slower RSI trades less often/i)).toBeTruthy();
+    // One change, not a list of them.
+    expect(rail.querySelectorAll(".coach-change").length).toBe(1);
+    expect(within(rail).getByRole("button", { name: /^modify$/i })).toBeTruthy();
+    expect(within(rail).getByRole("button", { name: /^reject$/i })).toBeTruthy();
+    expect(within(rail).getByRole("button", { name: /^accept$/i })).toBeTruthy();
+  });
+
+  it("keeps the call's cost, currency and prompt version visible", async () => {
+    await openRail(proposedSession());
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(rail.textContent).toContain("0.0184");
+    expect(rail.textContent).toContain("CNY");
+    expect(rail.textContent).toContain("b7f3ac91");
+  });
+
+  it("renders a typed failure with the BACKEND's recovery, never one it derived itself", async () => {
+    // A recovery string no frontend mapping would ever produce.
+    await openRail(
+      failedSession(
+        "inapplicable_advice",
+        "the coach asked for a volume filter",
+        "RECOVERY-FROM-THE-DTO-ONLY",
+      ),
+    );
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(rail.textContent).toContain("inapplicable_advice");
+    expect(rail.textContent).toContain("the coach asked for a volume filter");
+    expect(rail.textContent).toContain("RECOVERY-FROM-THE-DTO-ONLY");
+    // No proposal card on a failed turn — one outcome, never both.
+    expect(rail.querySelector(".coach-change")).toBeNull();
+  });
+
+  it("re-validates a modification through coach_decide on the SAME session id, and shows the stored value", async () => {
+    await openRail(proposedSession());
+    const modified: CoachDecisionDto = {
+      session: {
+        ...proposedSession(),
+        proposal: {
+          mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "9" },
+          hypothesis: "a slower RSI trades less often on this chop",
+          disposition: "modified",
+          childVersionId: null,
+          acceptedRunId: null,
+          acceptFailure: null,
+        },
+      },
+      accepted: null,
+    };
+    coachDecideMock.mockResolvedValue({ status: "ok", data: modified });
+
+    fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
+    const input = screen.getByLabelText(/new value/i);
+    fireEvent.change(input, { target: { value: "9" } });
+    fireEvent.click(screen.getByRole("button", { name: /re-validate|apply/i }));
+
+    await screen.findByText("9");
+    expect(coachDecideMock).toHaveBeenCalledTimes(1);
+    const request = coachDecideMock.mock.calls[0][0];
+    expect(request.sessionId).toBe("sess-77");
+    expect(request.action).toEqual({
+      kind: "modify",
+      path: "entry.lhs.indicator.rsi.period",
+      newValue: "9",
+    });
+  });
+
+  it("records a rejection and stops offering the proposal's actions", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "rejected",
+            childVersionId: null,
+            acceptedRunId: null,
+            acceptFailure: null,
+          },
+        },
+        accepted: null,
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+
+    await screen.findByText(/rejected/i);
+    expect(coachDecideMock.mock.calls[0][0].action).toEqual({ kind: "reject" });
+    expect(screen.queryByRole("button", { name: /^accept$/i })).toBeNull();
+  });
+
+  it("shows the accepted child beside its parent, with both expectancies and both links", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-child-9",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-child-9",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: CHILD_SUMMARY,
+          readBack: "ok",
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+
+    const comparison = await screen.findByRole("table", { name: /before and after/i });
+    // Both expectancies, exactly as the DTO delivered them — no delta, no percent.
+    expect(comparison.textContent).toContain("-10.515625");
+    expect(comparison.textContent).toContain("20.250");
+    expect(comparison.textContent).toContain("0.375");
+    expect(comparison.textContent).toContain("0.666");
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(within(rail).getByRole("link", { name: /child version/i }).getAttribute("href")).toBe(
+      "#/library",
+    );
+    expect(rail.textContent).toContain("v-child-9");
+    expect(rail.textContent).toContain("run-child-9");
+    expect(coachDecideMock.mock.calls[0][0].action).toEqual({ kind: "accept" });
+  });
+
+  it("selects the accepted child in the Lab, so the child run is one click from being re-run", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-alpha-2",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-alpha-2",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: CHILD_SUMMARY,
+          readBack: "ok",
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+    await screen.findByRole("table", { name: /before and after/i });
+
+    // The Lab's own selection moves to the child — the rail's second link is a
+    // real affordance in THIS screen, not a second route.
+    fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
+    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+  });
+
+  it("says so when an accepted child run could not be read back, and still names both ids", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-child-9",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-child-9",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: null,
+          readBack: { failure: "the saved child run could not be re-read" },
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+
+    const rail = await screen.findByRole("region", { name: /coach/i });
+    await screen.findByText(/could not be read back/i);
+    expect(rail.textContent).toContain("v-child-9");
+    expect(rail.textContent).toContain("run-child-9");
+    expect(rail.textContent).toContain("the saved child run could not be re-read");
+  });
+
+  it("renders a refused overlapping coach call as already-running, not as a failure", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "busy",
+        message: "a coach operation for session `sess-77` is already running",
+        run_id: null,
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    const rail = await screen.findByRole("region", { name: /coach/i });
+    await screen.findByText(/already running/i);
+    // Not an alert: nothing failed.
+    expect(within(rail).queryByRole("alert")).toBeNull();
+  });
+
+  it("closes the rail when the selection moves to another version", async () => {
+    await openRail(proposedSession());
+    expect(screen.getByRole("region", { name: /coach/i })).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+
+    expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
   });
 });

@@ -580,6 +580,16 @@ pub use crate::tauri::{
     demo_stream_core, export_bindings, library_overview_core, run_backtest_version_core,
     run_desktop, shell_info_core,
 };
+// r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
+// single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the
+// REAL cores through these — the `run_backtest_version_core` precedent, with the
+// provider injected so the offline suite never needs a credential.
+pub use crate::tauri::{
+    AcceptFailureDto, AcceptedCoachDto, CoachActionDto, CoachCostDto, CoachDecisionDto,
+    CoachDecisionRequestDto, CoachFailureDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
+    MutationDto, OperationGuard, OperationKey, ProposalDto, ReadBackDto, ReadBackOk, SummaryDto,
+    coach_decide_core, coach_turn_core,
+};
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).
 ///

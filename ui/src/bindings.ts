@@ -118,9 +118,73 @@ export const commands = {
 	 *  Returns a [`BusError`]; see [`run_backtest_version_core`].
 	 */
 	runBacktestVersion: (request: BacktestRunRequest) => typedError<BacktestRunDto, BusError>(__TAURI_INVOKE("run_backtest_version", { request })),
+	/**
+	 *  `coach_turn` — start or reload one coach turn for a persisted run (r1.s4.w3).
+	 * 
+	 *  This wrapper is where the credential lives, exactly as [`compose_strategy`]'s
+	 *  is: the config overlays load, the key resolves, the redactor and the provider
+	 *  are built from it, and the core receives everything EXCEPT the key. It therefore
+	 *  appears in no argument, no return value, no event, no error and no DTO, because
+	 *  it never leaves this function (ADR-0016).
+	 * 
+	 *  The prompt and its version resolve together from the same bytes (audit C2), so
+	 *  the ledger row's `prompt_version` is a true answer to "which prompt produced
+	 *  this?" — including when an operator's `$PULSE_PROMPT_DIR/coach.md` overlay won.
+	 * 
+	 *  **The transport makes ONE attempt per turn** ([`OpenAiCompatProvider::single_attempt`]),
+	 *  matching `pulse coach`: a turn records one exchange and names one ledger row, and
+	 *  the retrying default would put three upstream attempts and their cost behind that
+	 *  one record.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`] on a config-load failure, an unresolvable credential, a
+	 *  live duplicate (`busy`), an absent run, or an unrecordable turn. A provider
+	 *  TRANSPORT fault is not an error — it comes back as a recorded failed session.
+	 */
+	coachTurn: (request: CoachTurnRequestDto) => typedError<CoachSessionDto, BusError>(__TAURI_INVOKE("coach_turn", { request })),
+	/**
+	 *  `coach_decide` — modify, reject or accept one recorded proposal (r1.s4.w3).
+	 * 
+	 *  No credential, no provider and no config overlay: an accept re-runs the parent
+	 *  run's exact persisted inputs through the real engine and asks the coach nothing,
+	 *  so this wrapper is a thin adapter over the core and nothing else.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns a [`BusError`]; see [`coach_decide_core`].
+	 */
+	coachDecide: (request: CoachDecisionRequestDto) => typedError<CoachDecisionDto, BusError>(__TAURI_INVOKE("coach_decide", { request })),
 };
 
 /* Types */
+/**  The latest accept attempt's typed failure, when the most recent one failed. */
+export type AcceptFailureDto = {
+	/**  Where the accept stopped (`apply` / `load_inputs` / … / `persist`). */
+	stage: string,
+	/**  What went wrong, stated for the trader. */
+	message: string,
+	/**  What the failure is about, when it is about one thing. */
+	subject: string | null,
+};
+
+/**  What one committed accept produced, as the side-by-side panel needs it. */
+export type AcceptedCoachDto = {
+	/**  The child version the accept minted. */
+	childVersionId: string,
+	/**  The re-backtest run OF that child. */
+	acceptedRunId: string,
+	/**  The PARENT run's persisted summary — the "before" half. */
+	before: SummaryDto,
+	/**
+	 *  The CHILD run's persisted summary. Absent only for a saved-but-unreadable
+	 *  child run, which is a read failure and not an accept failure.
+	 */
+	after: SummaryDto | null,
+	/**  Whether that read back succeeded. */
+	readBack: ReadBackDto,
+};
+
 /**
  *  The complete Backtest Lab response.
  * 
@@ -287,6 +351,22 @@ export type BusErrorCode =
 "llm" | 
 /**  The composer agent loop (`ComposerError`). */
 "composer" | 
+/**
+ *  An operation the app is **already running** was invoked again (r1.s4.w3,
+ *  `pulseai-labs/pulse-trader#141`).
+ * 
+ *  A family of its own rather than an `Internal`, because it is the one
+ *  refusal that is not a fault: nothing broke, nothing failed, and there is
+ *  nothing to retry differently — the answer the caller wants is already on
+ *  its way from the invocation that holds the key. The coach rail renders it
+ *  as "already running" rather than as an error, and it can only do that if
+ *  the code says so.
+ * 
+ *  The discriminant serializes as a string (`"busy"`), so its position
+ *  carries no wire meaning; it sits beside the other non-domain code for
+ *  readability.
+ */
+"busy" | 
 /**  The shell itself: a dead channel, a failed startup, a bug. Not a domain family. */
 "internal";
 
@@ -358,6 +438,116 @@ outcome: string } |
 { kind: "finished"; 
 /**  A closing summary line. */
 message: string };
+
+/**
+ *  What the trader did with the coach's proposal.
+ * 
+ *  Internally tagged on `kind`, so the generated TypeScript is the discriminated
+ *  union the rail switches on rather than three optional fields.
+ */
+export type CoachActionDto = 
+/**
+ *  Replace the proposal's value with the trader's own edit, and re-validate.
+ * 
+ *  `new_value` is the value as TEXT — the same exact-string discipline every
+ *  other decimal crosses under. Which typed [`ParamValue`] it becomes is decided
+ *  by the CURRENT proposal's own parameter kind, not by parsing the string and
+ *  guessing: a `"21"` that is a period and a `"21"` that is a threshold are
+ *  different mutations, and only the stored proposal knows which leaf this is.
+ */
+{ kind: "modify"; 
+/**  The sweepable leaf being retuned. */
+path: string; 
+/**  Its new value, as text. */
+newValue: string } | 
+/**  Record the terminal rejection. No child, no run. */
+{ kind: "reject" } | 
+/**
+ *  Re-apply the current mutation and re-backtest it on the parent's exact
+ *  persisted inputs.
+ */
+{ kind: "accept" };
+
+/**
+ *  One turn's cost, in the price table's own billing currency.
+ * 
+ *  A pair rather than a bare number: the ledger bills in the model's native
+ *  currency (CNY for GLM), and an amount with no currency beside it is the kind of
+ *  figure a reader silently reads as dollars.
+ */
+export type CoachCostDto = {
+	/**  The exact decimal cost, as a string. */
+	amount: string,
+	/**  Its billing currency (`"CNY"`). */
+	currency: string,
+};
+
+/**  The durable result of one decision. */
+export type CoachDecisionDto = {
+	/**  The session as it now stands. */
+	session: CoachSessionDto,
+	/**  Present only for a committed accept. */
+	accepted: AcceptedCoachDto | null,
+};
+
+/**  One decision: which session, and what the trader did. */
+export type CoachDecisionRequestDto = {
+	/**  The coaching session being decided. */
+	sessionId: string,
+	/**  What the trader did. */
+	action: CoachActionDto,
+};
+
+/**  A recorded turn failure and what the trader can do about it. */
+export type CoachFailureDto = {
+	/**  The typed variant's own `snake_case` tag. */
+	kind: string,
+	/**  The failure's `Display` rendering — prose, already scrubbed. */
+	detail: string,
+	/**  The named recovery, chosen by the backend from the typed variant. */
+	recovery: string,
+};
+
+/**  One recorded coach turn, as the rail shows it. */
+export type CoachSessionDto = {
+	/**  The session id the desktop minted. */
+	sessionId: string,
+	/**  The persisted run this turn coached on. */
+	runId: string,
+	/**  The strategy version whose DSL the proposal mutates. */
+	versionId: string,
+	/**  `pending` | `proposed` | `failed`. */
+	outcome: string,
+	/**  The one proposal, when the turn produced one. */
+	proposal: ProposalDto | null,
+	/**  The one recorded failure, when it did not. */
+	failure: CoachFailureDto | null,
+	/**  The ledger row this turn produced, if any. */
+	llmCallId: string | null,
+	/**  That row's recorded cost. */
+	cost: CoachCostDto | null,
+	/**  That row's recorded prompt version. */
+	promptVersion: string | null,
+	/**  When the turn was claimed (RFC3339 UTC). */
+	createdAt: string,
+};
+
+/**
+ *  What the rail asks for when the trader presses "Ask the coach", and again on
+ *  every reload.
+ * 
+ *  **The DESKTOP mints the session id** (a UUID) and passes the same one back
+ *  forever after; the backend never mints one. That is what makes a reload
+ *  idempotent rather than a second billable turn: the id is the key the durable
+ *  session is stored under, and only the caller that owns the screen knows whether
+ *  this is a new ask or the same one being looked at again.
+ */
+export type CoachTurnRequestDto = {
+	/**  The persisted backtest run to coach on. */
+	runId: string,
+	/**  The session id this turn is recorded under — minted by the desktop. */
+	sessionId: string,
+};
 
 /**
  *  The compact DSL summary a finalized run returns — the finalize summary
@@ -557,6 +747,50 @@ export type LibraryVersion = {
 	recentRuns: LibraryRunSummary[],
 };
 
+/**  The proposed change: one path, one value. */
+export type MutationDto = {
+	/**  The sweepable leaf's locator. */
+	path: string,
+	/**  The value to write there, as an exact string. */
+	newValue: string,
+};
+
+/**  The coach's single proposal, as the rail's card renders it. */
+export type ProposalDto = {
+	/**  The one change. */
+	mutation: MutationDto,
+	/**  Why the coach believes it helps. */
+	hypothesis: string,
+	/**  Where the proposal stands. */
+	disposition: string,
+	/**  The child version an accept minted. */
+	childVersionId: string | null,
+	/**  The re-backtest run of that child. */
+	acceptedRunId: string | null,
+	/**  The latest accept attempt's typed failure, if it failed. */
+	acceptFailure: AcceptFailureDto | null,
+};
+
+/**
+ *  Whether the committed child run could be read back.
+ * 
+ *  Untagged so the wire shape is exactly `"ok" | { failure }`: past the commit the
+ *  accept has SUCCEEDED, so this is not an error family — it is a note about what
+ *  this process could re-read, and the rail says so beside two real ids.
+ */
+export type ReadBackDto = 
+/**  The child run read back. Serializes as the bare string `"ok"`. */
+ReadBackOk | 
+/**  It did not — the accept still committed. */
+{ 
+/**  Why the read back failed. */
+failure: string };
+
+/**  The `"ok"` token of [`ReadBackDto`]. */
+export type ReadBackOk = 
+/**  The one value. */
+"ok";
+
 /**  One regime's persisted trade count and net P&L. */
 export type RegimeCellDto = {
 	/**  `trending_up` / `trending_down` / `ranging` / `unknown`. */
@@ -602,6 +836,53 @@ export type StreamOutcome = {
 	emitted: number,
 	/**  True when the far end went away mid-run (the screen unmounted). */
 	cancelled: boolean,
+};
+
+/**
+ *  One persisted run summary, every money value an exact string.
+ * 
+ *  `sharpe`/`sortino` stay nullable numbers for the reason
+ *  [`BacktestRunDto`](super::backtest::BacktestRunDto) keeps them so: they are
+ *  genuinely `f64`-derived, and `null` is already how "not enough trades to
+ *  compute" is spelled everywhere else.
+ */
+export type SummaryDto = {
+	/**  Completed trades. */
+	tradeCount: number,
+	/**  How many won. */
+	winCount: number,
+	/**  How many lost. */
+	lossCount: number,
+	/**  Fraction of trades that won. */
+	winRate: string,
+	/**  Sum of winning P&L. */
+	grossProfit: string,
+	/**  Sum of losing P&L magnitudes. */
+	grossLoss: string,
+	/**  Net P&L. */
+	netPnl: string,
+	/**  Gross profit over gross loss; `null` when there is no loss to divide by. */
+	profitFactor: string | null,
+	/**  Mean winning trade. */
+	avgWin: string,
+	/**  Mean losing trade. */
+	avgLoss: string,
+	/**  Mean P&L per trade — the rail's headline comparison. */
+	expectancy: string,
+	/**  Largest peak-to-trough equity drop. */
+	maxDrawdown: string,
+	/**  Longest winning streak. */
+	maxWinStreak: number,
+	/**  Longest losing streak. */
+	maxLossStreak: number,
+	/**  Total taker commission. */
+	commissionTotal: string,
+	/**  Total signed funding. */
+	fundingTotal: string,
+	/**  Sharpe ratio; `null` when undefined for this run. */
+	sharpe: number | null,
+	/**  Sortino ratio; `null` when undefined for this run. */
+	sortino: number | null,
 };
 
 /**  One persisted trade, exactly as stored. */

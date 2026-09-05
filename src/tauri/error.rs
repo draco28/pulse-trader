@@ -44,6 +44,20 @@ pub enum BusErrorCode {
     Llm,
     /// The composer agent loop (`ComposerError`).
     Composer,
+    /// An operation the app is **already running** was invoked again (r1.s4.w3,
+    /// `pulseai-labs/pulse-trader#141`).
+    ///
+    /// A family of its own rather than an `Internal`, because it is the one
+    /// refusal that is not a fault: nothing broke, nothing failed, and there is
+    /// nothing to retry differently — the answer the caller wants is already on
+    /// its way from the invocation that holds the key. The coach rail renders it
+    /// as "already running" rather than as an error, and it can only do that if
+    /// the code says so.
+    ///
+    /// The discriminant serializes as a string (`"busy"`), so its position
+    /// carries no wire meaning; it sits beside the other non-domain code for
+    /// readability.
+    Busy,
     /// The shell itself: a dead channel, a failed startup, a bug. Not a domain family.
     Internal,
 }
