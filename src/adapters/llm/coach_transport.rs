@@ -218,6 +218,33 @@ mod tests {
         }
     }
 
+    /// The COMPOSER did not move when the coach forked (review V1).
+    ///
+    /// The coach's cap and temperature are the whole change; the composer's are the
+    /// baseline that change is measured against, and `compose_config`'s own test
+    /// pins only `max_tokens >= 4096` and says nothing about temperature — so a
+    /// later edit that raised the composer to the coach's numbers, or dropped its
+    /// 0.2 to the coach's 0.0, would pass every gate while making the ledger's
+    /// composer rows a different question than the ones already recorded.
+    #[test]
+    fn the_composer_config_did_not_move_when_the_coach_forked() {
+        let composer = crate::cli::compose::compose_config(None);
+        assert_eq!(
+            composer.max_tokens, 4096,
+            "the composer keeps the 4096 cap the coach outgrew"
+        );
+        assert_eq!(
+            composer.temperature.to_bits(),
+            0.2_f32.to_bits(),
+            "and keeps its 0.2 sampling temperature"
+        );
+        assert!(
+            COACH_MAX_TOKENS > composer.max_tokens,
+            "the fork exists because a coach turn is a bigger question than a \
+             composer step"
+        );
+    }
+
     /// The transport timeout and the turn guard are ONE budget with a reserve in it,
     /// so they are asserted together rather than separately (review R1/R11).
     ///
