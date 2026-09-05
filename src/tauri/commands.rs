@@ -69,11 +69,11 @@ use crate::adapters::db::{
     open_migrated,
 };
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::Redactor;
 use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
 use crate::agent::ComposerEvent;
 use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
 use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
+use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus, DataError, Direction,

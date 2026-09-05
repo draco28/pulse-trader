@@ -39,6 +39,7 @@ use crate::domain::coaching::{
     CoachTurnProjection, CoachingSession, CoachingSessionId, Disposition, InitialCoachOutcome,
     PreparedCoachAcceptance, Proposal,
 };
+use crate::domain::dsl::Mutation;
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
@@ -683,22 +684,59 @@ pub trait CoachingRepository {
     /// [`Disposition::Modified`] is refused here on purpose: a modify replaces the
     /// proposal's stored mutation, and this operation writes only the disposition
     /// columns — recording it would leave a row that says "edited" while carrying
-    /// the un-edited mutation.
+    /// the un-edited mutation. [`record_modification`](Self::record_modification)
+    /// is the operation that writes both in one statement.
+    ///
+    /// **[`Disposition::Accepted`] is refused here too, from r1.s4.w2.**
+    /// [`CoachAcceptanceRepository::commit_acceptance`] is the ONE writer of
+    /// accepted lineage: it mints the child version and its run inside the same
+    /// transaction that settles the proposal, so an accepted row can never name a
+    /// child that does not exist or a run that is not that child's. This operation
+    /// can only be handed ids some other code minted, which is a second writer of
+    /// the same fact — and the moment two writers disagree the version tree stops
+    /// being evidence. So the one target it still writes is
+    /// [`Disposition::Rejected`].
     ///
     /// # Errors
     ///
     /// Returns [`DataError::Db`] when the session has no proposal to disposition
     /// (an absent session, or a turn that failed), when the requested transition is
-    /// not legal from the proposal's current state, when the target is
-    /// [`Disposition::Proposed`] or [`Disposition::Modified`], or when the store
-    /// rejects the write — including the `0008` `CHECK`s that an accepted proposal
-    /// must name BOTH its child version and that child's `accepted_run_id`, and
-    /// that nothing else may name either.
+    /// not legal from the proposal's current state, when the target is anything but
+    /// [`Disposition::Rejected`], or when the store rejects the write.
     fn record_disposition(
         &self,
         id: &CoachingSessionId,
         disposition: &Disposition,
     ) -> impl Future<Output = Result<(), DataError>> + Send;
+
+    /// Record the trader's EDITED mutation and move the proposal to `modified`
+    /// (r1.s4.w2, ADR-0021).
+    ///
+    /// One statement writes both, which is the whole reason this exists next to
+    /// [`record_disposition`](Self::record_disposition) rather than inside it: that
+    /// operation writes the disposition columns only, so recording `modified`
+    /// through it would leave a row saying "edited" while carrying the un-edited
+    /// mutation, with no way to tell from the row which value the trader meant.
+    ///
+    /// **It edits; it does not settle.** The proposal stays open — a modify may
+    /// repeat, and an accept afterwards re-applies the LATEST stored mutation. Any
+    /// stale accept failure is cleared in the same statement, because a failure
+    /// recorded against the previous mutation is not a statement about this one.
+    ///
+    /// The mutation's applicability is the CALLER's to establish by calling
+    /// [`apply`](crate::domain::apply) first (audit C4: validity is use-time and is
+    /// never stored). This port persists what it is given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::Db`] when the session has no OPEN proposal to edit — an
+    /// absent session, a turn that failed, or a proposal already accepted or
+    /// rejected — or on a store failure.
+    fn record_modification(
+        &self,
+        id: &CoachingSessionId,
+        mutation: &Mutation,
+    ) -> impl Future<Output = Result<Proposal, DataError>> + Send;
 }
 
 /// The coach ACCEPT persistence port (r1.s4.w4, ADR-0010 / ADR-0019 / ADR-0021).

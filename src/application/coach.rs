@@ -32,10 +32,14 @@
 //! on error, on panic-unwind and on the future being dropped — which is what lets
 //! the NEXT turn tell a live claim from a stale one.
 //!
-//! **One adapter import** ([`Redactor`]), on the `run_version_backtest` precedent
-//! that the ring imports the deterministic engine: it is an adapter-namespaced VALUE
-//! type with no I/O, held as data, and it is the same scrubber the ledger decorator
-//! uses — passing a second one would be how the two roads drift apart.
+//! **NO adapter import** (r1.s4.w2, `pulseai-labs/pulse-trader#150`). This module
+//! used to reach `crate::adapters::llm::redacting_logging::Redactor`, which made
+//! ADR-0015's ONE deliberate adapters exception into two. The scrubber's pure text
+//! logic now lives in the domain ring as [`crate::domain::Redactor`], so the turn
+//! still holds the SAME scrubber the ledger decorator uses — passing a second one
+//! would be how the two roads drift apart — and reaches nothing outward to get it.
+//! `tests/tauri_backtest.rs` scans every file in this ring and keeps the exception
+//! count at one.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, PoisonError};
@@ -44,10 +48,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::llm::redacting_logging::Redactor;
 use crate::agent::{
     DEFAULT_MAX_TURN_BYTES, TurnAnswer, check_turn_budget, classify, coach_tool_definitions,
 };
+use crate::domain::Redactor;
 // The two coach-turn ports live in the DOMAIN ring beside every other port
 // (ADR-0015, one home for ports); this module is one of their consumers, not their
 // owner.

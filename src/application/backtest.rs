@@ -4,22 +4,31 @@
 //! run *this* sequence, not two copies of it:
 //!
 //! 1. load the immutable strategy version;
-//! 2. validate + compile its stored DSL;
+//! 2. validate its stored DSL;
 //! 3. **off the async runtime** (`spawn_blocking`): load the primary and optional
-//!    HTF `HEAD` snapshots, reject gapped series, resolve symbol filters, run the
-//!    synchronous deterministic engine;
+//!    HTF `HEAD` snapshots, reject gapped series, resolve symbol filters, build
+//!    [`BacktestInputs`] from the series about to be consumed, then compile and run
+//!    the synchronous deterministic engine through [`prepare_backtest`];
 //! 4. back on the runtime: read the prior run and compare fingerprints **before**
 //!    saving — after the insert the fresh row would be its own prior and the
 //!    warning could never fire;
-//! 5. build [`BacktestInputs`] from the series the engine actually consumed;
-//! 6. save, receiving a fresh [`BacktestRunId`];
-//! 7. reload that run, its trades, and the primary/HTF snapshots **named by the
+//! 5. save through [`persist_backtest`], receiving a fresh [`BacktestRunId`];
+//! 6. reload that run, its trades, and the primary/HTF snapshots **named by the
 //!    persisted inputs** — never `HEAD`, which may have moved — with the snapshot
 //!    loads off the async runtime (`spawn_blocking`), exactly like step 3: they
 //!    are the same filesystem I/O + Parquet decode;
-//! 8. answer from those reloaded values alone.
+//! 7. answer from those reloaded values alone.
 //!
-//! **Step 7 is the point of the whole item.** A response assembled from the
+//! **The prepare/persist split (r1.s4.w2).** Steps 3 and 5-7 are named functions —
+//! [`prepare_backtest`] (compile + compute, deterministic, no I/O and no identity)
+//! and [`persist_backtest`] (save + read back) — which `run_version_backtest` still
+//! composes in the same order. The coach accept path re-runs the SAME
+//! `prepare_backtest` on the parent run's persisted inputs and hands the result to
+//! `commit_acceptance` instead, so the child's numbers come from one computation
+//! rather than a second copy of it. Nothing under `domain::backtest` or
+//! `adapters::backtest` moved.
+//!
+//! **Step 6 is the point of the standalone flow.** A response assembled from the
 //! in-memory result would render identically today and would be a claim about
 //! memory rather than about what is stored. Reading it back proves the row is
 //! complete, decodable, and still resolves its snapshots — which is what makes the
@@ -35,13 +44,14 @@
 
 use rust_decimal::Decimal;
 
-use crate::domain::backtest::{BacktestResult, EquityCurve};
+use crate::domain::backtest::EquityCurve;
 use crate::domain::strategy::VersionId;
 use crate::domain::{
     BacktestError, BacktestInputs, BacktestRunId, BacktestRunRepository, CandleSeries,
-    CandleSeriesRepository, CompiledStrategy, DataError, DataVersion, EngineFingerprint,
-    ExchangeAdapter, ExchangeError, FundingConfig, Pair, PersistedRun, SnapshotSelection,
-    StrategyRepository, SymbolFilters, Timeframe, Trade, ValidationErrors, compile, validate,
+    CandleSeriesRepository, DataError, DataVersion, EngineFingerprint, ExchangeAdapter,
+    ExchangeError, FundingConfig, Pair, PersistedRun, PreparedBacktest, SnapshotSelection,
+    StrategyRepository, SymbolFilters, Timeframe, Trade, ValidatedDsl, ValidationErrors, compile,
+    validate,
 };
 
 use crate::adapters::backtest::{BacktestConfig, run_backtest};
@@ -431,11 +441,98 @@ impl BacktestOutcome {
 // The use case
 // ---------------------------------------------------------------------------
 
+/// Why the deterministic prepare step declined (r1.s4.w2).
+///
+/// Two cases, because the accept path records them as two different
+/// [`AcceptFailureStage`](crate::domain::AcceptFailureStage)s and a caller that
+/// could not tell them apart would have to guess which one to store.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PrepareError {
+    /// The validated document did not compile.
+    Compile(String),
+    /// The engine refused the run.
+    Engine(BacktestError),
+}
+
+/// **Step A of the split (r1.s4.w2): compile and compute, deterministically.**
+///
+/// No I/O, no identity, no timestamps — everything this returns is a pure function
+/// of the arguments, which is what lets the standalone backtest path and the coach
+/// accept path share ONE computation rather than keeping two copies of it in step.
+///
+/// The engine config is rebuilt from `inputs` (the fee/slippage the run is declared
+/// to have used) plus `starting_equity`, so the numbers cannot silently be computed
+/// against a different cost model than the one the persisted provenance names.
+///
+/// # Errors
+///
+/// Returns [`PrepareError::Compile`] when the validated document will not compile
+/// and [`PrepareError::Engine`] when the engine refuses the run.
+pub(crate) fn prepare_backtest(
+    validated: &ValidatedDsl,
+    inputs: BacktestInputs,
+    primary: &CandleSeries,
+    htf: Option<&CandleSeries>,
+    filters: &SymbolFilters,
+    starting_equity: Decimal,
+) -> Result<PreparedBacktest, PrepareError> {
+    let compiled = compile(validated).map_err(|e| PrepareError::Compile(e.to_string()))?;
+    let config = BacktestConfig {
+        starting_equity,
+        taker_fee_bps: inputs.taker_fee_bps,
+        slippage_bps: inputs.slippage_bps,
+    };
+    let result =
+        run_backtest(&compiled, primary, htf, &config, filters).map_err(PrepareError::Engine)?;
+    let summary = result.summary.clone();
+    Ok(PreparedBacktest {
+        inputs,
+        result,
+        summary,
+        starting_equity,
+    })
+}
+
+/// **Step B of the split (r1.s4.w2): persist, then read back.**
+///
+/// The standalone path's half. The accept path deliberately does NOT call it: its
+/// write is `commit_acceptance`, which puts the child version, the run, the trades
+/// and the proposal's links in one transaction — a guarantee this function cannot
+/// make, because a run saved here has no child to belong to.
+///
+/// # Errors
+///
+/// Returns [`BacktestAppError::Persist`] when the save itself fails (no row
+/// exists) and [`BacktestAppError::SavedButReadBackFailed`] for anything after it
+/// (a row does).
+pub(crate) async fn persist_backtest<C, R>(
+    candles: C,
+    runs: &R,
+    version_id: &VersionId,
+    prepared: &PreparedBacktest,
+    fingerprint_warning: Option<String>,
+) -> Result<BacktestOutcome, BacktestAppError>
+where
+    C: CandleSeriesRepository + Clone + Send + 'static,
+    R: BacktestRunRepository,
+{
+    let run_id = runs
+        .save_run(
+            version_id,
+            &prepared.inputs,
+            &prepared.result,
+            &prepared.summary,
+            prepared.starting_equity,
+        )
+        .await
+        .map_err(BacktestAppError::Persist)?;
+
+    read_back(candles, runs, run_id, fingerprint_warning).await
+}
+
 /// What the blocking section produces.
 struct EngineOutput {
-    result: BacktestResult,
-    primary: CandleSeries,
-    htf: Option<CandleSeries>,
+    prepared: PreparedBacktest,
 }
 
 /// Run one persisted strategy version and answer from the saved row.
@@ -468,14 +565,17 @@ where
         })?
         .ok_or_else(|| BacktestAppError::VersionNotFound(request.version_id.clone()))?;
     let validated = validate(&version.dsl)?;
-    let compiled =
-        compile(&validated).map_err(|e| BacktestAppError::CompileFailed(e.to_string()))?;
 
     // 3. Everything synchronous — Parquet decode and the CPU engine — happens on a
     //    blocking thread. Both are hundreds of milliseconds on the real fixture, and
     //    holding a Tokio worker for that stalls every other command on the bus. The
     //    closure owns clones; nothing is borrowed across the await.
-    let engine = run_engine_offthread(candles.clone(), exchange.clone(), compiled, request).await?;
+    //
+    //    r1.s4.w2: the compile + compute half of that closure is now
+    //    `prepare_backtest`, the SHARED deterministic step the coach accept path
+    //    also calls. Only its address moved; the sequence inside is unchanged.
+    let engine =
+        run_engine_offthread(candles.clone(), exchange.clone(), validated, request).await?;
 
     // 4. FR-7 compare BEFORE the insert (D3): afterwards the fresh row is its own
     //    prior and the warning can never fire.
@@ -488,24 +588,20 @@ where
         })?;
     let fingerprint_warning = prior.and_then(|prior| {
         let prior_fp = EngineFingerprint::from_stored(prior.engine_fingerprint);
-        engine.result.engine_fingerprint.compare(&prior_fp)
+        engine.prepared.result.engine_fingerprint.compare(&prior_fp)
     });
 
-    // 5-6. Provenance from the series the engine actually consumed, then save.
-    let inputs = inputs_from_run(&engine.primary, engine.htf.as_ref(), &request.config);
-    let run_id = runs
-        .save_run(
-            &request.version_id,
-            &inputs,
-            &engine.result,
-            &engine.result.summary,
-            request.config.starting_equity,
-        )
-        .await
-        .map_err(BacktestAppError::Persist)?;
-
-    // 7-8. From here every failure names the row that exists.
-    read_back(candles.clone(), runs, run_id, fingerprint_warning).await
+    // 5-8. Save the prepared run and answer from the saved row. From inside
+    //      `persist_backtest`, every failure after `save_run` returns names the row
+    //      that exists.
+    persist_backtest(
+        candles.clone(),
+        runs,
+        &request.version_id,
+        &engine.prepared,
+        fingerprint_warning,
+    )
+    .await
 }
 
 /// Steps 7-8: reload the saved run, its trades and its exact snapshots.
@@ -626,7 +722,7 @@ where
 async fn run_engine_offthread<C, E>(
     candles: C,
     exchange: E,
-    compiled: CompiledStrategy,
+    validated: ValidatedDsl,
     request: &BacktestRequest,
 ) -> Result<EngineOutput, BacktestAppError>
 where
@@ -650,12 +746,22 @@ where
             None => None,
         };
         let filters: SymbolFilters = exchange.symbol_filters(&pair)?;
-        let result = run_backtest(&compiled, &primary, htf.as_ref(), &config, &filters)?;
-        Ok(EngineOutput {
-            result,
-            primary,
-            htf,
-        })
+        // Provenance from the series the engine is ABOUT to consume, so the
+        // prepared run and the row it becomes name the same snapshots.
+        let inputs = inputs_from_run(&primary, htf.as_ref(), &config);
+        let prepared = prepare_backtest(
+            &validated,
+            inputs,
+            &primary,
+            htf.as_ref(),
+            &filters,
+            config.starting_equity,
+        )
+        .map_err(|e| match e {
+            PrepareError::Compile(reason) => BacktestAppError::CompileFailed(reason),
+            PrepareError::Engine(source) => BacktestAppError::Engine(source),
+        })?;
+        Ok(EngineOutput { prepared })
     })
     .await;
 

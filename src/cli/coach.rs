@@ -50,12 +50,13 @@ use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteCoachTurnSource, SqliteCoachingRepo, SqliteLlmCallRepo};
 use crate::adapters::llm::attributed::AttributedProvider;
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::config::load_coach_prompt_from;
 use crate::agent::{DEFAULT_MAX_DSL_BYTES, DEFAULT_TURN_TIMEOUT, LlmCallCapture};
 use crate::application::coach::{
     CoachTurnRegistry, CoachTurnRequest, CoachTurnSettings, run_coach_turn,
 };
+use crate::domain::Redactor;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
     BacktestRunId, Clock, CoachFailure, CoachTurnSource, CoachingRepository, CoachingSession,

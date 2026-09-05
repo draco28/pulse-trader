@@ -43,7 +43,7 @@ use crate::domain::{
     CoachFailure, Disposition, Hypothesis, Message, Mutation, Proposal, ToolDefinition, apply,
 };
 
-use crate::adapters::llm::redacting_logging::Redactor;
+use crate::domain::Redactor;
 
 use super::tools::{
     PROPOSE_MUTATION_TOOL, ProposeMutationArgs, RECORD_INAPPLICABLE_TOOL, RecordInapplicableArgs,

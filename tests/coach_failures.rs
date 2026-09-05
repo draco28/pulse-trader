@@ -33,11 +33,11 @@ use pulse::{
     CoachFailure, CoachSessionClaim, CoachSessionClaimResult, CoachTurnError, CoachWiring,
     CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy, DataError, DataVersion, Db,
     Disposition, EngineFingerprint, FakeClock, FundingConfig, InitialCoachOutcome, LlmCallCapture,
-    LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, MutationError,
-    NewVersion, Pair, Redactor, RegimeBreakdown, SessionOutcome, SkippedEntryCounts,
-    SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachTurnSource, SqliteCoachingRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats,
-    Timeframe, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
+    LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, Mutation,
+    MutationError, NewVersion, Pair, Proposal, Redactor, RegimeBreakdown, SessionOutcome,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachTurnSource,
+    SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
+    SummaryStats, Timeframe, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
 };
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
@@ -1237,6 +1237,16 @@ impl CoachingRepository for RefusingCoachingRepo {
     ) -> impl Future<Output = Result<(), DataError>> {
         std::future::ready(Ok(()))
     }
+
+    fn record_modification(
+        &self,
+        _id: &CoachingSessionId,
+        _mutation: &Mutation,
+    ) -> impl Future<Output = Result<Proposal, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_proposals is unwritable".to_owned(),
+        )))
+    }
 }
 
 /// A store that ACCEPTS the claim and cannot SETTLE it — the double-fault fixture
@@ -1296,6 +1306,16 @@ impl CoachingRepository for UnsettleableCoachingRepo {
         _disposition: &Disposition,
     ) -> impl Future<Output = Result<(), DataError>> {
         std::future::ready(Ok(()))
+    }
+
+    fn record_modification(
+        &self,
+        _id: &CoachingSessionId,
+        _mutation: &Mutation,
+    ) -> impl Future<Output = Result<Proposal, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_proposals is unwritable".to_owned(),
+        )))
     }
 }
 
