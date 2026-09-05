@@ -244,8 +244,16 @@ pub use cli::compose::{
 // REQUIRED under `deny(warnings)` — a `pub` item unused outside its private
 // `cli::coach` module is a `dead_code` build error, not a warning.
 pub use cli::coach::{CoachArgs, CoachCliOutcome, CoachWiring, run_coach, run_coach_with};
-// The coach itself, for `r1.s4`'s rail (which drives a turn without the CLI).
-pub use agent::{Coach, CoachTurnError};
+// r1.s4.w1 (#132): the SEALED turn's public surface is deliberately THREE items —
+// its typed error, the process-local single-flight registry a caller holds across
+// turns, and the pure request-fingerprint function. `run_coach_turn` itself, its
+// request/settings values stay `pub(crate)`, and its two ports are `pub(crate)` in
+// `domain::port` beside every other port (ADR-0015): the turn is reached
+// through the composition root, which is what keeps the fragments `#132` names
+// (a provider, a capture handle, a run, a trade vector, a version) unassemblable
+// from outside. `Coach` and `Coach::new` are GONE, not merely narrowed —
+// `scripts/check-coach-boundary.sh` is what keeps them gone.
+pub use application::coach::{CoachTurnError, CoachTurnRegistry, coach_request_fingerprint};
 
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
@@ -325,6 +333,11 @@ pub use adapters::db::SqliteLlmCallRepo;
 // `deny(warnings)` + `pub(crate) mod adapters` (the `db/mod.rs` re-export alone is
 // necessary but NOT sufficient). `w3`'s coach turn and `r1.s4`'s rail construct it.
 pub use adapters::db::SqliteCoachingRepo;
+// r1.s4.w1 (#132): the SQLite coach-turn projection — the adapter the composition
+// root hands the sealed turn in place of the run + strategy repositories it used to
+// coordinate itself. REQUIRED under `deny(warnings)` (the `db/mod.rs` re-export is
+// necessary but not sufficient).
+pub use adapters::db::SqliteCoachTurnSource;
 // r1.s4.w4: the accept half of the coach seam — the real SQLite adapter and the
 // deterministic in-memory test adapter at the same product-owned port.
 pub use adapters::db::SqliteCoachAcceptanceRepo;

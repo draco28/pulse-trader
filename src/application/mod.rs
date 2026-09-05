@@ -26,3 +26,10 @@
 //! `tests/tauri_backtest.rs` scans this ring for exactly that.
 
 pub(crate) mod backtest;
+
+// r1.s4.w1 (#131 / #132, ADR-0015): the SEALED coach turn. One crate-private entry
+// point that takes IDENTIFIERS and ports — a session id and a run id — claims the
+// session before any provider I/O, makes exactly one attributed call, and settles
+// the claim once. It replaces the `Coach::new` + `Coach::run_turn` fragment surface
+// the desktop rail (w3) and the decision module (w2) would otherwise consume.
+pub(crate) mod coach;

@@ -110,10 +110,10 @@ pub use dsl::{
 // accept outcome pair.
 pub use coaching::{
     AcceptFailureStage, AcceptedCoachOutcome, CoachAcceptFailure, CoachContext, CoachFailure,
-    CoachRequestFingerprint, CoachSessionClaim, CoachSessionClaimResult, CoachingError,
-    CoachingSession, CoachingSessionId, Disposition, DispositionKind, Hypothesis,
-    InitialCoachOutcome, MfeMaeAggregates, PreparedBacktest, PreparedCoachAcceptance, Proposal,
-    SessionOutcome,
+    CoachRequestFingerprint, CoachSessionClaim, CoachSessionClaimResult, CoachTurnProjection,
+    CoachingError, CoachingSession, CoachingSessionId, Disposition, DispositionKind, Hypothesis,
+    InitialCoachOutcome, MfeMaeAggregates, PreparedBacktest, PreparedCoachAcceptance, ProjectedRun,
+    Proposal, SessionOutcome,
 };
 pub use ids::IdSource;
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3). `compile`
@@ -138,6 +138,11 @@ pub use port::{
     BacktestRunRepository, CandleSeriesRepository, CoachAcceptanceRepository, CoachingRepository,
     ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
 };
+// r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
+// live in `port` like every other port and are re-exported `pub(crate)` rather than
+// `pub` because the use case they serve is crate-internal — the composition root
+// picks the implementations, and no consumer outside this crate names them.
+pub(crate) use port::{AttributedCoachProvider, CoachTurnSource};
 // VS-1.3.2 slice-close FIX C: the shared secret-token heuristic. `pub(crate)` (an
 // internal cross-ring utility, not a public API surface) — used by the composer
 // (agent ring) + the redacting-logging decorator (adapters ring), so it is never
@@ -167,6 +172,9 @@ pub use llm::{
 // crate surface — an un-re-exported public domain type is a `dead_code` BUILD error.
 pub use llm::ToolDefinition;
 pub use llm_call::{LlmCall, LlmCallId};
+// r1.s4.w1: the attributed-call pair the sealed coach turn's provider port
+// returns. `pub(crate)`: a crate-internal use case's vocabulary (ADR-0015).
+pub(crate) use llm_call::{AttributedCall, AttributedCallError};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the
 // `SymbolFilters` value type + its `unconstrained()` ctor, and the

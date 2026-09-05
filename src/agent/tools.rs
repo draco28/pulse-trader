@@ -1087,12 +1087,29 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// r1.s2.w3 — the coach's single tool (ADR-0013 conventions, ADR-0021 decision 7).
+// r1.s2.w3 — the coach's tools (ADR-0013 conventions, ADR-0021 decision 7),
+// widened to TWO mutually exclusive tools by r1.s4.w1 (#131).
 // ---------------------------------------------------------------------------
 
-/// The coach's one tool name. Exactly one well-formed call ends the turn (A3);
+/// The coach's mutation tool. Exactly one well-formed call ends the turn (A3);
 /// zero calls and two calls are both recorded typed failures, not retries.
 pub(crate) const PROPOSE_MUTATION_TOOL: &str = "propose_mutation";
+
+/// The coach's HONESTY tool (r1.s4.w1, `pulseai-labs/pulse-trader#131`).
+///
+/// The second of two mutually exclusive tools: a turn calls `propose_mutation`
+/// **or** this one, exactly once. It exists because the `r1` vocabulary is
+/// parameter-only, so a coach whose best advice is structural ("add an ADX
+/// filter", "trade the other side") previously had two options and both were
+/// dishonest — approximate the advice with whichever parameter sits nearest it, or
+/// say nothing. This is the third option: record what it wanted to change and what
+/// in the result motivated it, as a typed
+/// [`CoachFailure::InapplicableAdvice`](crate::domain::CoachFailure::InapplicableAdvice),
+/// and let the evidence accumulate for the release that widens the vocabulary.
+///
+/// It creates no proposal, mints no child version, and needs no DSL locator —
+/// which is exactly why it can say things the locator grammar cannot.
+pub(crate) const RECORD_INAPPLICABLE_TOOL: &str = "record_inapplicable";
 
 /// The `propose_mutation` arguments, as the model supplies them.
 ///
@@ -1121,9 +1138,32 @@ pub(crate) struct ProposeMutationArgs {
     pub(crate) hypothesis: String,
 }
 
-/// The coach's tool surface: exactly one tool.
+/// The `record_inapplicable` arguments, as the model supplies them (r1.s4.w1).
+///
+/// Two required strings and nothing else. There is deliberately no `path` and no
+/// locator of any kind: the whole point of the tool is to say something the
+/// parameter-only locator grammar cannot express, and a locator field would invite
+/// the model to aim the honest record at a parameter anyway.
+///
+/// `deny_unknown_fields`, like every other tool-arg struct in this file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordInapplicableArgs {
+    /// What the coach wanted to change, structurally.
+    pub(crate) intent: String,
+    /// Which observed run facts motivated it.
+    pub(crate) evidence: String,
+}
+
+/// The coach's tool surface: exactly two MUTUALLY EXCLUSIVE tools, in this
+/// advertisement order.
+///
+/// The order is load-bearing twice over: it is the order the request fingerprint
+/// feeds tool definitions in (`application::coach`), and it is the order the model
+/// reads them in. `propose_mutation` stays first because it is the turn's expected
+/// outcome; `record_inapplicable` is the honest exit, not the default.
 pub(crate) fn coach_tool_definitions() -> Vec<ToolDefinition> {
-    vec![def_propose_mutation()]
+    vec![def_propose_mutation(), def_record_inapplicable()]
 }
 
 fn def_propose_mutation() -> ToolDefinition {
@@ -1178,6 +1218,42 @@ fn def_propose_mutation() -> ToolDefinition {
                 }
             },
             "required": ["path", "new_value", "hypothesis"]
+        }),
+    }
+}
+
+/// The `record_inapplicable` tool definition (r1.s4.w1, #131).
+///
+/// Two required strings, described so the model knows this is the honest exit and
+/// not a way to avoid work: it is for advice the parameter vocabulary CANNOT
+/// express, never for a parameter change the coach is unsure about.
+fn def_record_inapplicable() -> ToolDefinition {
+    ToolDefinition {
+        name: RECORD_INAPPLICABLE_TOOL.to_owned(),
+        description: "Record that your best advice is STRUCTURAL and this release cannot express \
+                      it as a parameter change. Call this instead of `propose_mutation` — never \
+                      both, and never twice. Use it when what you want is to add or remove a \
+                      condition or filter, swap an indicator, change an exit's kind, or trade the \
+                      other side. Do NOT use it for a parameter change you are merely unsure \
+                      about: propose that one. Do NOT approximate a structural change with the \
+                      nearest parameter."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "what you would change, structurally, in one sentence (e.g. \
+                                    \"add an ADX>25 trend filter to the entry\"). Must not be \
+                                    empty."
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "which numbers in the persisted result led you there (e.g. \
+                                    \"most losses are in the ranging regime\"). Must not be empty."
+                }
+            },
+            "required": ["intent", "evidence"]
         }),
     }
 }

@@ -38,9 +38,19 @@ pub(crate) use tools::{
 mod composer;
 pub use composer::{ComposeOutcome, Composer, ComposerError, ComposerEvent, LlmCallCapture};
 
-// r1.s2.w3 (ADR-0021): the coach turn — ONE provider call over the single
-// `propose_mutation` tool, ending as exactly one recorded `CoachingSession` (a
-// proposal or a typed failure, never silence). `pub` because the CLI composition
-// root (`src/cli/coach.rs`) and `r1.s4`'s rail consume it; mirrored at `src/lib.rs`.
+// r1.s2.w3 (ADR-0021), RESEALED by r1.s4.w1 (#132): the coach's model-facing half —
+// the turn budgets and the routing of one response into one answer or one typed
+// failure. `pub(crate)` and deliberately so: the turn SEQUENCE moved to
+// `crate::application::coach`, which takes identifiers rather than fragments, so
+// there is no longer a public `Coach` any caller can assemble by hand.
 mod coach;
-pub use coach::{Coach, CoachTurnError};
+pub(crate) use coach::{
+    DEFAULT_MAX_DSL_BYTES, DEFAULT_MAX_TURN_BYTES, DEFAULT_TURN_TIMEOUT, TurnAnswer,
+    check_turn_budget, classify,
+};
+
+// r1.s4.w1 (#131): the coach's two mutually exclusive tool definitions, in
+// advertisement order. Consumed by the sealed turn, which both advertises them and
+// feeds them to the request fingerprint.
+#[allow(unused_imports)]
+pub(crate) use tools::coach_tool_definitions;

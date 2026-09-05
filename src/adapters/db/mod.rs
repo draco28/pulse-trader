@@ -56,6 +56,13 @@ pub use llm_call_repo::SqliteLlmCallRepo;
 // error (this re-export is necessary but not sufficient; lib.rs mirrors it).
 pub use coaching_repo::SqliteCoachingRepo;
 
+// r1.s4.w1 (#132): the SQLite `CoachTurnSource` adapter — the repository-owned
+// coach-turn projection. It adds NO `query!` macro of its own (and therefore no
+// `.sqlx` entry): it composes the run and strategy repositories' existing
+// fail-closed reads, keyed by the one `run_id` a caller supplies.
+pub mod coach_turn_source;
+pub use coach_turn_source::SqliteCoachTurnSource;
+
 // r1.s4.w4 (ADR-0010 / ADR-0021 as amended): the SQLite `CoachAcceptanceRepository`
 // adapter. One accept is one transaction — child version, run, trades and the
 // proposal's links commit together or not at all — and the child/run identity is

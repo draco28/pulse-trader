@@ -53,7 +53,7 @@ use super::backtest::{
 use super::dsl::{Mutation, MutationError, StrategyDsl};
 use super::llm_call::LlmCallId;
 use super::sizing::SkippedEntryCounts;
-use super::strategy::VersionId;
+use super::strategy::{StrategyVersion, VersionId};
 
 /// Identifier of a [`CoachingSession`] — a `#[serde(transparent)]` `String`
 /// newtype, matching [`LlmCallId`] and
@@ -534,11 +534,28 @@ pub enum CoachFailure {
     ///
     /// It is the honest failure ADR-0021's "the coach cannot restructure a strategy
     /// in `r1`" consequence predicted, made storable.
-    #[error("the coach answered with structural advice this release cannot apply: {advice}")]
+    ///
+    /// **The payload became two fields in r1.s4.w1** (`#131`), when the
+    /// `record_inapplicable` tool that produces it landed. `w4` shipped one opaque
+    /// `advice` string because nothing wrote it yet; the tool asks the model for the
+    /// two things separately — what it would change, and which observed numbers led
+    /// it there — and flattening them back into one string at the storage boundary
+    /// would discard the half that makes the record actionable. The column is a
+    /// serde-JSON payload (`0008`), so this is a payload change and NOT a schema
+    /// change: no migration, and `failure_kind` is still `inapplicable_advice`.
+    #[error(
+        "the coach answered with structural advice this release cannot apply: {intent} \
+         (evidence: {evidence})"
+    )]
     InapplicableAdvice {
-        /// The advice, preserved verbatim — it is the evidence for the feature-map
-        /// entry that eventually widens the vocabulary.
-        advice: String,
+        /// What the coach wanted to change, structurally — preserved verbatim
+        /// (after redaction). It is the evidence for the feature-map entry that
+        /// eventually widens the vocabulary.
+        intent: String,
+        /// Which observed run facts motivated it, preserved the same way. Kept
+        /// separate from `intent` because "what" without "why" reads as an opinion,
+        /// and the whole value of this record is that it is grounded in the run.
+        evidence: String,
     },
     /// The parent run's exact inputs could not be resolved, so the child could not
     /// be re-backtested on the same data (r1.s4.w4).
@@ -1024,6 +1041,45 @@ fn neutralize_dsl_markers(text: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// The coach-turn projection (r1.s4.w1)
+// ---------------------------------------------------------------------------
+
+/// One run, its complete ordered trade set, and the version THAT RUN NAMES.
+///
+/// Built only by a [`CoachTurnSource`](crate::domain::port::CoachTurnSource) from a
+/// `run_id`, which is what makes the three values consistent by construction. A
+/// caller cannot offer a version the run was not produced against (`#132`'s first
+/// false row), cannot substitute another run's trades, and cannot truncate the set —
+/// it has no such input.
+pub struct ProjectedRun {
+    /// The persisted run, exactly as stored.
+    pub run: PersistedRun,
+    /// Every trade of that run, in the stored chronological order.
+    pub trades: Vec<Trade>,
+    /// The immutable strategy version `run.strategy_version_id` names.
+    pub version: StrategyVersion,
+}
+
+/// What the projection found — and whether the run can be coached toward a
+/// comparable re-backtest at all.
+///
+/// [`Legacy`](Self::Legacy) is a TYPED PROJECTION, not an error: a pre-`0006` run
+/// (whose eight provenance columns are all NULL) is a real run the trader can see,
+/// and the honest answer is a recorded
+/// [`CoachFailure::MissingBacktestInputs`] rather than a load failure the rail would
+/// have to guess about. It carries the same values as
+/// [`Coachable`](Self::Coachable) because the turn still claims a session for it —
+/// a claim keyed by the same request fingerprint, so a retry is idempotent here too.
+pub enum CoachTurnProjection {
+    /// The run carries its `0006` input provenance (`PersistedRun::inputs` is
+    /// `Some`), so a child of it could be re-backtested on the same data.
+    Coachable(ProjectedRun),
+    /// A pre-`0006` run: no input provenance, so no comparable re-backtest exists
+    /// to coach toward.
+    Legacy(ProjectedRun),
 }
 
 #[cfg(test)]
