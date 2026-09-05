@@ -1092,8 +1092,9 @@ describe("BacktestLabScreen (the coach rail)", () => {
 
     await screen.findByText(/a slower RSI trades less often on this chop/i);
     expect(coachTurnMock).toHaveBeenCalledTimes(2);
-    // `interrupted` is terminal, so the retry carries a NEW session id rather than
-    // asking again under one the backend has already settled.
+    // A settled session is terminal whatever settled it, so the retry carries a NEW
+    // id rather than asking again under one the backend has already recorded an
+    // outcome for.
     expect(coachTurnMock.mock.calls[1][0].sessionId).not.toBe(
       coachTurnMock.mock.calls[0][0].sessionId,
     );
@@ -1145,7 +1146,13 @@ describe("BacktestLabScreen (the coach rail)", () => {
     // pick the other invocation's result up.
     await screen.findByText(/already running/i);
     expect(screen.queryByText(/what to do/i)).toBeNull();
-    expect(screen.getByRole("button", { name: /check again/i })).toBeTruthy();
+
+    // And the button DOES something: a busy record has settled, so re-asking is
+    // the only way the trader picks the other invocation's result up.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /check again/i }));
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock).toHaveBeenCalledTimes(2);
   });
 
   it("names each decision in flight — modifying, rejecting, accepting", async () => {

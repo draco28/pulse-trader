@@ -584,6 +584,11 @@ async fn an_abandoned_claim_is_settled_as_interrupted_with_the_new_session_recov
         // both the registry entry and the operation latch release on drop.
     }
 
+    // Old enough that no live call can still hold it — adoption is gated on age,
+    // because both single-flight registries are process-local and a young pending
+    // row may be a turn running in another process.
+    age_pending_claim(world.db().await.pool(), "sess-stale", 10).await;
+
     let (provider2, calls2) = ScriptedProvider::new(vec![propose_call(
         RSI_PERIOD,
         &json!({ "type": "Period", "value": 21 }),
@@ -612,6 +617,97 @@ async fn an_abandoned_claim_is_settled_as_interrupted_with_the_new_session_recov
         calls2.load(Ordering::SeqCst),
         0,
         "finalizing an abandoned claim spends no money"
+    );
+}
+
+/// Back-date a `pending` claim so a reload may adopt it.
+///
+/// Adoption is gated on AGE — a turn cannot outlive its own wall-clock guard, so a
+/// claim older than that guard plus a margin is held by nothing. A row just written
+/// is indistinguishable from a live call in another process, and refusing it is the
+/// safe direction, so a test about the ABANDONED path has to make the row old.
+async fn age_pending_claim(pool: &sqlx::SqlitePool, session: &str, minutes: i64) {
+    let when = (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // `0008` pins a recorded session's identity, `created_at` included, so the
+    // guard is lifted for this one statement and put straight back.
+    coach_support::with_trigger_lifted(
+        pool,
+        "coaching_sessions_lifecycle",
+        &[&format!(
+            "UPDATE coaching_sessions SET created_at = '{when}' WHERE id = '{session}'"
+        )],
+    )
+    .await;
+}
+
+/// A YOUNG pending claim is never adopted — it may be a turn running elsewhere.
+///
+/// Both single-flight registries are process-local, so a second process sees an
+/// adopted id as free and `run_coach_turn` reads its `ExistingPending` as stale,
+/// settling a live billed call as `interrupted` and breaking it when it tries to
+/// settle its own row. Age is the only cross-process evidence available without a
+/// durable lease, and a fresh row carries none of it: the reload defers instead.
+#[tokio::test]
+async fn a_young_pending_claim_is_not_adopted_and_the_reload_defers_to_it() {
+    let world = world().await;
+    let state = world.state().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let hanging = HangingProvider {
+        entered: Mutex::new(Some(entered_tx)),
+    };
+
+    {
+        let first = coach_turn_core(
+            &state,
+            deps(hanging),
+            turn_request("sess-live-elsewhere", &world.parent_run_id),
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("the hanging provider must not complete the turn"),
+            entered = entered_rx => entered.expect("the provider was entered"),
+        }
+        // Dropped: this process's registry entry and latch are released, so only
+        // the row's AGE stands between the reload and stealing the claim. It is
+        // NOT back-dated here — that is the whole point.
+    }
+
+    let (provider2, calls2) = ScriptedProvider::new(vec![propose_call(
+        RSI_PERIOD,
+        &json!({ "type": "Period", "value": 21 }),
+        "a live turn elsewhere must not be stolen",
+    )]);
+    let error = coach_turn_core(
+        &state,
+        deps(provider2),
+        turn_request("sess-reload", &world.parent_run_id),
+    )
+    .await
+    .expect_err("a young pending claim is deferred to, never adopted");
+
+    assert_eq!(error.code, pulse::BusErrorCode::Busy);
+    assert!(
+        error.message.contains("sess-live-elsewhere"),
+        "the refusal names the claim it is deferring to: {}",
+        error.message
+    );
+    assert_eq!(
+        calls2.load(Ordering::SeqCst),
+        0,
+        "deferring to a live claim spends no money"
+    );
+
+    // The claim is untouched — still pending, not settled as interrupted.
+    let sessions = world.sessions().await;
+    let recorded = sessions
+        .get_session(&CoachingSessionId::new("sess-live-elsewhere"))
+        .await
+        .expect("read the claim")
+        .expect("it is still there");
+    assert!(
+        matches!(recorded.outcome, SessionOutcome::Pending),
+        "a live claim is left alone, not finalized out from under its owner"
     );
 }
 
@@ -648,6 +744,8 @@ async fn a_reload_under_a_fresh_session_id_still_settles_this_runs_abandoned_cla
         // Dropped: the claim is committed and unfinished, as a killed process
         // leaves it.
     }
+
+    age_pending_claim(world.db().await.pool(), "sess-before-restart", 10).await;
 
     // The rail after a restart: a NEW id, because nothing remembers the old one.
     let (provider2, calls2) = ScriptedProvider::new(vec![propose_call(

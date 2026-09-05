@@ -154,12 +154,17 @@ type RailState =
   | { kind: "failed"; session: CoachSessionDto | null; error: BusError | null }
   | { kind: "completed"; session: CoachSessionDto; accepted: AcceptedCoachDto };
 
-/** The states in which something is genuinely in flight, so asking again is a
- * duplicate rather than a retry. Everything else — including a settled failure —
- * is a rail the trader may start over. */
+/**
+ * The states in which THIS rail has a call of its own still going, so asking again
+ * would be a duplicate rather than a retry.
+ *
+ * `busy` is deliberately NOT one of them. A busy record has already settled — the
+ * call it collided with belongs to someone else — so nothing further will arrive to
+ * move it along, and asking again is exactly how the trader picks that other
+ * result up. Listing it here made the "Check again" button a no-op.
+ */
 const IN_FLIGHT_KINDS = new Set<RailState["kind"]>([
   "running",
-  "busy",
   "modifying",
   "rejecting",
   "accepting",
@@ -369,16 +374,15 @@ export default function BacktestLabScreen() {
    * ask after the first outcome, which made the failure card's own recovery text
    * unactionable — it told the trader to ask again on a rail that could not.
    *
-   * The id is reused when the previous turn is one the backend can still settle
-   * against, and freshly minted when it cannot: an `interrupted` session is
-   * terminal, so asking again under its id would meet the already-settled row
-   * rather than starting a turn.
+   * Every SETTLED session gets a fresh id, not only an `interrupted` one. W1's
+   * claim semantics make a settled row terminal whatever settled it, so asking
+   * again under its id meets the recorded outcome instead of starting a turn — the
+   * previous id is reusable only while its claim is still PENDING, which is the
+   * reload case the backend resolves for itself.
    */
   function onAskCoach() {
     if (runId === null || IN_FLIGHT_KINDS.has(rail.kind)) return;
-    const previous = sessionIdOf(rail);
-    const terminal = rail.kind === "failed" && rail.session?.failure?.kind === "interrupted";
-    const sessionId = previous === null || terminal ? crypto.randomUUID() : previous;
+    const sessionId = crypto.randomUUID();
     if (rail.kind !== "idle") {
       operations.clear(coachKey(runId));
     }

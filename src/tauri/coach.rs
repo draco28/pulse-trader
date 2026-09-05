@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::broker::BinanceAdapter;
@@ -61,7 +62,7 @@ use crate::application::coach_decision::{
 use crate::domain::backtest::SummaryStats;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
-    AcceptFailureStage, BacktestRunId, CoachAcceptFailure, CoachFailure, CoachingRepository,
+    AcceptFailureStage, BacktestRunId, Clock, CoachAcceptFailure, CoachFailure, CoachingRepository,
     CoachingSession, CoachingSessionId, CredentialSource, Disposition, LlmCallRepository,
     LlmConfig, LlmProvider, Mutation, ParamKind, ParamValue, PriceTable, Proposal, Redactor,
     SessionOutcome,
@@ -633,24 +634,81 @@ pub struct CoachTurnDeps<P> {
     pub max_dsl_bytes: Option<usize>,
 }
 
-/// The id of this run's unfinished claim, when it has one.
+/// How old a `pending` claim must be before a reload may adopt it.
+///
+/// A turn cannot outlive its own wall-clock guard, so a claim older than that guard
+/// plus a margin belongs to no call that is still running anywhere. The margin
+/// covers the write and the clock skew between the claim and this read, not a
+/// judgement about the other process.
+const ABANDONED_AFTER: Duration = Duration::from_secs(DEFAULT_TURN_TIMEOUT.as_secs() + 30);
+
+/// What this run's unfinished claim, if it has one, means for a reload.
+enum PendingClaim {
+    /// Old enough that no live call can still hold it: adopt its id, so W1 settles
+    /// it as `interrupted`.
+    Abandoned(CoachingSessionId),
+    /// Young enough to be a call in flight — in ANOTHER process, since this one's
+    /// registry would have refused the turn already. Carries the id so the refusal
+    /// can name the claim it is deferring to.
+    MaybeLive(CoachingSessionId),
+}
+
+/// Classify this run's unfinished claim.
 ///
 /// A `pending` row is a session that was claimed and never settled. One run has one
 /// rail, so at most one such row is this rail's own; the LATEST is taken if a
-/// history somehow holds more than one, because that is the claim a reload is about.
+/// history somehow holds more than one.
 ///
-/// This is a read, not a judgement: whether the claim is live or stale is W1's to
-/// decide, and it can only decide it for a turn that arrives under the claim's own
-/// id. Supplying that id is all this does.
-async fn pending_session_for_run<R: CoachingRepository>(
+/// **Pending alone does not mean abandoned, and adopting on that alone steals live
+/// turns.** Both single-flight registries are process-local: a second process sees
+/// an adopted id as free, and `run_coach_turn` then reads `ExistingPending` as stale
+/// and settles it `interrupted` — killing a call the first process has already been
+/// billed for, and which will fail when it tries to settle its own row. That is a
+/// worse failure than the unreachable recovery adoption exists to fix.
+///
+/// AGE is the evidence available without a durable lease (a lease is a schema
+/// change, out of this spine's scope). A turn cannot outlive
+/// [`DEFAULT_TURN_TIMEOUT`], so a claim older than that plus a margin is held by
+/// nothing; a younger one is reported as possibly live and the caller refuses rather
+/// than guessing.
+async fn pending_claim_for_run<R: CoachingRepository>(
     sessions: &R,
     run_id: &BacktestRunId,
-) -> Result<Option<CoachingSessionId>, BusError> {
+    now: &impl Clock,
+) -> Result<Option<PendingClaim>, BusError> {
     let recorded = sessions.list_sessions_for_run(run_id).await?;
-    Ok(recorded
+    let Some(pending) = recorded
         .into_iter()
         .rfind(|session| matches!(session.outcome, SessionOutcome::Pending))
-        .map(|session| session.id))
+    else {
+        return Ok(None);
+    };
+
+    let claimed_at = DateTime::parse_from_rfc3339(&pending.created_at)
+        .map_err(|e| {
+            BusError::new(
+                BusErrorCode::Data,
+                format!(
+                    "coaching session `{}` has an unreadable created_at: {e}",
+                    pending.id.as_str()
+                ),
+            )
+        })?
+        .timestamp_millis();
+    let age_ms = now.now_ms().saturating_sub(claimed_at);
+
+    // Compared in i64 milliseconds, the units both sides already carry — no cast
+    // that could truncate the window.
+    //
+    // A future-dated row is never adopted: `saturating_sub` floors it at zero,
+    // which reads as young, which refuses. Refusing is the safe direction — it
+    // costs the trader a retry, where adopting wrongly costs someone a live turn.
+    let window_ms = i64::try_from(ABANDONED_AFTER.as_millis()).unwrap_or(i64::MAX);
+    Ok(Some(if age_ms >= window_ms {
+        PendingClaim::Abandoned(pending.id)
+    } else {
+        PendingClaim::MaybeLive(pending.id)
+    }))
 }
 
 /// Start or reload one coach turn for a persisted run — the drivable core behind
@@ -687,10 +745,23 @@ where
     //
     // One run has one rail, so a pending row for this run IS this rail's unfinished
     // business. Reloading under its id is what lets W1 tell a live claim from a
-    // stale one and settle the stale one honestly.
+    // stale one and settle the stale one honestly — but ONLY once the row is old
+    // enough that no live call can still hold it. See `pending_claim_for_run`: both
+    // registries are process-local, so adopting on "pending" alone steals turns
+    // running in another process.
     let reload_sessions = SqliteCoachingRepo::with_deps(state.db().pool().clone(), SystemClock);
-    let session_id = match pending_session_for_run(&reload_sessions, &run_id).await? {
-        Some(pending) => pending,
+    let session_id = match pending_claim_for_run(&reload_sessions, &run_id, &SystemClock).await? {
+        Some(PendingClaim::Abandoned(pending)) => pending,
+        Some(PendingClaim::MaybeLive(pending)) => {
+            return Err(BusError::new(
+                BusErrorCode::Busy,
+                format!(
+                    "coach turn {} is already running; its result will appear here when it \
+                     finishes",
+                    pending.as_str()
+                ),
+            ));
+        }
         None => CoachingSessionId::new(request.session_id),
     };
 

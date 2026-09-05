@@ -137,16 +137,27 @@ pub fn capture() -> LlmCallCapture {
 ///    failure would take the immutability rule down with it for the rest of the
 ///    test. The write's error is held and re-raised after the trigger is back.
 pub async fn with_run_immutability_lifted(pool: &sqlx::SqlitePool, statements: &[&str]) {
+    with_trigger_lifted(pool, "backtest_run_no_update", statements).await;
+}
+
+/// The same surgery against any named trigger.
+///
+/// `backtest_run`'s immutability is not the only rule a fixture has to step around:
+/// `0008` pins a coaching session's identity the same way, and a test about an
+/// ABANDONED claim has to back-date one. Everything the doc above says applies
+/// unchanged — one connection, restore from the stored definition, restore even
+/// when the surgery fails.
+pub async fn with_trigger_lifted(pool: &sqlx::SqlitePool, trigger: &str, statements: &[&str]) {
     let mut conn = pool.acquire().await.expect("a dedicated connection");
 
     let definition: String =
         sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1")
-            .bind("backtest_run_no_update")
+            .bind(trigger)
             .fetch_one(&mut *conn)
             .await
             .expect("the immutability trigger exists");
 
-    sqlx::query("DROP TRIGGER backtest_run_no_update")
+    sqlx::query(&format!("DROP TRIGGER {trigger}"))
         .execute(&mut *conn)
         .await
         .expect("lift the trigger");
@@ -168,11 +179,11 @@ pub async fn with_run_immutability_lifted(pool: &sqlx::SqlitePool, statements: &
         panic!("surgery `{statement}` failed: {e}");
     }
 
-    let back: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='backtest_run_no_update'",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .expect("count the trigger");
-    assert_eq!(back, 1, "the immutability trigger is back in place");
+    let back: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1")
+            .bind(trigger)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("count the trigger");
+    assert_eq!(back, 1, "the `{trigger}` guard is back in place");
 }

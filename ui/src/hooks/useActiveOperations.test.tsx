@@ -173,11 +173,22 @@ describe("useActiveOperations (the #141 store)", () => {
     });
     expect(second).toHaveBeenCalledTimes(1);
 
-    // Let the abandoned first operation finish; it must not resurrect its record.
+    // The abandoned operation finishes LATE. Freeing the latch alone would let its
+    // settle closure overwrite the replacement's record — it is still live and it
+    // still holds the key. It must drop its result instead.
     await act(async () => {
       gate.resolve({ status: "ok", data: "one" });
       await Promise.resolve();
     });
+
+    const record = result.current.lookup(backtestKey("v1"));
+    expect(record?.running).toBe(false);
+    if (record?.outcome?.status === "ok") {
+      expect(record.outcome.data).toBe("two");
+    } else {
+      throw new Error("the replacement's own result must be the one on record");
+    }
+    expect(first).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a settled result after the CONSUMER unmounts, and hands it back on remount", async () => {

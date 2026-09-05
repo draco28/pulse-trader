@@ -91,6 +91,18 @@ function bridgeError(error: unknown): BusResult<never> {
 function useOperationStore(): ActiveOperations {
   const [records, setRecords] = useState<Record<string, OperationRecord>>({});
   const inFlight = useRef<Set<string>>(new Set());
+  /**
+   * Who currently OWNS each key.
+   *
+   * Freeing the latch is not enough on its own: an abandoned operation's `settle`
+   * closure is still live, and a late result from it would overwrite the record of
+   * whatever started under the same key afterwards. The generation is minted in
+   * `start`, captured by that start's own closure, and checked before the write —
+   * so a settle whose generation is no longer the current one drops its result
+   * instead of speaking for an operation that is not it.
+   */
+  const generation = useRef<Map<string, number>>(new Map());
+  const nextGeneration = useRef(0);
 
   const start = useCallback(
     (key: string, invoke: () => Promise<BusResult<unknown>>, label?: string) => {
@@ -98,12 +110,21 @@ function useOperationStore(): ActiveOperations {
       return;
     }
     inFlight.current.add(key);
+    nextGeneration.current += 1;
+    const mine = nextGeneration.current;
+    generation.current.set(key, mine);
     setRecords((current) => ({
       ...current,
       [key]: { running: true, outcome: undefined, label },
     }));
 
     const settle = (outcome: BusResult<unknown>) => {
+      // Only the CURRENT owner of the key may write to it. A late result from an
+      // operation that was cleared, or superseded by a later start, is dropped:
+      // it is no longer an answer to the question the key is asking.
+      if (generation.current.get(key) !== mine) {
+        return;
+      }
       inFlight.current.delete(key);
       // No unmount guard: this provider lives above the route and is still
       // mounted, which is the entire point — the result has to land whether or
@@ -131,6 +152,10 @@ function useOperationStore(): ActiveOperations {
     // nothing is tracking any more — the failure card's own retry is the caller
     // that hits this first.
     inFlight.current.delete(key);
+    // Give up ownership too, so the abandoned operation's settle closure finds a
+    // generation that is no longer its own and drops its late result rather than
+    // resurrecting a record the trader has moved on from.
+    generation.current.delete(key);
     setRecords((current) => {
       const { [key]: _removed, ...rest } = current;
       return rest;
