@@ -45,6 +45,8 @@ use pulse::{
     SqliteStrategyRepo, StrategyRepository, SystemClock, TokenUsage, ToolCall, ToolDefinition,
     VersionId, coach_decide_core, coach_turn_core, run_backtest_version_core,
 };
+mod coach_support;
+
 use rust_decimal::Decimal;
 use serde_json::json;
 use tempfile::TempDir;
@@ -368,41 +370,6 @@ async fn world() -> World {
     world
 }
 
-/// Run `surgery` with `backtest_run`'s immutability trigger lifted, then put it
-/// back — on ONE pooled connection for the whole sequence.
-///
-/// `backtest_run` is immutable BY TRIGGER (migration `0003`), which is the property
-/// under test everywhere else and the reason a test cannot simply fabricate the two
-/// rows below with an `UPDATE`. Lifting the guard for one statement and restoring it
-/// immediately is what lets this suite build a row that PREDATES a migration, and a
-/// row the real repository will refuse to read, without weakening the rule for the
-/// code under test: every assertion afterwards runs against the restored trigger.
-///
-/// One connection for the whole sequence, deliberately: with a pool, a DROP on one
-/// connection and a CREATE on another are two statements a third connection can
-/// interleave between, and the guard's absence must not outlive the surgery
-/// (r1.s4.w2's harvested lesson).
-async fn with_run_immutability_lifted(pool: &sqlx::SqlitePool, surgery: &[&str]) {
-    let mut conn = pool.acquire().await.expect("one pooled connection");
-    sqlx::query("DROP TRIGGER backtest_run_no_update")
-        .execute(&mut *conn)
-        .await
-        .expect("lift the immutability guard");
-    for statement in surgery {
-        sqlx::query(statement)
-            .execute(&mut *conn)
-            .await
-            .unwrap_or_else(|e| panic!("surgery `{statement}` failed: {e}"));
-    }
-    sqlx::query(
-        "CREATE TRIGGER backtest_run_no_update BEFORE UPDATE ON backtest_run \
-         BEGIN SELECT RAISE(ABORT, 'backtest_run is immutable'); END",
-    )
-    .execute(&mut *conn)
-    .await
-    .expect("restore the immutability guard");
-}
-
 fn turn_request(session_id: &str, run_id: &BacktestRunId) -> CoachTurnRequestDto {
     CoachTurnRequestDto {
         session_id: session_id.to_owned(),
@@ -667,7 +634,7 @@ async fn a_run_without_input_provenance_is_recorded_as_missing_inputs_with_no_ca
          WHERE id = '{}'",
         world.parent_run_id.as_str()
     );
-    with_run_immutability_lifted(db.pool(), &[blank.as_str()]).await;
+    coach_support::with_run_immutability_lifted(db.pool(), &[blank.as_str()]).await;
 
     let (provider, calls) = ScriptedProvider::new(vec![propose_call(
         RSI_PERIOD,

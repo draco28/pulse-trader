@@ -36,6 +36,8 @@ use pulse::{
     StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId, run_coach_decision,
     run_version_backtest,
 };
+mod coach_support;
+
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -1278,57 +1280,17 @@ async fn an_absent_session_and_a_failed_turn_are_typed_refusals() {
 // Raw-SQL surgery on the immutable parent run
 // ---------------------------------------------------------------------------
 
-/// Rewrite `backtest_run` around its immutability trigger, restoring the trigger
-/// from its own stored definition afterwards.
-///
-/// The trigger is what makes a persisted run append-only, and lifting it is exactly
-/// how a test produces a row the adapter itself would never write. It is dropped for
-/// ONE statement and put back from `sqlite_master`, then asserted present again.
-async fn with_run_updates_allowed(pool: &SqlitePool, statement: &str) {
-    // ONE connection for the whole drop → write → restore sequence. Handing the
-    // three statements back to the pool between them lets a second connection start
-    // its read snapshot before the DROP is visible, which surfaced as an
-    // intermittent "trigger already exists" on the restore.
-    let mut conn = pool.acquire().await.expect("a dedicated connection");
-
-    let definition: String =
-        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1")
-            .bind("backtest_run_no_update")
-            .fetch_one(&mut *conn)
-            .await
-            .expect("the immutability trigger exists");
-
-    sqlx::query("DROP TRIGGER backtest_run_no_update")
-        .execute(&mut *conn)
-        .await
-        .expect("lift the trigger");
-    let outcome = sqlx::query(statement).execute(&mut *conn).await;
-    sqlx::query(&definition)
-        .execute(&mut *conn)
-        .await
-        .expect("restore the trigger");
-    outcome.expect("the surgery applies");
-
-    let back: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='backtest_run_no_update'",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap();
-    assert_eq!(back, 1, "the immutability trigger is back in place");
-}
-
 /// Blank the parent run's `0006` provenance columns — the pre-`0006` legacy shape.
 async fn make_parent_legacy(pool: &SqlitePool, run_id: &BacktestRunId) {
-    with_run_updates_allowed(
+    coach_support::with_run_immutability_lifted(
         pool,
-        &format!(
+        &[&format!(
             "UPDATE backtest_run SET pair = NULL, primary_timeframe = NULL, \
              primary_data_version = NULL, htf_timeframe = NULL, htf_data_version = NULL, \
              taker_fee_bps = NULL, slippage_bps = NULL, funding_config = NULL \
              WHERE id = '{}'",
             run_id.as_str()
-        ),
+        )],
     )
     .await;
 }
@@ -1336,24 +1298,24 @@ async fn make_parent_legacy(pool: &SqlitePool, run_id: &BacktestRunId) {
 /// Point the parent run's persisted primary snapshot at a version the store does not
 /// hold.
 async fn repoint_parent_primary_snapshot(pool: &SqlitePool, run_id: &BacktestRunId, to: &str) {
-    with_run_updates_allowed(
+    coach_support::with_run_immutability_lifted(
         pool,
-        &format!(
+        &[&format!(
             "UPDATE backtest_run SET primary_data_version = '{to}' WHERE id = '{}'",
             run_id.as_str()
-        ),
+        )],
     )
     .await;
 }
 
 /// Put the parent run's persisted taker fee outside the engine's accepted range.
 async fn repoint_parent_taker_fee(pool: &SqlitePool, run_id: &BacktestRunId, to: &str) {
-    with_run_updates_allowed(
+    coach_support::with_run_immutability_lifted(
         pool,
-        &format!(
+        &[&format!(
             "UPDATE backtest_run SET taker_fee_bps = '{to}' WHERE id = '{}'",
             run_id.as_str()
-        ),
+        )],
     )
     .await;
 }
@@ -1363,12 +1325,12 @@ async fn repoint_parent_taker_fee(pool: &SqlitePool, run_id: &BacktestRunId, to:
 /// The real shape is an app upgrade between the parent run and the accept; a
 /// fabricated hex is the same condition without waiting for one.
 async fn repoint_parent_engine_fingerprint(pool: &SqlitePool, run_id: &BacktestRunId, to: &str) {
-    with_run_updates_allowed(
+    coach_support::with_run_immutability_lifted(
         pool,
-        &format!(
+        &[&format!(
             "UPDATE backtest_run SET engine_fingerprint = '{to}' WHERE id = '{}'",
             run_id.as_str()
-        ),
+        )],
     )
     .await;
 }

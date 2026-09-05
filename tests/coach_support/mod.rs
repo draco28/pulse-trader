@@ -107,3 +107,72 @@ pub fn canonical_dsl_json() -> String {
 pub fn capture() -> LlmCallCapture {
     Arc::new(Mutex::new(Vec::new()))
 }
+
+// ---------------------------------------------------------------------------
+// Run-immutability surgery — ONE implementation, shared
+// ---------------------------------------------------------------------------
+
+/// Run `statements` against `backtest_run` with its immutability trigger lifted,
+/// then put the trigger back.
+///
+/// `0003` makes `backtest_run` immutable and `0006` refuses an incomplete insert, so
+/// a row the CURRENT schema would never accept — a pre-`0006` legacy run, a row the
+/// repository will refuse to read back — is otherwise unconstructible. Every
+/// assertion after the surgery runs against the restored trigger.
+///
+/// Three things this gets right, each of which one of its two former copies got
+/// wrong (`pulseai-labs/pulse-trader#153`):
+///
+/// 1. **ONE connection for the whole sequence.** Handing DROP → write → CREATE back
+///    to the pool between statements lets another connection start its read snapshot
+///    before the DROP is visible, which showed up as an intermittent "trigger
+///    already exists" on the restore.
+/// 2. **The trigger is restored from its OWN stored definition**, read out of
+///    `sqlite_master` first — never from a DDL string copied into the test. A copy
+///    silently restores a DIFFERENT trigger under the same name the day `0003`
+///    changes, and every later assertion runs against the wrong rule while the name
+///    match hides it.
+/// 3. **The restore happens even when the surgery fails.** Panicking on the write
+///    would return the connection to the pool with `backtest_run` mutable, so the
+///    failure would take the immutability rule down with it for the rest of the
+///    test. The write's error is held and re-raised after the trigger is back.
+pub async fn with_run_immutability_lifted(pool: &sqlx::SqlitePool, statements: &[&str]) {
+    let mut conn = pool.acquire().await.expect("a dedicated connection");
+
+    let definition: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1")
+            .bind("backtest_run_no_update")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the immutability trigger exists");
+
+    sqlx::query("DROP TRIGGER backtest_run_no_update")
+        .execute(&mut *conn)
+        .await
+        .expect("lift the trigger");
+
+    let mut outcome = Ok(());
+    for statement in statements {
+        if let Err(e) = sqlx::query(statement).execute(&mut *conn).await {
+            outcome = Err((*statement, e));
+            break;
+        }
+    }
+
+    sqlx::query(&definition)
+        .execute(&mut *conn)
+        .await
+        .expect("restore the trigger");
+
+    if let Err((statement, e)) = outcome {
+        panic!("surgery `{statement}` failed: {e}");
+    }
+
+    let back: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='backtest_run_no_update'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("count the trigger");
+    assert_eq!(back, 1, "the immutability trigger is back in place");
+}
