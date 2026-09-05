@@ -155,6 +155,25 @@ pub use domain::{
     CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
     DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
 };
+// r1.s4.w4 (ADR-0010 / ADR-0018 / ADR-0019 / ADR-0021 as amended): the coach
+// LIFECYCLE value types migration `0008` makes storable — the pre-call claim and
+// its three semantic results, the one settling move, the typed accept failure, and
+// the identity-free prepared acceptance whose child/run ids the adapter mints.
+// Re-exported because `tests/migration_0008.rs` and `tests/coaching_repo.rs` drive
+// the real adapters through them, and because an un-re-exported public domain type
+// is a `dead_code` BUILD error under `deny(warnings)`.
+pub use domain::{
+    AcceptFailureStage, AcceptedCoachOutcome, CoachAcceptFailure, CoachRequestFingerprint,
+    CoachSessionClaim, CoachSessionClaimResult, InitialCoachOutcome, PreparedBacktest,
+    PreparedCoachAcceptance,
+};
+// r1.s4.w4: the `IdSource` port and its two adapters. Minting a row id became an
+// injected dependency when the coach accept started minting child/run identity
+// INSIDE its transaction: the in-memory test adapter has to mint "the same way" as
+// the SQLite one, and two hidden `Uuid::new_v4()` calls cannot be the same way as
+// anything.
+pub use adapters::ids::{SeqIdSource, UuidIdSource};
+pub use domain::IdSource;
 
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
@@ -225,8 +244,29 @@ pub use cli::compose::{
 // REQUIRED under `deny(warnings)` — a `pub` item unused outside its private
 // `cli::coach` module is a `dead_code` build error, not a warning.
 pub use cli::coach::{CoachArgs, CoachCliOutcome, CoachWiring, run_coach, run_coach_with};
-// The coach itself, for `r1.s4`'s rail (which drives a turn without the CLI).
-pub use agent::{Coach, CoachTurnError};
+// r1.s4.w1 (#132): the SEALED turn's public surface is deliberately THREE items —
+// its typed error, the process-local single-flight registry a caller holds across
+// turns, and the pure request-fingerprint function. `run_coach_turn` itself, its
+// request/settings values stay `pub(crate)`, and its two ports are `pub(crate)` in
+// `domain::port` beside every other port (ADR-0015): the turn is reached
+// through the composition root, which is what keeps the fragments `#132` names
+// (a provider, a capture handle, a run, a trade vector, a version) unassemblable
+// from outside. `Coach` and `Coach::new` are GONE, not merely narrowed —
+// `scripts/check-coach-boundary.sh` is what keeps them gone.
+pub use application::coach::{CoachTurnError, CoachTurnRegistry, coach_request_fingerprint};
+
+// r1.s4.w2: the coach DECISION use case — modify / reject / accept over one
+// coaching session. Re-exported on the `run_version_backtest` precedent (the module
+// stays private and `lib.rs` curates what crosses): `tests/coach_decision.rs` drives
+// this exact function over the REAL SQLite repositories, the REAL acceptance
+// adapter, REAL `apply()` and the REAL engine, and an integration-test binary is a
+// separate crate that cannot reach a `pub(crate)` item. Nothing here is a fragment
+// the `#132` seal is about — the request carries a session id and an action, and
+// every port it names is already public.
+pub use application::coach_decision::{
+    AcceptedCoachResult, CoachAction, CoachActionKind, CoachDecisionError, CoachDecisionOutcome,
+    CoachDecisionRequest, run_coach_decision,
+};
 
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
@@ -306,6 +346,15 @@ pub use adapters::db::SqliteLlmCallRepo;
 // `deny(warnings)` + `pub(crate) mod adapters` (the `db/mod.rs` re-export alone is
 // necessary but NOT sufficient). `w3`'s coach turn and `r1.s4`'s rail construct it.
 pub use adapters::db::SqliteCoachingRepo;
+// r1.s4.w1 (#132): the SQLite coach-turn projection — the adapter the composition
+// root hands the sealed turn in place of the run + strategy repositories it used to
+// coordinate itself. REQUIRED under `deny(warnings)` (the `db/mod.rs` re-export is
+// necessary but not sufficient).
+pub use adapters::db::SqliteCoachTurnSource;
+// r1.s4.w4: the accept half of the coach seam — the real SQLite adapter and the
+// deterministic in-memory test adapter at the same product-owned port.
+pub use adapters::db::SqliteCoachAcceptanceRepo;
+pub use adapters::memory::{InMemoryCoachAcceptanceRepo, MemoryAcceptedChild, MemoryCoachTurn};
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -442,6 +491,11 @@ pub use domain::LlmCallRepository;
 // `deny(warnings)` + `pub(crate) mod domain`. `w3` writes through it; `r1.s4`'s rail
 // reads and dispositions through it.
 pub use domain::CoachingRepository;
+// r1.s4.w4: the accept persistence port. Separate from `CoachingRepository`
+// because it answers a different question — that one records what a TURN produced,
+// this one records what a DECISION did — and because its two semantic operations
+// carry an atomicity promise a turn-recording port has no business making.
+pub use domain::CoachAcceptanceRepository;
 
 // VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
 // the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).
@@ -479,7 +533,11 @@ pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 // REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public
 // adapter type unused outside its module is a `dead_code` BUILD error, not a
 // warning (the `llm/mod.rs` re-export alone is necessary but NOT sufficient).
-pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+// r1.s4.w2 (#150): `Redactor` moved to `domain::redaction` — the pure text kernel
+// crossed inward so the application ring keeps ADR-0015's ONE adapters import. The
+// crate surface is unchanged: `pulse::Redactor` still resolves, to the same type.
+pub use adapters::llm::redacting_logging::RedactingLoggingProvider;
+pub use domain::Redactor;
 
 // VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
 // `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +
@@ -521,6 +579,16 @@ pub use crate::tauri::{
     ShellInfo, StreamOutcome, TradeRowDto, VersionStats, backtest_run_dto, compose_strategy_core,
     demo_stream_core, export_bindings, library_overview_core, run_backtest_version_core,
     run_desktop, shell_info_core,
+};
+// r1.s4.w3: the coach rail's wire contract, its two drivable cores and the `#141`
+// single-flight latch. `tests/tauri_coach.rs` is a separate crate and drives the
+// REAL cores through these — the `run_backtest_version_core` precedent, with the
+// provider injected so the offline suite never needs a credential.
+pub use crate::tauri::{
+    AcceptFailureDto, AcceptedCoachDto, CoachActionDto, CoachCostDto, CoachDecisionDto,
+    CoachDecisionRequestDto, CoachFailureDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
+    MutationDto, OperationGuard, OperationKey, ProposalDto, ReadBackDto, ReadBackOk, SummaryDto,
+    coach_decide_core, coach_turn_core,
 };
 
 /// Library entry point invoked by the thin binary shim (`src/main.rs`).

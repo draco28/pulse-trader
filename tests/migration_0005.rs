@@ -57,14 +57,19 @@ async fn columns_of(pool: &SqlitePool, table: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0005_*` — the
-/// "older binary" that shipped `0007` while `0005` was still reserved.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0005_*` and `0008_*` —
+/// the "older binary" that shipped `0007` while `0005` was still reserved.
+///
+/// r1.s4.w4 added `0008` to the skip list, and it is not bookkeeping: `0008`
+/// REBUILDS the two tables `0005` creates, so a set holding `0008` without `0005`
+/// is not an older binary at all — it is an impossible one, and it fails with "no
+/// such table: `coaching_proposals`". The binary being simulated here predates both.
 fn shipped_set_without_0005(dir: &Path) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0005_") {
+        if name.starts_with("0005_") || name.starts_with("0008_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
@@ -121,11 +126,16 @@ async fn seed_parents(pool: &SqlitePool) {
     .expect("seed strategy_version");
 
     // A second version, so an `accepted` disposition has a child to point at.
+    //
+    // r1.s4.w4: it is now a REAL CHILD of `ver-1` — `0008`'s lineage trigger asks
+    // that an accepted child descend from the version the session coached, and a
+    // root version standing in for a child was only ever legal because nothing
+    // checked. The fixture had to become true rather than merely present.
     sqlx::query(
         "INSERT INTO strategy_version \
-         (id, strategy_id, dsl_schema_version, dsl, dsl_original, version_hash, created_by, \
-          creating_llm_call_ids, created_at) \
-         VALUES ('ver-2', 'strat-1', '1.0.0', '{}', '{}', 'hash-2', 'coach_llm', '[]', \
+         (id, strategy_id, parent_version_id, dsl_schema_version, dsl, dsl_original, \
+          version_hash, created_by, creating_llm_call_ids, created_at) \
+         VALUES ('ver-2', 'strat-1', 'ver-1', '1.0.0', '{}', '{}', 'hash-2', 'coach_llm', '[]', \
                  '2026-08-29T00:00:01.000Z')",
     )
     .execute(pool)
@@ -149,6 +159,22 @@ async fn seed_parents(pool: &SqlitePool) {
     .execute(pool)
     .await
     .expect("seed backtest_run");
+
+    // r1.s4.w4: a run OF the child version. `0008` requires an accepted proposal to
+    // name the re-backtest of its child, so the legal pairing below needs one.
+    sqlx::query(
+        "INSERT INTO backtest_run \
+         (id, strategy_version_id, schema_version, created_at, engine_fingerprint, engine_target, \
+          result_content_hash, starting_equity, net_pnl, fees_total, funding_total, slippage_total, \
+          pair, primary_timeframe, primary_data_version, taker_fee_bps, slippage_bps, \
+          funding_config) \
+         VALUES ('run-child-2', 'ver-2', '1', '2026-08-29T00:00:01.000Z', 'fp-1', 'test-target', \
+                 'rch-2', '10000', '0', '0', '0', '0', \
+                 'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed the child's backtest_run");
 
     sqlx::query(
         "INSERT INTO llm_call \
@@ -226,10 +252,19 @@ async fn migration_0005_applies_to_a_database_already_at_0007() {
         applied.contains(&5),
         "0005 must be applied, not skipped: {applied:?}"
     );
+    // The subject of this test is that `0005` APPLIED even though it sorts BELOW
+    // the maximum the database already held — the reserved-number property. The
+    // maximum itself moved to 8 in r1.s4.w4 because the same run also applies
+    // `0008`, which the fixture withheld; asserting `Some(7)` here would now be
+    // asserting that `0008` did not run, which is a different (and false) claim.
+    assert!(
+        applied.contains(&8),
+        "0008 rides along in the same run: {applied:?}"
+    );
     assert_eq!(
         applied.iter().copied().max(),
-        Some(7),
-        "0005 is recorded at its own version; the maximum does not move"
+        Some(8),
+        "0005 is recorded at its own version, below the new maximum 0008 sets"
     );
 
     assert!(
@@ -452,17 +487,40 @@ async fn a_child_version_exists_exactly_when_accepted() {
         "only an accepted proposal may name a child version"
     );
 
-    // The legal pairing (dormant until r1.s4, exercised here).
-    insert_proposal(
-        db.pool(),
-        "prop-1",
-        "sess-1",
-        "why",
-        "accepted",
-        Some("ver-2"),
+    // The legal pairing. r1.s4.w4 made it a TRIPLE rather than a pair: `0008`
+    // requires an accepted proposal to name its child AND that child's
+    // re-backtest, so "accepted + child, no run" — the dormant `0005` shape — is
+    // now itself refused. `tests/migration_0008.rs` covers that half; here the
+    // point is that the legal shape still lands.
+    insert_accepted_proposal(db.pool(), "prop-1", "sess-1", "ver-2", "run-child-2")
+        .await
+        .expect("accepted + child version + its run is the legal shape");
+}
+
+/// Insert an ACCEPTED proposal naming both `0008` links (r1.s4.w4).
+///
+/// Separate from [`insert_proposal`] rather than a seventh parameter on it: every
+/// other call site names no run at all, and threading a `None` through ten of them
+/// would obscure the one place the accepted shape is the subject.
+async fn insert_accepted_proposal(
+    pool: &SqlitePool,
+    id: &str,
+    session_id: &str,
+    child_version_id: &str,
+    accepted_run_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO coaching_proposals \
+         (id, session_id, mutation, hypothesis, disposition, child_version_id, accepted_run_id) \
+         VALUES (?1, ?2, '{\"type\":\"set_param\"}', 'why', 'accepted', ?3, ?4)",
     )
+    .bind(id)
+    .bind(session_id)
+    .bind(child_version_id)
+    .bind(accepted_run_id)
+    .execute(pool)
     .await
-    .expect("accepted + child version is the legal pairing");
+    .map(|_| ())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

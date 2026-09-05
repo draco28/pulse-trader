@@ -14,7 +14,7 @@
 // pointer/keyboard tooltip parity with Left/Right/Home/End traversal, the
 // focusable trade-table scroll region, and the ≥24px inline hit targets.
 
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -22,6 +22,10 @@ vi.mock("../bindings", () => ({
   commands: {
     libraryOverview: vi.fn(),
     runBacktestVersion: vi.fn(),
+    // r1.s4.w3: the rail's two commands, mocked on the same terms — no command
+    // answers except through this mock.
+    coachTurn: vi.fn(),
+    coachDecide: vi.fn(),
   },
 }));
 
@@ -29,9 +33,12 @@ import { commands } from "../bindings";
 import type {
   BacktestRunDto,
   BusError,
+  CoachDecisionDto,
+  CoachSessionDto,
   HistogramBinDto,
   LibraryOverview,
   LibraryVersion,
+  SummaryDto,
 } from "../bindings";
 import BacktestLabScreen from "./BacktestLabScreen";
 import { RouteContent } from "../App";
@@ -214,13 +221,13 @@ const RUN_ERROR: BusError = {
   // can only pass through the structured `run_id` field, never prose parsing.
   code: "data",
   message: "The saved run could not be read back.",
-  run_id: "run-51234",
+  run_id: "run-51234", session_id: null,
 };
 
 const CATALOG_ERROR: BusError = {
   code: "internal",
   message: "The library read failed.",
-  run_id: null,
+  run_id: null, session_id: null,
 };
 
 /** Render + wait for the catalog to land, then click Run on the seeded
@@ -760,5 +767,508 @@ describe("the backtest route entry (the real ROUTES table)", () => {
     catalogMock.mockResolvedValue({ status: "ok", data: { strategies: [] } });
     render(<RouteContent route={route} />);
     expect(await screen.findByText(/no strategies yet/i)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The coach rail (r1.s4.w3) — opt-in, one proposal or one recorded failure
+// ---------------------------------------------------------------------------
+//
+// Same discipline as the run tests above: every value asserted is a fixture
+// string, so a pass means the rail rendered the DTO's own text. The `recovery`
+// fixtures are deliberately NOT the real recovery sentences — a rail that mapped
+// failure kind to recovery text in TypeScript would render its own copy and pass
+// a laxer assertion; these can only pass by rendering the DTO's field.
+
+const PARENT_SUMMARY: SummaryDto = {
+  tradeCount: 8,
+  winCount: 3,
+  lossCount: 5,
+  winRate: "0.375",
+  grossProfit: "180.000",
+  grossLoss: "264.125",
+  netPnl: "-84.125",
+  profitFactor: null,
+  avgWin: "60.000",
+  avgLoss: "52.825",
+  expectancy: "-10.515625",
+  maxDrawdown: "412.750",
+  maxWinStreak: 2,
+  maxLossStreak: 3,
+  commissionTotal: "26.400",
+  fundingTotal: "-3.115",
+  sharpe: null,
+  sortino: null,
+};
+
+const CHILD_SUMMARY: SummaryDto = {
+  ...PARENT_SUMMARY,
+  tradeCount: 6,
+  winCount: 4,
+  lossCount: 2,
+  winRate: "0.666",
+  netPnl: "121.500",
+  expectancy: "20.250",
+};
+
+function proposedSession(overrides: Partial<CoachSessionDto> = {}): CoachSessionDto {
+  return {
+    sessionId: "sess-77",
+    runId: SEEDED_RUN.runId,
+    versionId: "v-alpha-1",
+    outcome: "proposed",
+    proposal: {
+      mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+      hypothesis: "a slower RSI trades less often on this chop",
+      disposition: "proposed",
+      childVersionId: null,
+      acceptedRunId: null,
+      acceptFailure: null,
+    },
+    failure: null,
+    llmCallId: "call-abc",
+    cost: { amount: "0.0184", currency: "CNY" },
+    promptVersion: "b7f3ac91",
+    createdAt: "2026-09-05T10:15:00.000Z",
+    ...overrides,
+  };
+}
+
+function failedSession(kind: string, detail: string, recovery: string): CoachSessionDto {
+  return {
+    ...proposedSession(),
+    outcome: "failed",
+    proposal: null,
+    failure: { kind, detail, recovery },
+  };
+}
+
+const coachTurnMock = vi.mocked(commands.coachTurn);
+const coachDecideMock = vi.mocked(commands.coachDecide);
+
+/** Render, run, then open the rail — the trader's actual sequence. */
+async function openRail(session: CoachSessionDto) {
+  const container = await renderRun(SEEDED_RUN);
+  coachTurnMock.mockResolvedValue({ status: "ok", data: session });
+  fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+  await screen.findByRole("region", { name: /coach/i });
+  return container;
+}
+
+describe("BacktestLabScreen (the coach rail)", () => {
+  beforeEach(() => {
+    coachTurnMock.mockReset();
+    coachDecideMock.mockReset();
+  });
+
+  it("is opt-in: no coach command is invoked from mount, StrictMode included, and no rail is shown", async () => {
+    catalogMock.mockResolvedValue({ status: "ok", data: CATALOG });
+    runMock.mockResolvedValue({ status: "ok", data: SEEDED_RUN });
+
+    render(
+      <StrictMode>
+        <BacktestLabScreen />
+      </StrictMode>,
+    );
+    await screen.findByRole("button", { name: /run backtest/i });
+
+    expect(coachTurnMock).not.toHaveBeenCalled();
+    expect(coachDecideMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
+  });
+
+  it("offers the coach only beneath a persisted run, and mints the session id itself", async () => {
+    const container = await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+    await screen.findByRole("region", { name: /coach/i });
+
+    expect(coachTurnMock).toHaveBeenCalledTimes(1);
+    const request = coachTurnMock.mock.calls[0][0];
+    expect(request.runId).toBe(SEEDED_RUN.runId);
+    // A UUID minted by the DESKTOP — the backend never mints one.
+    expect(request.sessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    expect(container).toBeTruthy();
+  });
+
+  it("shows exactly ONE proposed change with its hypothesis and the three actions", async () => {
+    await openRail(proposedSession());
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(within(rail).getByText("entry.lhs.indicator.rsi.period")).toBeTruthy();
+    expect(within(rail).getByText("21")).toBeTruthy();
+    expect(within(rail).getByText(/a slower RSI trades less often/i)).toBeTruthy();
+    // One change, not a list of them.
+    expect(rail.querySelectorAll(".coach-change").length).toBe(1);
+    expect(within(rail).getByRole("button", { name: /^modify$/i })).toBeTruthy();
+    expect(within(rail).getByRole("button", { name: /^reject$/i })).toBeTruthy();
+    expect(within(rail).getByRole("button", { name: /^accept$/i })).toBeTruthy();
+  });
+
+  it("keeps the call's cost, currency and prompt version visible", async () => {
+    await openRail(proposedSession());
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(rail.textContent).toContain("0.0184");
+    expect(rail.textContent).toContain("CNY");
+    expect(rail.textContent).toContain("b7f3ac91");
+  });
+
+  it("renders a typed failure with the BACKEND's recovery, never one it derived itself", async () => {
+    // A recovery string no frontend mapping would ever produce.
+    await openRail(
+      failedSession(
+        "inapplicable_advice",
+        "the coach asked for a volume filter",
+        "RECOVERY-FROM-THE-DTO-ONLY",
+      ),
+    );
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(rail.textContent).toContain("inapplicable_advice");
+    expect(rail.textContent).toContain("the coach asked for a volume filter");
+    expect(rail.textContent).toContain("RECOVERY-FROM-THE-DTO-ONLY");
+    // No proposal card on a failed turn — one outcome, never both.
+    expect(rail.querySelector(".coach-change")).toBeNull();
+  });
+
+  it("re-validates a modification through coach_decide on the SAME session id, and shows the stored value", async () => {
+    await openRail(proposedSession());
+    const modified: CoachDecisionDto = {
+      session: {
+        ...proposedSession(),
+        proposal: {
+          mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "9" },
+          hypothesis: "a slower RSI trades less often on this chop",
+          disposition: "modified",
+          childVersionId: null,
+          acceptedRunId: null,
+          acceptFailure: null,
+        },
+      },
+      accepted: null,
+    };
+    coachDecideMock.mockResolvedValue({ status: "ok", data: modified });
+
+    fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
+    const input = screen.getByLabelText(/new value/i);
+    fireEvent.change(input, { target: { value: "9" } });
+    fireEvent.click(screen.getByRole("button", { name: /re-validate|apply/i }));
+
+    await screen.findByText("9");
+    expect(coachDecideMock).toHaveBeenCalledTimes(1);
+    const request = coachDecideMock.mock.calls[0][0];
+    expect(request.sessionId).toBe("sess-77");
+    expect(request.action).toEqual({
+      kind: "modify",
+      path: "entry.lhs.indicator.rsi.period",
+      newValue: "9",
+    });
+  });
+
+  it("records a rejection and stops offering the proposal's actions", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "rejected",
+            childVersionId: null,
+            acceptedRunId: null,
+            acceptFailure: null,
+          },
+        },
+        accepted: null,
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+
+    await screen.findByText(/rejected/i);
+    expect(coachDecideMock.mock.calls[0][0].action).toEqual({ kind: "reject" });
+    expect(screen.queryByRole("button", { name: /^accept$/i })).toBeNull();
+  });
+
+  it("shows the accepted child beside its parent, with both expectancies and both links", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-child-9",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-child-9",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: CHILD_SUMMARY,
+          readBack: "ok",
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+
+    const comparison = await screen.findByRole("table", { name: /before and after/i });
+    // Both expectancies, exactly as the DTO delivered them — no delta, no percent.
+    expect(comparison.textContent).toContain("-10.515625");
+    expect(comparison.textContent).toContain("20.250");
+    expect(comparison.textContent).toContain("0.375");
+    expect(comparison.textContent).toContain("0.666");
+
+    const rail = screen.getByRole("region", { name: /coach/i });
+    expect(within(rail).getByRole("link", { name: /child version/i }).getAttribute("href")).toBe(
+      "#/library",
+    );
+    expect(rail.textContent).toContain("v-child-9");
+    expect(rail.textContent).toContain("run-child-9");
+    expect(coachDecideMock.mock.calls[0][0].action).toEqual({ kind: "accept" });
+  });
+
+  it("selects the accepted child in the Lab, so the child run is one click from being re-run", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-alpha-2",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-alpha-2",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: CHILD_SUMMARY,
+          readBack: "ok",
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+    await screen.findByRole("table", { name: /before and after/i });
+
+    // The Lab's own selection moves to the child — the rail's second link is a
+    // real affordance in THIS screen, not a second route.
+    //
+    // Awaited, because selecting the child REFETCHES the catalog first: the child
+    // was minted after the catalog was read, so selecting it against the stale
+    // list would set the selector to an id no option carries.
+    fireEvent.click(screen.getByRole("button", { name: /select the child/i }));
+    await waitFor(() => {
+      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("v-alpha-2");
+    });
+  });
+
+  it("lets a failed turn be asked again — the recovery the card states is one the rail can perform", async () => {
+    await openRail(failedSession("interrupted", "the turn never settled", "start a new coaching session"));
+    await screen.findByText(/start a new coaching session/i);
+
+    // The card's recovery is an ACTION, not advice the rail cannot act on: the
+    // settled record is cleared and a second turn actually starts.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach again/i }));
+
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock).toHaveBeenCalledTimes(2);
+    // A settled session is terminal whatever settled it, so the retry carries a NEW
+    // id rather than asking again under one the backend has already recorded an
+    // outcome for.
+    expect(coachTurnMock.mock.calls[1][0].sessionId).not.toBe(
+      coachTurnMock.mock.calls[0][0].sessionId,
+    );
+  });
+
+  it("checks the CONTESTED session when busy, never a fresh one", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "busy",
+        message: "coach turn sess-elsewhere for this run has not settled yet; check again to see where it got to",
+        run_id: null,
+        session_id: "sess-elsewhere",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+    await screen.findByText(/has not settled yet/i);
+
+    // The button offers the OTHER turn's result. Asking under a fresh id would ask a
+    // new question and bill for it instead.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /check again/i }));
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock.mock.calls[1][0].sessionId).toBe("sess-elsewhere");
+  });
+
+  it("offers a re-run, not another ask, when the parent run has no input provenance", async () => {
+    await openRail(
+      failedSession(
+        "missing_backtest_inputs",
+        "this run predates input provenance",
+        "run this version again, then ask the coach",
+      ),
+    );
+    await screen.findByRole("button", { name: /run this version again/i });
+
+    // Asking again cannot recover this: the parent run is immutable, so it can never
+    // acquire the provenance it lacks and every re-ask records the same failure. The
+    // card offers the action its own recovery names.
+    expect(screen.queryByRole("button", { name: /ask the coach again/i })).toBeNull();
+    runMock.mockResolvedValue({ status: "ok", data: SEEDED_RUN });
+    fireEvent.click(screen.getByRole("button", { name: /run this version again/i }));
+    expect(runMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives an operational failure a recovery too, so no failure card is a dead end", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: { code: "internal", message: "the provider is unreachable", run_id: null, session_id: null },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    // No typed coach failure exists to name its own recovery — the generic one is
+    // stated rather than left blank.
+    await screen.findByText(/the provider is unreachable/i);
+    expect(screen.getByText(/what to do/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /ask the coach again/i })).toBeTruthy();
+  });
+
+  it("keeps the proposal when a decision is refused, and shows the reason on the card", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "error",
+      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null, session_id: null },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
+    fireEvent.change(screen.getByLabelText(/new value/i), { target: { value: "abc" } });
+    fireEvent.click(screen.getByRole("button", { name: /re-validate|apply/i }));
+
+    // The refusal appears ON the card. The proposal it refused is still there to
+    // correct — replacing it with the message would throw away what was edited.
+    await screen.findByText(/is not a whole-number period/i);
+    expect(screen.getByText(/a slower RSI trades less often on this chop/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^accept$/i })).toBeTruthy();
+  });
+
+  it("shows a busy refusal as its own transient state with a way to check again", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "busy",
+        message: "coach turn sess-other for this run has not settled yet; check again",
+        run_id: null,
+        session_id: null,
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    // Not a failure — nothing broke. Not `running` either: THIS record settled, so
+    // nothing further will arrive to move it along and the trader needs a way to
+    // pick the other invocation's result up.
+    await screen.findByText(/has not settled yet/i);
+    expect(screen.queryByText(/what to do/i)).toBeNull();
+
+    // And the button DOES something: a busy record has settled, so re-asking is
+    // the only way the trader picks the other invocation's result up.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /check again/i }));
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("names each decision in flight — modifying, rejecting, accepting", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockImplementation(() => new Promise(() => {}));
+
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    await screen.findByText(/recording the rejection/i);
+  });
+
+  it("says so when an accepted child run could not be read back, and still names both ids", async () => {
+    await openRail(proposedSession());
+    coachDecideMock.mockResolvedValue({
+      status: "ok",
+      data: {
+        session: {
+          ...proposedSession(),
+          proposal: {
+            mutation: { path: "entry.lhs.indicator.rsi.period", newValue: "21" },
+            hypothesis: "a slower RSI trades less often on this chop",
+            disposition: "accepted",
+            childVersionId: "v-child-9",
+            acceptedRunId: "run-child-9",
+            acceptFailure: null,
+          },
+        },
+        accepted: {
+          childVersionId: "v-child-9",
+          acceptedRunId: "run-child-9",
+          before: PARENT_SUMMARY,
+          after: null,
+          readBack: { failure: "the saved child run could not be re-read" },
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^accept$/i }));
+
+    const rail = await screen.findByRole("region", { name: /coach/i });
+    await screen.findByText(/could not be read back/i);
+    expect(rail.textContent).toContain("v-child-9");
+    expect(rail.textContent).toContain("run-child-9");
+    expect(rail.textContent).toContain("the saved child run could not be re-read");
+  });
+
+  it("renders a refused overlapping coach call as already-running, not as a failure", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "busy",
+        message: "a coach operation for session `sess-77` is already running",
+        run_id: null, session_id: null,
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+
+    const rail = await screen.findByRole("region", { name: /coach/i });
+    await screen.findByText(/already running/i);
+    // Not an alert: nothing failed.
+    expect(within(rail).queryByRole("alert")).toBeNull();
+  });
+
+  it("closes the rail when the selection moves to another version", async () => {
+    await openRail(proposedSession());
+    expect(screen.getByRole("region", { name: /coach/i })).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "v-beta-1" } });
+
+    expect(screen.queryByRole("region", { name: /coach/i })).toBeNull();
   });
 });

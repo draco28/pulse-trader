@@ -25,9 +25,9 @@ use pulse::{
     CoachWiring, CreatedBy, DataVersion, Db, Direction, EngineFingerprint, ExitReason, FakeClock,
     Fill, FundingConfig, LlmCallRepository, LlmConfig, LlmError, LlmProvider, LlmResponse,
     MIGRATOR, Message, NewVersion, Pair, Redactor, Regime, RegimeBreakdown, SessionOutcome,
-    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachingRepo,
-    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository, SummaryStats, Timeframe, TokenUsage,
-    ToolCall, ToolDefinition, Trade, TradeSource, run_coach_with,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachTurnSource,
+    SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository, SummaryStats,
+    Timeframe, TokenUsage, ToolCall, ToolDefinition, Trade, TradeSource, run_coach_with,
 };
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
@@ -226,11 +226,14 @@ async fn turn_with(db: &Db, run_id: &BacktestRunId, provider: ScriptedProvider) 
         turn_timeout: None,
         max_dsl_bytes: None,
         captured: ids,
+        // One independent turn per call: a fresh claimed id, a registry that outlives
+        // nothing (r1.s4.w1).
+        session_id: None,
+        registry: None,
     };
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    let source = SqliteCoachTurnSource::new(db.pool().clone());
     let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
-    run_coach_with(wiring, &run_repo, &strategy_repo, &coaching_repo, run_id)
+    run_coach_with(wiring, &source, &coaching_repo, run_id)
         .await
         .expect("the turn completes")
 }
@@ -304,6 +307,7 @@ async fn no_persisted_artifact_of_a_turn_contains_the_canary() {
             proposal.hypothesis.as_str()
         ),
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     let call_id = outcome

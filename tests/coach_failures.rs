@@ -29,12 +29,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pulse::{
-    BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, Coach, CoachCliOutcome,
-    CoachFailure, CoachTurnError, CoachWiring, CoachingRepository, CoachingSession,
-    CoachingSessionId, CreatedBy, DataError, DataVersion, Db, Disposition, EngineFingerprint,
-    FakeClock, FundingConfig, LlmCallCapture, LlmCallId, LlmConfig, LlmError, LlmProvider,
-    LlmResponse, MIGRATOR, Message, MutationError, NewVersion, Pair, PersistedRun, Redactor,
-    RegimeBreakdown, SessionOutcome, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
+    BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, CoachCliOutcome,
+    CoachFailure, CoachSessionClaim, CoachSessionClaimResult, CoachTurnError, CoachWiring,
+    CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy, DataError, DataVersion, Db,
+    Disposition, EngineFingerprint, FakeClock, FundingConfig, InitialCoachOutcome, LlmCallCapture,
+    LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, Mutation,
+    MutationError, NewVersion, Pair, Proposal, Redactor, RegimeBreakdown, SessionOutcome,
+    SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachTurnSource,
     SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
     SummaryStats, Timeframe, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
 };
@@ -272,13 +273,97 @@ async fn turn_with_redactor(
     redactor: Redactor,
     prompt_dir: Option<PathBuf>,
 ) -> CoachCliOutcome {
+    try_turn(
+        db,
+        run_id,
+        provider,
+        turn_timeout,
+        max_dsl_bytes,
+        redactor,
+        prompt_dir,
+        Captures::wired(),
+    )
+    .await
+    .expect("a deviant turn is still a completed turn")
+}
+
+/// The two ends of the capture pairing: the buffer the LEDGER REPO writes minted ids
+/// into, and the buffer the ATTRIBUTED PROVIDER reads them back from.
+struct Captures {
+    ledger: LlmCallCapture,
+    provider: LlmCallCapture,
+}
+
+impl Captures {
+    /// Correctly wired: one buffer, both ends — what the composition root builds.
+    fn wired() -> Self {
+        let shared = capture();
+        Self {
+            ledger: Arc::clone(&shared),
+            provider: shared,
+        }
+    }
+
+    /// Mis-wired: the provider reads a buffer nothing writes to, so a call that
+    /// happened and was billed correlates no row.
+    fn orphaned() -> Self {
+        Self {
+            ledger: capture(),
+            provider: capture(),
+        }
+    }
+
+    /// Correctly wired to a buffer the TEST also holds — so something else can write
+    /// into it and the turn sees more ids than its one call produced.
+    fn shared_with(buffer: &LlmCallCapture) -> Self {
+        Self {
+            ledger: Arc::clone(buffer),
+            provider: Arc::clone(buffer),
+        }
+    }
+}
+
+/// The refusal of a turn that must not complete. `CoachCliOutcome` is not `Debug`
+/// (it carries the whole session), so `expect_err` is unavailable here.
+trait ExpectRefused {
+    fn expect_err_refusal(self, what: &str) -> anyhow::Error;
+}
+impl ExpectRefused for anyhow::Result<CoachCliOutcome> {
+    fn expect_err_refusal(self, what: &str) -> anyhow::Error {
+        match self {
+            Ok(outcome) => panic!(
+                "{what}: expected a refusal, got a settled session `{}`",
+                outcome.session.id.as_str()
+            ),
+            Err(error) => error,
+        }
+    }
+}
+
+/// The same, returning the `Result` — the wiring-fault cases below are about what
+/// does NOT get recorded, so they need the `Err`.
+///
+/// `captures` is the r1.s4.w1 seam for those cases. `CoachWiring.captured` is the
+/// buffer the ATTRIBUTED PROVIDER reads, and the capturing ledger repo writes to its
+/// own; wiring them to DIFFERENT buffers is precisely the mis-pairing `#132` showed a
+/// caller can perform, and it is now reproducible without a `Coach` constructor.
+#[allow(clippy::too_many_arguments)]
+async fn try_turn(
+    db: &Db,
+    run_id: &BacktestRunId,
+    provider: ScriptedProvider,
+    turn_timeout: Option<Duration>,
+    max_dsl_bytes: Option<usize>,
+    redactor: Redactor,
+    prompt_dir: Option<PathBuf>,
+    captures: Captures,
+) -> anyhow::Result<CoachCliOutcome> {
     let clock = FakeClock::at(1_700_000_000_000);
-    let ids = Arc::new(Mutex::new(Vec::new()));
     let wiring = CoachWiring {
         provider,
         llm_repo: CapturingLlmRepo::new(
             SqliteLlmCallRepo::with_deps(db.pool().clone(), clock),
-            Arc::clone(&ids),
+            captures.ledger,
         ),
         redactor,
         prices: test_prices(),
@@ -288,42 +373,16 @@ async fn turn_with_redactor(
         prompt_dir,
         turn_timeout,
         max_dsl_bytes,
-        captured: ids,
+        captured: captures.provider,
+        session_id: None,
+        registry: None,
     };
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    let source = SqliteCoachTurnSource::new(db.pool().clone());
     let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
-    run_coach_with(wiring, &run_repo, &strategy_repo, &coaching_repo, run_id)
-        .await
-        .expect("a deviant turn is still a completed turn")
+    run_coach_with(wiring, &source, &coaching_repo, run_id).await
 }
 
-/// The run + trades + version a direct `Coach::run_turn` call needs, read back
-/// through the repos exactly as `run_coach_with` does.
-async fn coachable(
-    db: &Db,
-    run_id: &BacktestRunId,
-) -> (PersistedRun, Vec<pulse::Trade>, pulse::StrategyVersion) {
-    let clock = FakeClock::at(1_700_000_000_000);
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
-
-    let run = run_repo
-        .get_run(run_id)
-        .await
-        .expect("load the run")
-        .expect("the seeded run exists");
-    let trades = run_repo.get_trades(run_id).await.expect("load the trades");
-    let version = strategy_repo
-        .get_version(&run.strategy_version_id)
-        .await
-        .expect("load the version")
-        .expect("the run's version exists");
-    (run, trades, version)
-}
-
-/// How many coaching sessions are on disk — the never-silence counter, and the
-/// counter a caller fault must leave at zero.
+/// How many coaching sessions are on disk — the never-silence counter.
 async fn session_count(db: &Db) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
         .fetch_one(db.pool())
@@ -331,11 +390,35 @@ async fn session_count(db: &Db) -> i64 {
         .expect("count the coaching sessions")
 }
 
+/// How many SETTLED sessions are on disk (r1.s4.w1).
+///
+/// The counter that matters changed shape when the turn started CLAIMING a session
+/// before it calls: a wiring or local fault now leaves a `pending` claim behind — by
+/// design, because that claim is what a later turn finalizes as `Interrupted`
+/// instead of leaving the crash silent. What must still be zero is a SETTLED row: a
+/// recorded outcome for a turn that never produced one is the false record, and the
+/// pending claim is not one.
+async fn settled_session_count(db: &Db) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions WHERE outcome <> 'pending'")
+        .fetch_one(db.pool())
+        .await
+        .expect("count the settled coaching sessions")
+}
+
+/// The stored `outcome` of the one session row, when there is exactly one.
+async fn only_session_outcome(db: &Db) -> String {
+    sqlx::query_scalar("SELECT outcome FROM coaching_sessions")
+        .fetch_one(db.pool())
+        .await
+        .expect("read the one session row's outcome")
+}
+
 /// The recorded failure of a turn — panicking if it produced a proposal instead.
 fn failure_of(outcome: &CoachCliOutcome) -> &CoachFailure {
     match &outcome.outcome_ref() {
         SessionOutcome::Failed { failure } => failure,
         SessionOutcome::Proposed { .. } => panic!("expected a recorded failure, got a proposal"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 
@@ -747,26 +830,32 @@ async fn an_oversized_system_prompt_is_recorded_as_context_overflow_before_any_c
     assert_persisted(&db, &outcome).await;
 }
 
-/// A run and a version that do not belong together is a CALLER fault, not a
-/// coaching outcome (PR #128, finding F3). `run_coach_with` loads the version from
-/// the run and cannot produce the pair, but `Coach` is exported, so a direct caller
-/// can — and the turn would then prompt on unrelated DSL and persist a session whose
-/// FKs are individually valid and jointly false. Caught first: no context, no
-/// budget check, no call, no row.
+/// A run and a version that do not belong together used to be a CALLER fault the
+/// turn had to CHECK for (PR #128, finding F3): `Coach::run_turn` took both, so a
+/// direct caller could prompt on one version's DSL about another version's result
+/// and persist a session whose two foreign keys were individually valid and jointly
+/// false.
+///
+/// **r1.s4.w1 removed the fault instead of re-checking it** (`#132`). The sealed
+/// turn takes identifiers, and the projection loads the version FROM the run — there
+/// is no argument through which the wrong version could arrive, and
+/// `CoachTurnError::RunVersionMismatch` no longer exists because the state it named
+/// is unconstructible. This case therefore keeps its subject and changes its
+/// question: it seeds the very version a pre-seal caller would have handed in, and
+/// asserts the recorded row names the run's OWN version, in the database, not just
+/// in the returned value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_and_version_that_do_not_belong_together_are_refused_before_any_call() {
+async fn a_turn_records_the_version_the_run_names_and_never_a_strangers() {
     let (_tmp, db, run_id) = seeded().await;
     let clock = FakeClock::at(1_700_000_000_000);
     let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
     let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
-    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
 
     let run = run_repo
         .get_run(&run_id)
         .await
         .expect("load the run")
         .expect("the seeded run exists");
-    let trades = run_repo.get_trades(&run_id).await.expect("load the trades");
     let owner = strategy_repo
         .get_version(&run.strategy_version_id)
         .await
@@ -791,135 +880,137 @@ async fn a_run_and_version_that_do_not_belong_together_are_refused_before_any_ca
         "propose_mutation",
         good_args("entry.lhs.indicator.rsi.period"),
     )])]);
-    let mut coach = Coach::new(provider, "unused prompt".to_owned(), config(), capture());
+    let outcome = turn_with(&db, &run_id, provider, None, None).await;
 
-    let err = coach
-        .run_turn(
-            &coaching_repo,
-            CoachingSessionId::new("sess-mismatch".to_owned()),
-            &run,
-            &trades,
-            &stranger,
-        )
-        .await
-        .expect_err("a run and a version that do not belong together is not a coaching outcome");
-
-    match &err {
-        CoachTurnError::RunVersionMismatch {
-            run_version,
-            offered,
-            ..
-        } => {
-            assert_eq!(run_version.as_str(), run.strategy_version_id.as_str());
-            assert_eq!(offered.as_str(), stranger.id.as_str());
-        }
-        other => panic!("expected RunVersionMismatch, got {other:?}"),
-    }
-
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one call, one turn");
     assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the mismatch is caught before the provider is called"
+        outcome.session.strategy_version_id, owner.id,
+        "the recorded session names the version the RUN names"
     );
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
-        .fetch_one(db.pool())
-        .await
-        .expect("count the coaching sessions");
-    assert_eq!(rows, 0, "a caller fault writes no session row");
+    assert_ne!(
+        outcome.session.strategy_version_id, stranger.id,
+        "and never the stranger a caller could once have offered"
+    );
+
+    // In the row, not just in the return value: the audit trail is the artifact.
+    let stored: String =
+        sqlx::query_scalar("SELECT strategy_version_id FROM coaching_sessions WHERE id = ?1")
+            .bind(outcome.session.id.as_str().to_owned())
+            .fetch_one(db.pool())
+            .await
+            .expect("read the session row");
+    assert_eq!(stored, run.strategy_version_id.as_str());
 }
 
 /// A turn that reached the provider MUST name the ledger row that call minted: NULL
 /// there would claim a correlation that does not exist, and audit C3 reads a NULL on
-/// a POST-call session as exactly that. `Coach::new`
-/// takes the provider and the capture handle independently, so a caller can hand it
-/// a provider that is not the capturing decorator — and before PR #128 (finding G1)
-/// the turn then wrote a post-call session with NULL, saying "no call was made"
-/// about a call that was made and billed.
+/// a POST-call session as exactly that.
+///
+/// **The mis-wiring is reproduced through the composition root now** (r1.s4.w1). The
+/// pairing used to be `Coach::new`'s two independent arguments; it is now
+/// `CoachWiring.captured` versus the buffer the capturing ledger repo writes to, and
+/// handing the attributed provider a DIFFERENT buffer is the same fault in the one
+/// place it can still be made. The turn refuses rather than writing NULL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_successful_turn_that_captured_no_ledger_row_is_a_local_fault() {
     let (_tmp, db, run_id) = seeded().await;
-    let (run, trades, version) = coachable(&db, &run_id).await;
-    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), FakeClock::at(1));
 
-    // A RAW provider: it answers, and nothing writes a ledger row.
     let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
         "c1",
         "propose_mutation",
         good_args("entry.lhs.indicator.rsi.period"),
     )])]);
-    let mut coach = Coach::new(provider, "prompt".to_owned(), config(), capture());
 
-    let err = coach
-        .run_turn(
-            &coaching_repo,
-            CoachingSessionId::new("sess-nocapture".to_owned()),
-            &run,
-            &trades,
-            &version,
-        )
-        .await
-        .expect_err("a response with no ledger row is a wiring fault, not a coaching outcome");
+    // The provider reads a buffer nothing writes to: the ledger decorator still mints
+    // its row, into the OTHER buffer, so this turn sees zero ids for a call that
+    // happened and was billed.
+    let error = try_turn(
+        &db,
+        &run_id,
+        provider,
+        None,
+        None,
+        Redactor::default(),
+        None,
+        Captures::orphaned(),
+    )
+    .await
+    .expect_err_refusal("a response with no captured ledger row");
 
     assert!(
-        matches!(err, CoachTurnError::LedgerRowMissing),
-        "expected LedgerRowMissing, got {err:?}"
+        matches!(
+            error.downcast_ref::<CoachTurnError>(),
+            Some(CoachTurnError::LedgerRowMissing)
+        ),
+        "expected LedgerRowMissing, got {error:#}"
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "this is a POST-call fault — the call did happen"
     );
+    // r1.s4.w1: the claim exists (it is what a later turn finalizes as
+    // `Interrupted`), and it is still PENDING. What a wiring fault must never leave
+    // is a SETTLED row asserting an outcome this turn never produced.
     assert_eq!(
-        session_count(&db).await,
+        settled_session_count(&db).await,
         0,
-        "a wiring fault writes no coaching row"
+        "a wiring fault settles nothing"
+    );
+    assert_eq!(
+        only_session_outcome(&db).await,
+        "pending",
+        "it leaves the claim open rather than recording a false outcome"
     );
 }
 
 /// Several ids for one turn means the buffer is shared or looping, and there is no
 /// honest way to pick one. Taking `.last()` — what the code did before PR #128
 /// (finding G1) — is a guess that can name another turn's row.
+///
+/// Driven through the real composition (r1.s4.w1): the scripted provider pushes ONE
+/// impostor id into the same buffer the ledger decorator writes its genuine row to,
+/// which is exactly the "the buffer is shared with something else" shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ambiguous_capture_is_refused_rather_than_guessed() {
     let (_tmp, db, run_id) = seeded().await;
-    let (run, trades, version) = coachable(&db, &run_id).await;
-    let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), FakeClock::at(1));
 
-    let captured = capture();
+    let shared: LlmCallCapture = capture();
     let (provider, calls) = ScriptedProvider::pushing(
         vec![with_calls(vec![call(
             "c1",
             "propose_mutation",
             good_args("entry.lhs.indicator.rsi.period"),
         )])],
-        Arc::clone(&captured),
-        vec![
-            LlmCallId::new("call-one".to_owned()),
-            LlmCallId::new("call-two".to_owned()),
-        ],
+        Arc::clone(&shared),
+        vec![LlmCallId::new("call-impostor".to_owned())],
     );
-    let mut coach = Coach::new(provider, "prompt".to_owned(), config(), captured);
 
-    let err = coach
-        .run_turn(
-            &coaching_repo,
-            CoachingSessionId::new("sess-ambiguous".to_owned()),
-            &run,
-            &trades,
-            &version,
-        )
-        .await
-        .expect_err("two ids for one turn cannot be resolved into one honest row");
+    let error = try_turn(
+        &db,
+        &run_id,
+        provider,
+        None,
+        None,
+        Redactor::default(),
+        None,
+        Captures::shared_with(&shared),
+    )
+    .await
+    .expect_err_refusal("two ids for one turn");
 
-    match err {
-        CoachTurnError::LedgerRowsAmbiguous { seen } => assert_eq!(seen, 2),
-        other => panic!("expected LedgerRowsAmbiguous, got {other:?}"),
+    match error.downcast_ref::<CoachTurnError>() {
+        Some(CoachTurnError::LedgerRowsAmbiguous { seen }) => assert_eq!(
+            *seen, 2,
+            "the impostor and the decorator's genuine row are both in the buffer"
+        ),
+        _ => panic!("expected LedgerRowsAmbiguous, got {error:#}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "still one call per turn");
     assert_eq!(
-        session_count(&db).await,
+        settled_session_count(&db).await,
         0,
-        "an unresolvable correlation writes no coaching row"
+        "an unresolvable correlation settles nothing"
     );
 }
 
@@ -1036,10 +1127,11 @@ where
         turn_timeout,
         max_dsl_bytes: None,
         captured: ids,
+        session_id: None,
+        registry: None,
     };
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
-    run_coach_with(wiring, &run_repo, &strategy_repo, coaching_repo, run_id)
+    let source = SqliteCoachTurnSource::new(db.pool().clone());
+    run_coach_with(wiring, &source, coaching_repo, run_id)
         .await
         .map(|_| ())
         .map_err(|e| format!("{e:#}"))
@@ -1069,20 +1161,52 @@ async fn a_local_fault_is_surfaced_rather_than_recorded_as_a_transport_failure()
         "the fault is preserved at the edge: {error}"
     );
 
-    // And nothing was written. `TransportFailure` says "the coach's provider call
+    // And nothing was RECORDED. `TransportFailure` says "the coach's provider call
     // failed"; recording that for a price-table miss would put a false reason in
     // the one record an auditor trusts.
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coaching_sessions")
-        .fetch_one(db.pool())
-        .await
-        .expect("count sessions");
-    assert_eq!(rows, 0, "a local fault records no coaching session");
+    //
+    // r1.s4.w1: the claim the turn committed before calling is still there, still
+    // `pending`. That is not a recorded outcome — it is the reservation whose whole
+    // purpose is to survive a turn that ends badly, and a later turn finalizes it as
+    // `Interrupted`. What must be zero is SETTLED rows.
+    assert_eq!(
+        settled_session_count(&db).await,
+        0,
+        "a local fault settles no coaching session"
+    );
+    assert_eq!(
+        session_count(&db).await,
+        1,
+        "it does leave its claim behind — that is what makes the crash recoverable"
+    );
+    assert_eq!(only_session_outcome(&db).await, "pending");
 }
 
-/// A coaching repo that refuses every write — the double-fault fixture.
+/// A coaching repo that refuses every write, CLAIM INCLUDED — the unwritable-store
+/// fixture. A claim that quietly succeeded here would let a turn believe it had
+/// reserved a session id on a database that cannot hold one.
 struct RefusingCoachingRepo;
 
 impl CoachingRepository for RefusingCoachingRepo {
+    fn claim_session(
+        &self,
+        _claim: CoachSessionClaim,
+    ) -> impl Future<Output = Result<CoachSessionClaimResult, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
+    fn finish_session(
+        &self,
+        _session_id: &CoachingSessionId,
+        _outcome: InitialCoachOutcome,
+    ) -> impl Future<Output = Result<CoachingSession, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
     fn save_session(
         &self,
         _session: &CoachingSession,
@@ -1113,22 +1237,102 @@ impl CoachingRepository for RefusingCoachingRepo {
     ) -> impl Future<Output = Result<(), DataError>> {
         std::future::ready(Ok(()))
     }
+
+    fn record_modification(
+        &self,
+        _id: &CoachingSessionId,
+        _mutation: &Mutation,
+    ) -> impl Future<Output = Result<Proposal, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_proposals is unwritable".to_owned(),
+        )))
+    }
+}
+
+/// A store that ACCEPTS the claim and cannot SETTLE it — the double-fault fixture
+/// after r1.s4.w1.
+///
+/// The double fault is "the turn deviated AND the deviation could not be recorded",
+/// and reaching it now requires getting past the claim: claim-before-I/O means a
+/// store that refuses everything fails before the provider is ever called, which is
+/// a different (and also tested) incident. This fixture is the one that still
+/// produces the original one.
+struct UnsettleableCoachingRepo;
+
+impl CoachingRepository for UnsettleableCoachingRepo {
+    fn claim_session(
+        &self,
+        _claim: CoachSessionClaim,
+    ) -> impl Future<Output = Result<CoachSessionClaimResult, DataError>> {
+        std::future::ready(Ok(CoachSessionClaimResult::Claimed))
+    }
+
+    fn finish_session(
+        &self,
+        _session_id: &CoachingSessionId,
+        _outcome: InitialCoachOutcome,
+    ) -> impl Future<Output = Result<CoachingSession, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
+    fn save_session(
+        &self,
+        _session: &CoachingSession,
+    ) -> impl Future<Output = Result<CoachingSessionId, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
+    fn get_session(
+        &self,
+        _id: &CoachingSessionId,
+    ) -> impl Future<Output = Result<Option<CoachingSession>, DataError>> {
+        std::future::ready(Ok(None))
+    }
+
+    fn list_sessions_for_run(
+        &self,
+        _run_id: &BacktestRunId,
+    ) -> impl Future<Output = Result<Vec<CoachingSession>, DataError>> {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    fn record_disposition(
+        &self,
+        _id: &CoachingSessionId,
+        _disposition: &Disposition,
+    ) -> impl Future<Output = Result<(), DataError>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn record_modification(
+        &self,
+        _id: &CoachingSessionId,
+        _mutation: &Mutation,
+    ) -> impl Future<Output = Result<Proposal, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_proposals is unwritable".to_owned(),
+        )))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_that_cannot_be_recorded_reports_both_halves() {
     let (_tmp, db, run_id) = seeded().await;
-    let (provider, _calls) = ScriptedProvider::stalling(Duration::from_secs(30));
+    let (provider, calls) = ScriptedProvider::stalling(Duration::from_secs(30));
 
     let error = try_turn_against(
         &db,
         &run_id,
         provider,
         Some(Duration::from_millis(20)),
-        &RefusingCoachingRepo,
+        &UnsettleableCoachingRepo,
     )
     .await
-    .expect_err("an unwritable session is fatal");
+    .expect_err("an unsettleable session is fatal");
 
     // The double fault: the write error alone would leave the operator knowing
     // that something could not be written and nothing about what the turn did.
@@ -1140,5 +1344,40 @@ async fn a_failure_that_cannot_be_recorded_reports_both_halves() {
     assert!(
         error.contains("did not answer"),
         "the original failure travels with it: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the turn did reach the provider — that is what makes this the DOUBLE fault"
+    );
+}
+
+/// r1.s4.w1: a store that cannot even take the CLAIM fails before the provider is
+/// called, and says so.
+///
+/// The counterpart to the double fault above, and the reason the two fixtures are
+/// different: claim-before-I/O turns "the store is unwritable" into a fault that
+/// costs nothing, and an operator reading it needs to know no call was billed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_that_cannot_be_written_is_fatal_before_any_call() {
+    let (_tmp, db, run_id) = seeded().await;
+    let (provider, calls) = ScriptedProvider::new(vec![with_calls(vec![call(
+        "c1",
+        "propose_mutation",
+        good_args("entry.lhs.indicator.rsi.period"),
+    )])]);
+
+    let error = try_turn_against(&db, &run_id, provider, None, &RefusingCoachingRepo)
+        .await
+        .expect_err("a session id that cannot be claimed is fatal");
+
+    assert!(
+        error.contains("unwritable"),
+        "the store's reason is preserved at the edge: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the claim precedes the call, so an unwritable store costs nothing"
     );
 }

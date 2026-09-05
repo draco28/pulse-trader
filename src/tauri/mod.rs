@@ -26,6 +26,10 @@
 
 // r1.s3.w3: the Backtest Lab wire contract (DTOs + the pure projection).
 pub(crate) mod backtest;
+// r1.s4.w3: the coach rail's wire contract (DTOs + the named recoveries) and the
+// two command cores. A separate module so `commands.rs` stays the registration
+// surface while the projection logic lives beside its own unit tests.
+pub(crate) mod coach;
 pub(crate) mod commands;
 pub(crate) mod error;
 pub(crate) mod events;
@@ -38,10 +42,16 @@ pub use backtest::{
     BacktestRunDto, BacktestRunRequest, EquityPointDto, HistogramBinDto, HistogramDto,
     RegimeCellDto, TradeRowDto, backtest_run_dto,
 };
+pub use coach::{
+    AcceptFailureDto, AcceptedCoachDto, CoachActionDto, CoachCostDto, CoachDecisionDto,
+    CoachDecisionRequestDto, CoachFailureDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
+    MutationDto, ProposalDto, ReadBackDto, ReadBackOk, SummaryDto, coach_decide_core,
+    coach_turn_core,
+};
 pub use commands::{
     BUS_COMMANDS, ComposeDeps, ComposeDslSummary, ComposeResult, ComposeStrategySummary,
-    DesktopState, ShellInfo, StreamOutcome, compose_strategy_core, demo_stream_core,
-    library_overview_core, run_backtest_version_core, shell_info_core,
+    DesktopState, OperationGuard, OperationKey, ShellInfo, StreamOutcome, compose_strategy_core,
+    demo_stream_core, library_overview_core, run_backtest_version_core, shell_info_core,
 };
 pub use error::{BusError, BusErrorCode};
 pub use events::{BusEvent, BusEventPayload, EventSink, RunId};
@@ -69,6 +79,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         commands::compose_strategy,
         commands::compose_cancel,
         commands::run_backtest_version,
+        commands::coach_turn,
+        commands::coach_decide,
     ])
 }
 

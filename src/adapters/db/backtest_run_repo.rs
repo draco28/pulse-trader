@@ -246,90 +246,10 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
         let run_id = Uuid::new_v4().to_string();
         let created_at = self.now_rfc3339()?;
 
-        // Scalar / canonicalized column values (D2 — Decimal-as-TEXT via
-        // `.normalize().to_string()`; D2b — sharpe/sortino finite-or-NULL).
-        let schema_version = RUN_SCHEMA_VERSION;
-        let engine_fingerprint = result.engine_fingerprint.as_str().to_owned();
-        let engine_target = EngineFingerprint::target().to_owned();
-        let result_content_hash = result.result_content_hash();
-        let starting_equity_text = decimal_text(starting_equity);
-        let net_pnl_text = decimal_text(result.net_pnl);
-        let fees_total_text = decimal_text(result.fees_total);
-        let funding_total_text = decimal_text(result.funding_total);
-        let slippage_total_text = decimal_text(result.slippage_total);
-
-        let expectancy_text = decimal_text(summary.expectancy);
-        let win_rate_text = decimal_text(summary.win_rate);
-        let profit_factor_text = summary.profit_factor.map(decimal_text);
-        let gross_profit_text = decimal_text(summary.gross_profit);
-        let gross_loss_text = decimal_text(summary.gross_loss);
-        let avg_win_text = decimal_text(summary.avg_win);
-        let avg_loss_text = decimal_text(summary.avg_loss);
-        let max_drawdown_text = decimal_text(summary.max_drawdown);
-        let trade_count = i64::try_from(summary.trade_count).map_err(|e| {
-            DataError::Db(format!(
-                "trade_count {} overflows i64: {e}",
-                summary.trade_count
-            ))
-        })?;
-        let wins = i64::try_from(summary.win_count)
-            .map_err(|e| DataError::Db(format!("win_count overflows i64: {e}")))?;
-        let losses = i64::try_from(summary.loss_count)
-            .map_err(|e| DataError::Db(format!("loss_count overflows i64: {e}")))?;
-        // `breakeven = trade_count - wins - losses` (README C1: wins+losses+breakeven
-        // == trade_count). SummaryStats carries no explicit breakeven field.
-        let breakeven = trade_count - wins - losses;
-        let max_win_streak = i64::try_from(summary.max_win_streak)
-            .map_err(|e| DataError::Db(format!("max_win_streak overflows i64: {e}")))?;
-        let max_loss_streak = i64::try_from(summary.max_loss_streak)
-            .map_err(|e| DataError::Db(format!("max_loss_streak overflows i64: {e}")))?;
-        // sharpe/sortino: f64 to_string() finite, or NULL; NaN/Inf fail-closed (D2b).
-        let sharpe_text = f64_stat_text("sharpe", summary.sharpe)?;
-        let sortino_text = f64_stat_text("sortino", summary.sortino)?;
-        // The regime breakdown rides an inline JSON column (round-trips exactly into
-        // the hash feed on read — D4b proves this).
-        let regime_breakdown_json = serde_json::to_string(&result.regime_breakdown)
-            .map_err(|e| DataError::Db(e.to_string()))?;
-        let skipped_sub_lot = i64::try_from(result.skipped_entries.sub_lot)
-            .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
-        let skipped_sub_notional = i64::try_from(result.skipped_entries.sub_notional)
-            .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
-        let skipped_leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
-            .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
-
-        // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
-        // funding discriminant ride their serde tokens (`15m`/`4h`,
-        // `snapshot_rates`), matching the `direction`/`regime` precedent; the two
-        // bps values ride the same `.normalize()`d Decimal-as-TEXT every other money
-        // column uses (NFR-2). The HTF pair is written all-or-nothing — the domain
-        // cannot express half a selection, and `0006`'s trigger refuses one.
-        //
         // The two version tags are checked BEFORE the transaction opens, so an
         // unsafe one persists nothing at all rather than aborting a partly-built
-        // write. `DataVersion` is opaque by design but not arbitrary: the adapter
-        // joins a tag verbatim into `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and
-        // W3 will hand a decoded tag straight to `load_version`, so `../../../x`
-        // would escape the store root. Same rule, same reason, as `Pair::parse`.
-        inputs.primary.data_version.ensure_path_safe()?;
-        if let Some(htf) = inputs.htf.as_ref() {
-            htf.data_version.ensure_path_safe()?;
-        }
-
-        let pair_text = inputs.pair.as_str().to_owned();
-        let primary_timeframe = enum_token(&inputs.primary.timeframe)?;
-        let primary_data_version = inputs.primary.data_version.as_str().to_owned();
-        let htf_timeframe = inputs
-            .htf
-            .as_ref()
-            .map(|htf| enum_token(&htf.timeframe))
-            .transpose()?;
-        let htf_data_version = inputs
-            .htf
-            .as_ref()
-            .map(|htf| htf.data_version.as_str().to_owned());
-        let taker_fee_bps_text = decimal_text(inputs.taker_fee_bps);
-        let slippage_bps_text = decimal_text(inputs.slippage_bps);
-        let funding_config = enum_token(&inputs.funding)?;
+        // write (see `check_inputs_path_safe`).
+        check_inputs_path_safe(inputs)?;
 
         // INSERT run + ALL trades + read-back in ONE transaction (D3, mirror
         // `create_version`'s begin → insert → commit → read-back).
@@ -356,125 +276,18 @@ impl<C: Clock + Send + Sync> BacktestRunRepository for SqliteBacktestRunRepo<C> 
             )));
         }
 
-        sqlx::query!(
-            "INSERT INTO backtest_run \
-             (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
-              engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
-              funding_total, slippage_total, expectancy, win_rate, profit_factor, \
-              gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
-              wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
-              regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
-              pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
-              taker_fee_bps, slippage_bps, funding_config) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
-                     ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
-            run_id,
-            version_id_str,
-            schema_version,
-            created_at,
-            engine_fingerprint,
-            engine_target,
-            result_content_hash,
-            starting_equity_text,
-            net_pnl_text,
-            fees_total_text,
-            funding_total_text,
-            slippage_total_text,
-            expectancy_text,
-            win_rate_text,
-            profit_factor_text,
-            gross_profit_text,
-            gross_loss_text,
-            avg_win_text,
-            avg_loss_text,
-            max_drawdown_text,
-            trade_count,
-            wins,
-            losses,
-            breakeven,
-            max_win_streak,
-            max_loss_streak,
-            sharpe_text,
-            sortino_text,
-            regime_breakdown_json,
-            skipped_sub_lot,
-            skipped_sub_notional,
-            skipped_leverage_capped,
-            pair_text,
-            primary_timeframe,
-            primary_data_version,
-            htf_timeframe,
-            htf_data_version,
-            taker_fee_bps_text,
-            slippage_bps_text,
-            funding_config,
+        insert_run_row(
+            &mut tx,
+            &run_id,
+            &version_id_str,
+            &created_at,
+            inputs,
+            result,
+            summary,
+            starting_equity,
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        // INSERT every trade in `seq` order (0-based chronological).
-        for (seq, trade) in result.trades.iter().enumerate() {
-            let trade_id = Uuid::new_v4().to_string();
-            let seq_i64 = i64::try_from(seq)
-                .map_err(|e| DataError::Db(format!("trade seq {seq} overflows i64: {e}")))?;
-            let direction = enum_token(&trade.direction)?;
-            let qty = decimal_text(trade.qty);
-            let entry_price = decimal_text(trade.entry_price);
-            let exit_price = decimal_text(trade.exit_price);
-            let t_fees_total = decimal_text(trade.fees_total);
-            let t_funding_total = decimal_text(trade.funding_total);
-            let t_slippage_total = decimal_text(trade.slippage_total);
-            let realized_pnl = decimal_text(trade.realized_pnl);
-            let realized_r = decimal_text(trade.realized_r);
-            let mfe_r = decimal_text(trade.mfe_r);
-            let mae_r = decimal_text(trade.mae_r);
-            let exit_reason = enum_token(&trade.exit_reason)?;
-            let source = enum_token(&trade.source)?;
-            let regime = enum_token(&trade.regime)?;
-            let fills_json =
-                serde_json::to_string(&trade.fills).map_err(|e| DataError::Db(e.to_string()))?;
-            let entry_signal_time = trade.entry_signal_time;
-            let entry_fill_time = trade.entry_fill_time;
-            let exit_signal_time = trade.exit_signal_time;
-            let exit_fill_time = trade.exit_fill_time;
-
-            sqlx::query!(
-                "INSERT INTO trade \
-                 (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
-                  entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
-                  fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
-                  mfe_r, mae_r, exit_reason, source, regime, fills) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                         ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-                trade_id,
-                run_id,
-                seq_i64,
-                direction,
-                qty,
-                entry_price,
-                exit_price,
-                entry_signal_time,
-                entry_fill_time,
-                exit_signal_time,
-                exit_fill_time,
-                t_fees_total,
-                t_funding_total,
-                t_slippage_total,
-                realized_pnl,
-                realized_r,
-                mfe_r,
-                mae_r,
-                exit_reason,
-                source,
-                regime,
-                fills_json,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DataError::Db(e.to_string()))?;
-        }
+        .await?;
+        insert_trade_rows(&mut tx, &run_id, &result.trades).await?;
 
         tx.commit()
             .await
@@ -1043,6 +856,278 @@ fn usize_from(column: &str, value: Option<i64>) -> Result<usize, DataError> {
 /// must be present but is NULL is a corrupt row, never silently defaulted).
 fn require_col<T>(column: &str, value: Option<T>) -> Result<T, DataError> {
     value.ok_or_else(|| DataError::Db(format!("NULL in required column `{column}` (corrupt row)")))
+}
+
+// ---------------------------------------------------------------------------
+// r1.s4.w4 — the crate-private insert mappings, extracted so the coach's accept
+// transaction can REUSE them.
+//
+// `commit_acceptance` has to write a `backtest_run` and its `trade` rows inside the
+// same transaction that mints the child version. Copying this mapping there would
+// have created a SECOND place that knows how a run becomes columns — and the two
+// would drift the first time a column is added, in the direction that matters most
+// (money math persisted two ways). These are `pub(crate)`: the mapping stays owned
+// by this file, and the accept path borrows it.
+// ---------------------------------------------------------------------------
+
+/// The two `DataVersion` tags a run names, checked for path safety BEFORE any
+/// transaction opens.
+///
+/// `DataVersion` is opaque by design but not arbitrary: the adapter joins a tag
+/// verbatim into `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and a consumer hands a
+/// decoded tag straight to `load_version`, so `../../../x` would escape the store
+/// root. Same rule, same reason, as `Pair::parse`. Called before `begin()` so an
+/// unsafe tag persists nothing at all rather than aborting a partly-built write.
+///
+/// # Errors
+///
+/// Returns the `DataError` `ensure_path_safe` raises for an unsafe tag.
+pub(crate) fn check_inputs_path_safe(inputs: &BacktestInputs) -> Result<(), DataError> {
+    inputs.primary.data_version.ensure_path_safe()?;
+    if let Some(htf) = inputs.htf.as_ref() {
+        htf.data_version.ensure_path_safe()?;
+    }
+    Ok(())
+}
+
+/// Insert one `backtest_run` row on the caller's transaction.
+///
+/// The caller owns the id, the timestamp and the ownership guard; this owns the
+/// COLUMN MAPPING and nothing else. D2 (`Decimal`-as-TEXT via `.normalize()`), D2b
+/// (finite-or-NULL sharpe/sortino) and `0006`'s eight input-provenance columns all
+/// live here, once.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] on an overflowing count, a non-finite f64 statistic, a
+/// serialization failure, or a store/constraint rejection.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn insert_run_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    version_id_str: &str,
+    created_at: &str,
+    inputs: &BacktestInputs,
+    result: &BacktestResult,
+    summary: &SummaryStats,
+    starting_equity: Decimal,
+) -> Result<(), DataError> {
+    // Scalar / canonicalized column values (D2 — Decimal-as-TEXT via
+    // `.normalize().to_string()`; D2b — sharpe/sortino finite-or-NULL).
+    let schema_version = RUN_SCHEMA_VERSION;
+    let engine_fingerprint = result.engine_fingerprint.as_str().to_owned();
+    let engine_target = EngineFingerprint::target().to_owned();
+    let result_content_hash = result.result_content_hash();
+    let starting_equity_text = decimal_text(starting_equity);
+    let net_pnl_text = decimal_text(result.net_pnl);
+    let fees_total_text = decimal_text(result.fees_total);
+    let funding_total_text = decimal_text(result.funding_total);
+    let slippage_total_text = decimal_text(result.slippage_total);
+
+    let expectancy_text = decimal_text(summary.expectancy);
+    let win_rate_text = decimal_text(summary.win_rate);
+    let profit_factor_text = summary.profit_factor.map(decimal_text);
+    let gross_profit_text = decimal_text(summary.gross_profit);
+    let gross_loss_text = decimal_text(summary.gross_loss);
+    let avg_win_text = decimal_text(summary.avg_win);
+    let avg_loss_text = decimal_text(summary.avg_loss);
+    let max_drawdown_text = decimal_text(summary.max_drawdown);
+    let trade_count = i64::try_from(summary.trade_count).map_err(|e| {
+        DataError::Db(format!(
+            "trade_count {} overflows i64: {e}",
+            summary.trade_count
+        ))
+    })?;
+    let wins = i64::try_from(summary.win_count)
+        .map_err(|e| DataError::Db(format!("win_count overflows i64: {e}")))?;
+    let losses = i64::try_from(summary.loss_count)
+        .map_err(|e| DataError::Db(format!("loss_count overflows i64: {e}")))?;
+    // `breakeven = trade_count - wins - losses` (README C1: wins+losses+breakeven
+    // == trade_count). SummaryStats carries no explicit breakeven field.
+    let breakeven = trade_count - wins - losses;
+    let max_win_streak = i64::try_from(summary.max_win_streak)
+        .map_err(|e| DataError::Db(format!("max_win_streak overflows i64: {e}")))?;
+    let max_loss_streak = i64::try_from(summary.max_loss_streak)
+        .map_err(|e| DataError::Db(format!("max_loss_streak overflows i64: {e}")))?;
+    // sharpe/sortino: f64 to_string() finite, or NULL; NaN/Inf fail-closed (D2b).
+    let sharpe_text = f64_stat_text("sharpe", summary.sharpe)?;
+    let sortino_text = f64_stat_text("sortino", summary.sortino)?;
+    // The regime breakdown rides an inline JSON column (round-trips exactly into
+    // the hash feed on read — D4b proves this).
+    let regime_breakdown_json = serde_json::to_string(&result.regime_breakdown)
+        .map_err(|e| DataError::Db(e.to_string()))?;
+    let skipped_sub_lot = i64::try_from(result.skipped_entries.sub_lot)
+        .map_err(|e| DataError::Db(format!("skipped_sub_lot overflows i64: {e}")))?;
+    let skipped_sub_notional = i64::try_from(result.skipped_entries.sub_notional)
+        .map_err(|e| DataError::Db(format!("skipped_sub_notional overflows i64: {e}")))?;
+    let skipped_leverage_capped = i64::try_from(result.skipped_entries.leverage_capped)
+        .map_err(|e| DataError::Db(format!("skipped_leverage_capped overflows i64: {e}")))?;
+
+    // r1.s3.w2 (#110) — the eight INPUT provenance columns. Timeframes and the
+    // funding discriminant ride their serde tokens (`15m`/`4h`,
+    // `snapshot_rates`), matching the `direction`/`regime` precedent; the two
+    // bps values ride the same `.normalize()`d Decimal-as-TEXT every other money
+    // column uses (NFR-2). The HTF pair is written all-or-nothing — the domain
+    // cannot express half a selection, and `0006`'s trigger refuses one.
+    //
+    // The two version tags are checked BEFORE the transaction opens, so an
+    // unsafe one persists nothing at all rather than aborting a partly-built
+    // write. `DataVersion` is opaque by design but not arbitrary: the adapter
+    // joins a tag verbatim into `<base>/candles/<PAIR>/<TF>/<tag>.parquet`, and
+    // W3 will hand a decoded tag straight to `load_version`, so `../../../x`
+    // would escape the store root. Same rule, same reason, as `Pair::parse`.
+    let pair_text = inputs.pair.as_str().to_owned();
+    let primary_timeframe = enum_token(&inputs.primary.timeframe)?;
+    let primary_data_version = inputs.primary.data_version.as_str().to_owned();
+    let htf_timeframe = inputs
+        .htf
+        .as_ref()
+        .map(|htf| enum_token(&htf.timeframe))
+        .transpose()?;
+    let htf_data_version = inputs
+        .htf
+        .as_ref()
+        .map(|htf| htf.data_version.as_str().to_owned());
+    let taker_fee_bps_text = decimal_text(inputs.taker_fee_bps);
+    let slippage_bps_text = decimal_text(inputs.slippage_bps);
+    let funding_config = enum_token(&inputs.funding)?;
+    sqlx::query!(
+        "INSERT INTO backtest_run \
+         (id, strategy_version_id, schema_version, created_at, engine_fingerprint, \
+          engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
+          funding_total, slippage_total, expectancy, win_rate, profit_factor, \
+          gross_profit, gross_loss, avg_win, avg_loss, max_drawdown, trade_count, \
+          wins, losses, breakeven, max_win_streak, max_loss_streak, sharpe, sortino, \
+          regime_breakdown, skipped_sub_lot, skipped_sub_notional, skipped_leverage_capped, \
+          pair, primary_timeframe, primary_data_version, htf_timeframe, htf_data_version, \
+          taker_fee_bps, slippage_bps, funding_config) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, \
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
+        run_id,
+        version_id_str,
+        schema_version,
+        created_at,
+        engine_fingerprint,
+        engine_target,
+        result_content_hash,
+        starting_equity_text,
+        net_pnl_text,
+        fees_total_text,
+        funding_total_text,
+        slippage_total_text,
+        expectancy_text,
+        win_rate_text,
+        profit_factor_text,
+        gross_profit_text,
+        gross_loss_text,
+        avg_win_text,
+        avg_loss_text,
+        max_drawdown_text,
+        trade_count,
+        wins,
+        losses,
+        breakeven,
+        max_win_streak,
+        max_loss_streak,
+        sharpe_text,
+        sortino_text,
+        regime_breakdown_json,
+        skipped_sub_lot,
+        skipped_sub_notional,
+        skipped_leverage_capped,
+        pair_text,
+        primary_timeframe,
+        primary_data_version,
+        htf_timeframe,
+        htf_data_version,
+        taker_fee_bps_text,
+        slippage_bps_text,
+        funding_config,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DataError::Db(e.to_string()))?;
+    Ok(())
+}
+
+/// Insert every `trade` row for `run_id`, in `seq` order (0-based chronological),
+/// on the caller's transaction.
+///
+/// # Errors
+///
+/// Returns [`DataError::Db`] on an overflowing sequence number, a serialization
+/// failure, or a store/constraint rejection.
+// `mfe_r` / `mae_r` are domain field names and are similar by construction — the
+// same allow `save_run` carried before this mapping moved out of it.
+#[allow(clippy::similar_names)]
+pub(crate) async fn insert_trade_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    trades: &[Trade],
+) -> Result<(), DataError> {
+    // INSERT every trade in `seq` order (0-based chronological).
+    for (seq, trade) in trades.iter().enumerate() {
+        let trade_id = Uuid::new_v4().to_string();
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|e| DataError::Db(format!("trade seq {seq} overflows i64: {e}")))?;
+        let direction = enum_token(&trade.direction)?;
+        let qty = decimal_text(trade.qty);
+        let entry_price = decimal_text(trade.entry_price);
+        let exit_price = decimal_text(trade.exit_price);
+        let t_fees_total = decimal_text(trade.fees_total);
+        let t_funding_total = decimal_text(trade.funding_total);
+        let t_slippage_total = decimal_text(trade.slippage_total);
+        let realized_pnl = decimal_text(trade.realized_pnl);
+        let realized_r = decimal_text(trade.realized_r);
+        let mfe_r = decimal_text(trade.mfe_r);
+        let mae_r = decimal_text(trade.mae_r);
+        let exit_reason = enum_token(&trade.exit_reason)?;
+        let source = enum_token(&trade.source)?;
+        let regime = enum_token(&trade.regime)?;
+        let fills_json =
+            serde_json::to_string(&trade.fills).map_err(|e| DataError::Db(e.to_string()))?;
+        let entry_signal_time = trade.entry_signal_time;
+        let entry_fill_time = trade.entry_fill_time;
+        let exit_signal_time = trade.exit_signal_time;
+        let exit_fill_time = trade.exit_fill_time;
+
+        sqlx::query!(
+            "INSERT INTO trade \
+             (id, backtest_run_id, seq, direction, qty, entry_price, exit_price, \
+              entry_signal_time, entry_fill_time, exit_signal_time, exit_fill_time, \
+              fees_total, funding_total, slippage_total, realized_pnl, realized_r, \
+              mfe_r, mae_r, exit_reason, source, regime, fills) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            trade_id,
+            run_id,
+            seq_i64,
+            direction,
+            qty,
+            entry_price,
+            exit_price,
+            entry_signal_time,
+            entry_fill_time,
+            exit_signal_time,
+            exit_fill_time,
+            t_fees_total,
+            t_funding_total,
+            t_slippage_total,
+            realized_pnl,
+            realized_r,
+            mfe_r,
+            mae_r,
+            exit_reason,
+            source,
+            regime,
+            fills_json,
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                 s.outcome             AS \"outcome!: String\",\n                 s.strategy_version_id AS \"strategy_version_id!: String\",\n                 s.llm_call_id         AS \"llm_call_id?: String\",\n                 v.strategy_id         AS \"strategy_id!: String\"\n               FROM coaching_sessions s\n               JOIN strategy_version v ON v.id = s.strategy_version_id\n               WHERE s.id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "outcome!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "strategy_version_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "llm_call_id?: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "strategy_id!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "5ee9f00febd2ee34f588aad4fedcf4980c5c4bc16e65b9a1ebcb2eca6bacff39"
+}

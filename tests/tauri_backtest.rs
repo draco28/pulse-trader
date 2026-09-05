@@ -918,13 +918,28 @@ fn save_run_commits_and_returns_the_id_without_reading_back() {
         body.contains("Ok(BacktestRunId::new(run_id))"),
         "positive control: save_run still returns the minted id"
     );
+    // r1.s4.w4: the two INSERT mappings moved OUT of `save_run` into the
+    // crate-private `insert_run_row` / `insert_trade_rows`, which the coach's
+    // accept transaction now reuses rather than copying. The positive control has
+    // to follow them, and it is checked in two halves so it still fails loudly if
+    // either the call or the mapping disappears: `save_run` must still drive both
+    // writes, and the file must still contain both statements.
+    let file = blank_comments(&read_source("src/adapters/db/backtest_run_repo.rs"));
     assert!(
-        body.contains("INSERT INTO backtest_run"),
-        "positive control: the run insert is still here"
+        body.contains("insert_run_row("),
+        "positive control: save_run still writes the run"
     );
     assert!(
-        body.contains("INSERT INTO trade"),
-        "positive control: the trade inserts are still here"
+        body.contains("insert_trade_rows("),
+        "positive control: save_run still writes the trades"
+    );
+    assert!(
+        file.contains("INSERT INTO backtest_run"),
+        "positive control: the run insert mapping is still in this adapter"
+    );
+    assert!(
+        file.contains("INSERT INTO trade"),
+        "positive control: the trade insert mapping is still in this adapter"
     );
     // The actual rule.
     assert!(
@@ -986,10 +1001,39 @@ async fn candle_and_engine_work_runs_off_the_calling_worker_thread() {
 // 6. the application ring has no order capability
 // ---------------------------------------------------------------------------
 
+/// EVERY Rust source file in the application ring, by glob (r1.s4.w2, #150).
+///
+/// It used to be a hard-coded pair, which meant the guarantee below held for the
+/// two files someone remembered and for no others — and the ring grew a third file
+/// (`coach.rs`) and then a fourth (`coach_decision.rs`) without either of them ever
+/// being scanned. A glob is what makes "the application ring" the subject of the
+/// assertion instead of "two files in it".
+fn application_ring_sources() -> Vec<String> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/application");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("a readable dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            format!(
+                "src/application/{}",
+                path.file_name().expect("a file name").to_string_lossy()
+            )
+        })
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 4,
+        "the application ring has at least mod/backtest/coach/coach_decision; the glob \
+         found {files:?} — a scan that reads nothing passes vacuously"
+    );
+    files
+}
+
 #[test]
 fn the_application_ring_exposes_no_order_or_broker_capability() {
-    for relative in ["src/application/mod.rs", "src/application/backtest.rs"] {
-        let code = blank_comments(&read_source(relative));
+    for relative in application_ring_sources() {
+        let code = blank_comments(&read_source(&relative));
         for banned in [
             "broker",
             "Broker",
@@ -1020,6 +1064,43 @@ fn the_application_ring_exposes_no_order_or_broker_capability() {
             }
         }
     }
+}
+
+/// ADR-0015 keeps EXACTLY ONE deliberate adapters import in the application ring:
+/// `crate::adapters::backtest`, the deterministic engine, which owns no I/O.
+///
+/// r1.s4.w2 / `pulseai-labs/pulse-trader#150`: there used to be a second —
+/// `crate::adapters::llm::redacting_logging::Redactor` in `coach.rs` — and the pair
+/// of them turned "one deliberate exception" into "however many have accumulated".
+/// The redactor's pure text logic now lives in the domain ring, and this is the
+/// assertion that keeps the exception count at one.
+#[test]
+fn the_application_ring_imports_exactly_one_adapter_namespace() {
+    let mut engine_import_seen = false;
+    for relative in application_ring_sources() {
+        let code = blank_comments(&read_source(&relative));
+        for line in code.lines() {
+            let Some(at) = line.find("crate::adapters::") else {
+                continue;
+            };
+            let named = &line[at..];
+            assert!(
+                named.starts_with("crate::adapters::backtest"),
+                "{relative} names `{}` — ADR-0015 keeps exactly ONE deliberate adapters \
+                 import in the application ring (`crate::adapters::backtest`, the \
+                 deterministic engine), and this is a second one",
+                named.split_whitespace().next().unwrap_or(named)
+            );
+            engine_import_seen = true;
+        }
+    }
+    // Positive control: the ONE permitted import really is there, so a scan that
+    // matched nothing cannot pass by reading an empty ring.
+    assert!(
+        engine_import_seen,
+        "no file in the application ring imports `crate::adapters::backtest` — either \
+         the engine import moved or this scan is reading the wrong tree"
+    );
 }
 
 // ---------------------------------------------------------------------------

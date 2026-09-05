@@ -79,6 +79,8 @@ fn sample_proposal() -> Proposal {
         mutation: set_period("entry.lhs.indicator.rsi.period", 21),
         hypothesis: hypothesis("a slower RSI should cut the whipsaw entries the run shows"),
         disposition: Disposition::Proposed,
+        // r1.s4.w4: a fresh proposal has no accept attempt behind it.
+        accept_failure: None,
     }
 }
 
@@ -121,6 +123,7 @@ fn a_session_carries_a_proposal_or_a_failure() {
             assert!(!proposal.hypothesis.as_str().is_empty());
         }
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     // A pre-call failure records no LlmCall row (audit C3): the session row IS the
@@ -155,7 +158,8 @@ fn a_session_carries_a_proposal_or_a_failure() {
 /// The `match` below is EXHAUSTIVE and has no `_` arm on purpose: an eighth
 /// failure kind stops this file compiling until someone writes down what that
 /// kind reads back as. A `vec![...]` alone cannot do that — it would just quietly
-/// cover six of seven, which is how `TransportFailure` shipped untested here.
+/// cover six of seven, which is how `TransportFailure` shipped untested here (and
+/// nine of ten, once r1.s4.w4 widened the taxonomy again).
 fn every_failure_case() -> Vec<(CoachFailure, &'static str)> {
     let cases = vec![
         (CoachFailure::ZeroCalls, "no"),
@@ -195,6 +199,32 @@ fn every_failure_case() -> Vec<(CoachFailure, &'static str)> {
             },
             "503",
         ),
+        // r1.s4.w4 — the three `0008` adds. Each needle is the CONTEXT the
+        // recorded reason has to carry: the advice a trader would otherwise lose,
+        // the input that went missing, and what is known about the abandoned claim.
+        (
+            // r1.s4.w1 (#131): the payload became `intent` + `evidence` when the
+            // `record_inapplicable` tool that produces it landed. The needle stays
+            // the ADVICE ITSELF — the thing a trader would otherwise lose.
+            CoachFailure::InapplicableAdvice {
+                intent: "add an ADX filter above 25".to_owned(),
+                evidence: "most losses are in the ranging regime".to_owned(),
+            },
+            "add an ADX filter above 25",
+        ),
+        (
+            CoachFailure::MissingBacktestInputs {
+                detail: "primary snapshot `v-primary` is not in the store".to_owned(),
+            },
+            "v-primary",
+        ),
+        (
+            CoachFailure::Interrupted {
+                detail: "claimed at 2026-08-29T00:00:00Z by a process that did not finish"
+                    .to_owned(),
+            },
+            "2026-08-29T00:00:00Z",
+        ),
     ];
 
     // The completeness gate: every variant must appear at least once, and the
@@ -204,7 +234,7 @@ fn every_failure_case() -> Vec<(CoachFailure, &'static str)> {
     seen.dedup();
     assert_eq!(
         seen.len(),
-        7,
+        10,
         "every CoachFailure variant must be exercised, got {seen:?}"
     );
     cases
@@ -221,6 +251,9 @@ fn variant_tag(failure: &CoachFailure) -> &'static str {
         CoachFailure::ProviderTimeout { .. } => "provider_timeout",
         CoachFailure::ContextOverflow { .. } => "context_overflow",
         CoachFailure::TransportFailure { .. } => "transport_failure",
+        CoachFailure::InapplicableAdvice { .. } => "inapplicable_advice",
+        CoachFailure::MissingBacktestInputs { .. } => "missing_backtest_inputs",
+        CoachFailure::Interrupted { .. } => "interrupted",
     }
 }
 
@@ -307,6 +340,7 @@ fn legal_dispositions_transition() {
         Disposition::Modified,
         Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         },
     ] {
         let moved = proposal
@@ -325,6 +359,7 @@ fn legal_dispositions_transition() {
     let accepted = modified
         .transition(Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         })
         .expect("modified -> accepted");
     assert_eq!(accepted.disposition.kind(), DispositionKind::Accepted);
@@ -340,6 +375,7 @@ fn illegal_dispositions_are_rejected() {
     let err = rejected
         .transition(Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         })
         .expect_err("rejected -> accepted must be refused");
     match err {
@@ -347,7 +383,7 @@ fn illegal_dispositions_are_rejected() {
             assert_eq!(from, DispositionKind::Rejected);
             assert_eq!(to, DispositionKind::Accepted);
         }
-        other @ CoachingError::EmptyHypothesis => {
+        other @ (CoachingError::EmptyHypothesis | CoachingError::EmptyRequestFingerprint) => {
             panic!("expected IllegalTransition, got {other:?}")
         }
     }
@@ -355,6 +391,7 @@ fn illegal_dispositions_are_rejected() {
     let accepted = sample_proposal()
         .transition(Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         })
         .expect("proposed -> accepted");
     for next in [
@@ -362,6 +399,7 @@ fn illegal_dispositions_are_rejected() {
         Disposition::Modified,
         Disposition::Accepted {
             child_version_id: VersionId::new("ver-3"),
+            accepted_run_id: BacktestRunId::new("run-child-3"),
         },
     ] {
         assert!(
@@ -391,6 +429,7 @@ fn child_version_id_exists_only_on_accepted() {
     // so "a rejected proposal with a child version" is not representable.
     let accepted = Disposition::Accepted {
         child_version_id: VersionId::new("ver-2"),
+        accepted_run_id: BacktestRunId::new("run-child-2"),
     };
     assert_eq!(
         accepted.child_version_id(),
@@ -434,6 +473,7 @@ fn an_accepted_disposition_round_trips_with_its_child_version() {
     let accepted = sample_proposal()
         .transition(Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         })
         .expect("proposed -> accepted");
 

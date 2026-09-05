@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE coaching_sessions SET outcome = ?1, failure_kind = ?2, failure_detail = ?3, llm_call_id = ?4 WHERE id = ?5 AND outcome = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "d35a83af701645ee465f8cd96468610a684045a54819ede688c8400e21f0a699"
+}

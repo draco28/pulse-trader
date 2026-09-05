@@ -8,7 +8,7 @@
 //!
 //! This is the ONE place the coach's concrete stack is assembled, keeping every
 //! layer generic underneath — the `run_compose` precedent, with the coach's own
-//! prompt and tool:
+//! prompt and tools:
 //!
 //! ```text
 //! resolve_llm_api_key()  →  ApiKey (opaque; carries the CredentialSource label)
@@ -16,15 +16,24 @@
 //!                      →  RedactingLoggingProvider::new(inner, capturing, clock, redactor, prices)
 //!                         .with_created_by(CoachLlm).with_key_source(source)
 //!                         .with_prompt_version(Some(sha256(resolved coach.md)))   ← audit C2
-//!                      →  Coach::new(decorator, prompt, config, buffer)
-//!                      →  run_turn()  →  ONE recorded CoachingSession
+//!                      →  AttributedProvider::new(decorator, buffer)   ← response + its LlmCallId
+//!                      →  run_coach_turn(source, provider, sessions, registry, …)
+//!                                             →  ONE recorded CoachingSession
 //! ```
 //!
+//! **The turn is sealed** (r1.s4.w1, `#132`). This root no longer builds a `Coach`
+//! out of fragments and hands it a run, a trade vector and a version: it builds the
+//! ports and passes IDENTIFIERS. It also no longer coordinates the run and strategy
+//! repositories — [`SqliteCoachTurnSource`](crate::adapters::db::SqliteCoachTurnSource)
+//! owns that projection now (ADR-0015: adapters and the CLI do not coordinate
+//! repositories).
+//!
 //! **Injectable core.** [`run_coach_with`] takes the LLM-side deps bundled in a
-//! [`CoachWiring`] plus the three repos, so the offline tests (`coach_turn` = demo
-//! `d6`, `coach_failures` = demo `d7`, `coach_redaction`) drive the SAME
-//! composition with a scripted provider over the REAL coach, REAL `apply()`, REAL
-//! repos and a `tempfile` `SQLite` — never a live LLM, never the network.
+//! [`CoachWiring`] plus the projection and the coaching repo, so the offline tests
+//! (`coach_turn` = demo `d6`, `coach_failures` = demo `d7`, `coach_redaction`,
+//! `coach_turn_boundary`) drive the SAME composition with a scripted provider over
+//! the REAL sealed turn, REAL `apply()`, REAL repos and a `tempfile` `SQLite` —
+//! never a live LLM, never the network.
 //!
 //! **Prompt resolution lives in the core, not the caller** (unlike
 //! `ComposeWiring.prompt`): the resolved prompt and the `prompt_version` stamped on
@@ -38,21 +47,24 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use crate::adapters::clock::SystemClock;
-use crate::adapters::db::{
-    Db, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo,
-};
+use crate::adapters::db::{Db, SqliteCoachTurnSource, SqliteCoachingRepo, SqliteLlmCallRepo};
+use crate::adapters::llm::attributed::AttributedProvider;
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::config::load_coach_prompt_from;
-use crate::agent::{Coach, LlmCallCapture};
+use crate::agent::{DEFAULT_MAX_DSL_BYTES, DEFAULT_TURN_TIMEOUT, LlmCallCapture};
+use crate::application::coach::{
+    CoachTurnRegistry, CoachTurnRequest, CoachTurnSettings, run_coach_turn,
+};
+use crate::domain::Redactor;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
-    BacktestRunId, BacktestRunRepository, Clock, CoachFailure, CoachingRepository, CoachingSession,
+    BacktestRunId, Clock, CoachFailure, CoachTurnSource, CoachingRepository, CoachingSession,
     CoachingSessionId, CredentialSource, LlmBackend, LlmCallRepository, LlmConfig, LlmProvider,
-    PriceTable, SessionOutcome, StrategyRepository,
+    PriceTable, SessionOutcome,
 };
 
-use super::llm::CapturingRepo;
+use crate::adapters::llm::capturing::CapturingRepo;
 
 /// `pulse coach <RUN_ID> [--db <path>]`.
 #[derive(Debug, clap::Args)]
@@ -92,8 +104,24 @@ pub struct CoachWiring<P, R, C> {
     /// Override the pre-call DSL size budget. `None` = the default.
     pub max_dsl_bytes: Option<usize>,
     /// The shared buffer the capturing ledger repo pushes minted ids into, and the
-    /// coach reads back to name the turn's ledger row.
+    /// attributed provider reads back to name the turn's ledger row.
+    ///
+    /// It is handed to the ATTRIBUTED PROVIDER here, not to the turn: the pairing
+    /// obligation `#132` showed a caller can get wrong is discharged in this one
+    /// place, and the sealed module never sees a capture handle at all.
     pub captured: LlmCallCapture,
+    /// The session id to claim and settle under. `None` mints a fresh one — the
+    /// live arm's case, where every `pulse coach` invocation is a new turn.
+    ///
+    /// An explicit id is what makes a turn RETRYABLE: the same id with the same
+    /// request is the idempotent answer, and a `pending` row under it is a claim to
+    /// finalize. `r1.s4`'s rail supplies one; the debug verb does not need to.
+    pub session_id: Option<CoachingSessionId>,
+    /// The process-local single-flight registry. `None` mints a fresh one per
+    /// invocation, which is correct for a CLI process that runs exactly one turn and
+    /// deliberately blind for anything that runs several: a registry that never saw
+    /// the first turn can never say "in flight" about it.
+    pub registry: Option<Arc<CoachTurnRegistry>>,
 }
 
 /// The outcome of one coach turn at the CLI edge.
@@ -105,31 +133,46 @@ pub struct CoachCliOutcome {
     pub prompt_version: String,
 }
 
-/// The injectable, doubleable core: resolve the prompt, load the persisted run and
-/// its version, assemble the decorator, and run exactly one coach turn.
+/// The injectable, doubleable core: resolve the prompt, assemble the attributed
+/// provider, and run exactly one SEALED coach turn.
+///
+/// It hands the turn two identifiers and three ports. It does not load the run, the
+/// trades or the version — that is the projection's job now — and it does not pair a
+/// provider with a capture handle at the turn's boundary, because the attributed
+/// provider assembled here has already done it.
 ///
 /// # Errors
 ///
-/// Returns an error when the run or its version is absent, when the prompt overlay
-/// exists but cannot be read, when this process faults on the provider call path
-/// (an unpriced model, a failed ledger write — the turn never happened and nothing
-/// is recorded), or when the session cannot be recorded. A provider TRANSPORT
-/// fault is not an error here: it is a recorded `TransportFailure` session, which
-/// the live arm below then exits non-zero on (recorded AND loud, ADR-0017).
-pub async fn run_coach_with<P, L, B, S, K, C>(
+/// Returns an error when the prompt overlay exists but cannot be read, when the run
+/// is absent or its projection cannot be loaded, when the session id is already in
+/// flight or held by a different request, when this process faults on the provider
+/// call path (an unpriced model, a failed ledger write — the turn never happened),
+/// or when the session cannot be recorded. A provider TRANSPORT fault is not an
+/// error here: it is a recorded `TransportFailure` session, which the live arm below
+/// then exits non-zero on (recorded AND loud, ADR-0017).
+///
+/// The `private_bounds` allow is the sealed-trait shape, stated on purpose:
+/// [`CoachTurnSource`] is `pub(crate)` because nothing outside this crate may
+/// implement or name the projection port (ADR-0015), while this function is `pub`
+/// because the four offline coach test binaries — separate crates — drive the
+/// injectable core through it. Widening the port to `pub` to silence the lint would
+/// re-open exactly the surface `#132` asked to seal; narrowing this function would
+/// take the regression suite off the production path. So the bound stays private and
+/// the seam stays testable: an outside caller can CALL `run_coach_with`, and still
+/// cannot name a type to satisfy `S` that this crate did not give it.
+#[allow(private_bounds)]
+pub async fn run_coach_with<P, L, S, K, C>(
     wiring: CoachWiring<P, L, C>,
-    run_repo: &B,
-    strategy_repo: &S,
+    source: &S,
     coaching_repo: &K,
     run_id: &BacktestRunId,
 ) -> anyhow::Result<CoachCliOutcome>
 where
     P: LlmProvider + Send + Sync,
     L: LlmCallRepository + Send + Sync,
-    B: BacktestRunRepository + Send + Sync,
-    S: StrategyRepository + Send + Sync,
+    S: CoachTurnSource + Send + Sync,
     K: CoachingRepository + Send + Sync,
-    C: Clock + Send + Sync,
+    C: Clock + Copy + Send + Sync,
 {
     let CoachWiring {
         provider,
@@ -143,58 +186,53 @@ where
         turn_timeout,
         max_dsl_bytes,
         captured,
+        session_id,
+        registry,
     } = wiring;
 
     // The prompt and its version, resolved together from the same bytes (audit C2).
     let prompt =
         load_coach_prompt_from(prompt_dir.as_deref()).context("resolving the coach prompt")?;
 
-    // The persisted run the coach READS (and never recomputes), plus its trades and
-    // the version whose DSL a mutation addresses.
-    let run = run_repo
-        .get_run(run_id)
-        .await
-        .context("loading the backtest run")?
-        .with_context(|| format!("no persisted backtest run `{}`", run_id.as_str()))?;
-    let trades = run_repo
-        .get_trades(run_id)
-        .await
-        .context("loading the run's trades")?;
-    let version = strategy_repo
-        .get_version(&run.strategy_version_id)
-        .await
-        .context("loading the run's strategy version")?
-        .with_context(|| {
-            format!(
-                "backtest run `{}` names strategy version `{}`, which is absent",
-                run_id.as_str(),
-                run.strategy_version_id.as_str()
-            )
-        })?;
-
-    // The coach speaks to the PORT, behind the decorator that redacts what is
-    // persisted and stamps the ledger row's cost, actor and prompt version.
+    // The turn speaks to the PORT, behind the decorator that redacts what is
+    // persisted and stamps the ledger row's cost, actor and prompt version — and
+    // behind the attribution that pairs the response with the row it minted.
     let decorated =
         RedactingLoggingProvider::new(provider, llm_repo, clock, redactor.clone(), prices)
             .with_created_by(CreatedBy::CoachLlm)
             .with_key_source(key_source)
             .with_prompt_version(Some(prompt.version.clone()));
+    let attributed = AttributedProvider::new(decorated, captured);
 
     // The SAME redactor on both roads: the decorator scrubs the ledger copy of the
-    // prompt/completion, the coach scrubs the tool arguments that become stored
+    // prompt/completion, the turn scrubs the tool arguments that become stored
     // domain values (AC-3).
-    let mut coach = Coach::new(decorated, prompt.text, config, captured).with_redactor(redactor);
-    if let Some(timeout) = turn_timeout {
-        coach = coach.with_turn_timeout(timeout);
-    }
-    if let Some(budget) = max_dsl_bytes {
-        coach = coach.with_max_dsl_bytes(budget);
-    }
+    let settings = CoachTurnSettings {
+        prompt: prompt.text,
+        prompt_version: Some(prompt.version.clone()),
+        config,
+        redactor,
+        turn_timeout: turn_timeout.unwrap_or(DEFAULT_TURN_TIMEOUT),
+        max_dsl_bytes: max_dsl_bytes.unwrap_or(DEFAULT_MAX_DSL_BYTES),
+    };
 
-    let session_id = CoachingSessionId::new(uuid::Uuid::new_v4().to_string());
-    let session = coach
-        .run_turn(coaching_repo, session_id, &run, &trades, &version)
-        .await?;
+    let registry = registry.unwrap_or_else(|| Arc::new(CoachTurnRegistry::new()));
+    let request = CoachTurnRequest {
+        session_id: session_id
+            .unwrap_or_else(|| CoachingSessionId::new(uuid::Uuid::new_v4().to_string())),
+        run_id: run_id.clone(),
+    };
+
+    let session = run_coach_turn(
+        source,
+        &attributed,
+        coaching_repo,
+        &registry,
+        &clock,
+        &settings,
+        request,
+    )
+    .await?;
 
     Ok(CoachCliOutcome {
         session,
@@ -261,16 +299,17 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
         turn_timeout: None,
         max_dsl_bytes: None,
         captured,
+        // One turn per invocation: a fresh id, and a registry that outlives nothing.
+        session_id: None,
+        registry: None,
     };
 
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    let source = SqliteCoachTurnSource::new(db.pool().clone());
     let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
 
     let outcome = run_coach_with(
         wiring,
-        &run_repo,
-        &strategy_repo,
+        &source,
         &coaching_repo,
         &BacktestRunId::new(args.run_id.clone()),
     )
@@ -325,6 +364,39 @@ fn print_outcome(outcome: &CoachCliOutcome) {
         SessionOutcome::Failed { failure } => {
             println!("\nRECORDED FAILURE");
             println!("  {failure}");
+            // r1.s4.w1 (ADR-0017): the three failures this item can now produce are
+            // printed as themselves rather than flattened into one line of prose.
+            // Each says something structurally different about what to do next, and
+            // an operator reading `pulse coach` is deciding exactly that.
+            match failure {
+                CoachFailure::InapplicableAdvice { intent, evidence } => {
+                    println!("\n  STRUCTURAL ADVICE (this release cannot apply it)");
+                    println!("    intent:   {intent}");
+                    println!("    evidence: {evidence}");
+                    println!(
+                        "    recorded rather than approximated with a parameter change (#131)"
+                    );
+                }
+                CoachFailure::MissingBacktestInputs { detail } => {
+                    println!("\n  NO INPUT PROVENANCE");
+                    println!("    {detail}");
+                    println!("    re-run the backtest to produce a run this release can coach on");
+                }
+                CoachFailure::Interrupted { detail } => {
+                    println!("\n  INTERRUPTED CLAIM (finalized, not re-asked)");
+                    println!("    {detail}");
+                    println!("    no second provider call was made on the claimant's behalf");
+                }
+                _ => {}
+            }
+        }
+        // r1.s4.w4: `pulse coach` runs one turn to completion, so it never prints a
+        // claim. Printing "(none)" here would be the wrong shape of honest — the
+        // turn this command reports on either produced something or recorded why
+        // not, and a pending row on THIS path is a wiring fault worth naming.
+        SessionOutcome::Pending => {
+            println!("\nSTILL PENDING");
+            println!("  the turn was claimed and never settled — this is a wiring fault");
         }
     }
 }
@@ -345,6 +417,13 @@ fn no_ledger_reason(outcome: &CoachCliOutcome) -> &'static str {
         SessionOutcome::Failed {
             failure: CoachFailure::ProviderTimeout { .. },
         } => "the call was attempted and did not answer inside the turn's budget",
+        // r1.s4.w1: an interrupted claim is finalized by a process that made no call
+        // of its own — and cannot know whether the claimant's call happened. Saying
+        // "before any provider call" here would be a claim about someone else's
+        // process, which is exactly what the `Interrupted` tag exists to avoid.
+        SessionOutcome::Failed {
+            failure: CoachFailure::Interrupted { .. },
+        } => "this process finalized an abandoned claim and made no call of its own",
         _ => "the turn failed before any provider call",
     }
 }

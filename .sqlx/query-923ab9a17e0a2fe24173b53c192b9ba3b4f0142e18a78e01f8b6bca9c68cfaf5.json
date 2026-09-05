@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n             mutation              AS \"mutation!: String\",\n             hypothesis            AS \"hypothesis!: String\",\n             disposition           AS \"disposition!: String\",\n             child_version_id      AS \"child_version_id?: String\",\n             accepted_run_id       AS \"accepted_run_id?: String\",\n             accept_failure_stage  AS \"accept_failure_stage?: String\",\n             accept_failure_detail AS \"accept_failure_detail?: String\"\n           FROM coaching_proposals WHERE session_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "mutation!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "hypothesis!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "disposition!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "child_version_id?: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "accepted_run_id?: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "accept_failure_stage?: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "accept_failure_detail?: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "923ab9a17e0a2fe24173b53c192b9ba3b4f0142e18a78e01f8b6bca9c68cfaf5"
+}

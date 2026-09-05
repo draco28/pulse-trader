@@ -33,9 +33,9 @@ use pulse::{
     EngineFingerprint, FakeClock, FundingConfig, LlmCall, LlmCallId, LlmCallRepository, LlmConfig,
     LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, ModelPrice, Mutation, NewVersion, Pair,
     ParamValue, PriceTable, Redactor, RegimeBreakdown, SessionOutcome, SkippedEntryCounts,
-    SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo,
-    SqliteStrategyRepo, StrategyRepository, StrategyVersion, SummaryStats, Timeframe, TokenUsage,
-    ToolCall, ToolDefinition, run_coach_with,
+    SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachTurnSource, SqliteCoachingRepo,
+    SqliteLlmCallRepo, SqliteStrategyRepo, StrategyRepository, StrategyVersion, SummaryStats,
+    Timeframe, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
 };
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
@@ -220,13 +220,20 @@ async fn coach_once(
         turn_timeout: None,
         max_dsl_bytes: None,
         captured: ids,
+        // r1.s4.w1: the turn CLAIMS a session id before it calls, so the id and the
+        // process-local registry are wiring now. A fresh pair per turn is this
+        // fixture's case exactly — each `coach_once` is one independent turn.
+        session_id: None,
+        registry: None,
     };
 
-    let run_repo = SqliteBacktestRunRepo::with_deps(db.pool().clone(), clock);
-    let strategy_repo = SqliteStrategyRepo::new(db.pool().clone());
+    // r1.s4.w1 (ADR-0015): the CLI no longer coordinates the run and strategy
+    // repositories — the projection loads the run, its trades and THE VERSION THE
+    // RUN NAMES, from the one run id.
+    let source = SqliteCoachTurnSource::new(db.pool().clone());
     let coaching_repo = SqliteCoachingRepo::with_deps(db.pool().clone(), clock);
 
-    let outcome = run_coach_with(wiring, &run_repo, &strategy_repo, &coaching_repo, run_id)
+    let outcome = run_coach_with(wiring, &source, &coaching_repo, run_id)
         .await
         .expect("the coach turn completes");
     (outcome, seen)
@@ -278,6 +285,7 @@ async fn a_persisted_run_yields_one_validated_mutation_with_a_hypothesis() {
             assert_eq!(proposal.disposition, Disposition::Proposed);
         }
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
     assert_eq!(&session.backtest_run_id, &run_id);
 
@@ -458,6 +466,7 @@ async fn an_empty_overlay_dir_falls_back_to_the_compiled_in_default() {
             }
         ),
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 

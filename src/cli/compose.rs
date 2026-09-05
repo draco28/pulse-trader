@@ -33,7 +33,7 @@
 //! persisted ledger timestamp single-sourced.
 //!
 //! **One shared `LlmCallCapture` buffer.** ONE `Arc<Mutex<Vec<LlmCallId>>>` is wired
-//! into BOTH the [`CapturingRepo`](super::llm::CapturingRepo) (which pushes each
+//! into BOTH the [`CapturingRepo`](crate::adapters::llm::capturing::CapturingRepo) (which pushes each
 //! minted id as the decorator writes an `LlmCall`) AND [`Composer::new`], so the
 //! composer reads its run's provenance ids back after the loop.
 //!
@@ -56,18 +56,19 @@ use anyhow::Context as _;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo, SqliteStrategyRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
 use crate::agent::{
     ComposeOutcome, Composer, ComposerEvent, LlmCallCapture, builder_tool_definitions,
 };
+use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, NewVersion, Strategy, StrategyVersion};
 use crate::domain::{
     ApiKey, Clock, CredentialSource, LlmBackend, LlmCallId, LlmCallRepository, LlmConfig,
     LlmProvider, PriceTable, StrategyRepository,
 };
 
-use super::llm::CapturingRepo;
+use crate::adapters::llm::capturing::CapturingRepo;
 
 /// The FALLBACK Ollama Cloud model id the composer drives when the config
 /// `[llm].model` is absent (README C2/C8). A model-id STRING (not a price literal)

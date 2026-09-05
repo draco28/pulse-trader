@@ -56,6 +56,21 @@ pub use llm_call_repo::SqliteLlmCallRepo;
 // error (this re-export is necessary but not sufficient; lib.rs mirrors it).
 pub use coaching_repo::SqliteCoachingRepo;
 
+// r1.s4.w1 (#132): the SQLite `CoachTurnSource` adapter — the repository-owned
+// coach-turn projection. It adds NO `query!` macro of its own (and therefore no
+// `.sqlx` entry): it composes the run and strategy repositories' existing
+// fail-closed reads, keyed by the one `run_id` a caller supplies.
+pub mod coach_turn_source;
+pub use coach_turn_source::SqliteCoachTurnSource;
+
+// r1.s4.w4 (ADR-0010 / ADR-0021 as amended): the SQLite `CoachAcceptanceRepository`
+// adapter. One accept is one transaction — child version, run, trades and the
+// proposal's links commit together or not at all — and the child/run identity is
+// MINTED inside it from the injected id/clock sources, with provenance derived from
+// the claimed session row.
+pub mod coach_acceptance_repo;
+pub use coach_acceptance_repo::SqliteCoachAcceptanceRepo;
+
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol. Re-export EVERY public
 // item — under `#![deny(warnings)]` a `pub` item unused outside its module is a
 // `dead_code` BUILD ERROR, not a warning (VS-1.1.2 harvested gotcha). All three
@@ -82,6 +97,10 @@ const BUSY_TIMEOUT_SECS: u64 = 5;
 /// need neither a live DB nor `sqlx-cli` — the migrations travel in the binary.
 /// 1.04 drives `MIGRATOR.run(pool)` / `MIGRATOR.undo(pool, target)` in-process;
 /// re-exported from `lib.rs` so it (and the integration boundary) can reach it.
+/// r1.s4.w4: `sqlx::migrate!` records a dependency on the migration files it saw
+/// when it last expanded, so ADDING a file (here, `0008_coaching_lifecycle`) does
+/// not by itself invalidate the cached expansion. Editing this file is what forces
+/// the re-expansion, which is why a new migration always comes with a touch here.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// A thin newtype over a `sqlx::SqlitePool` for the `PulseTrader` `SQLite` tier.

@@ -17,18 +17,25 @@
 // default export, zero props — the shell mounts it from the route table and
 // all state is its own.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { commands } from "../bindings";
 import type {
+  AcceptedCoachDto,
   BacktestRunDto,
   BusError,
+  CoachActionDto,
+  CoachDecisionDto,
+  CoachSessionDto,
   HistogramDto,
   LibraryOverview,
   LibraryVersion,
   RegimeCellDto,
+  SummaryDto,
   TradeRowDto,
 } from "../bindings";
+import { backtestKey, coachKey, useActiveOperations } from "../hooks/useActiveOperations";
+import type { BusResult, OperationRecord } from "../hooks/useActiveOperations";
 
 /** The em dash every null renders — a statement that no value exists, never
  * a zero dressed up as data (the Library's grill A1 rule, applied here). */
@@ -81,6 +88,160 @@ type RunState =
   | { kind: "failed"; error: BusError }
   | { kind: "done"; dto: BacktestRunDto };
 
+/**
+ * Read one operation record as this screen's own state machine (r1.s4.w3, #141).
+ *
+ * The record lives above the route, so this is a projection of shared state
+ * rather than state of its own — which is exactly what makes a remount show the
+ * run that is still going rather than an idle screen with a live command behind
+ * it.
+ */
+function runStateOf(record: OperationRecord | undefined): RunState {
+  if (record === undefined) {
+    return { kind: "idle" };
+  }
+  if (record.running) {
+    return { kind: "running" };
+  }
+  const outcome = record.outcome as BusResult<BacktestRunDto> | undefined;
+  if (outcome === undefined) {
+    return { kind: "idle" };
+  }
+  return outcome.status === "ok"
+    ? { kind: "done", dto: outcome.data }
+    : { kind: "failed", error: outcome.error };
+}
+
+// ---------------------------------------------------------------------------
+// Coach rail state (r1.s4.w3) — opt-in, beneath the selected persisted run
+// ---------------------------------------------------------------------------
+
+/**
+ * What the rail's one operation key holds: a turn, a decision on it, or a decision
+ * the backend REFUSED.
+ *
+ * The refusal rides as a settled outcome rather than an error because it is not the
+ * turn that failed — the proposal is untouched and still actionable, and dropping
+ * it to show a validation message would throw away the thing the trader was editing.
+ */
+type CoachOutcome =
+  | { kind: "turn"; session: CoachSessionDto }
+  | { kind: "decision"; decision: CoachDecisionDto }
+  | { kind: "refused"; session: CoachSessionDto; error: BusError };
+
+/**
+ * The rail's explicit states, and nothing outside them.
+ *
+ * A `busy` refusal has a state of its own. It used to project onto `running`, which
+ * reads correctly — the answer IS coming from whoever holds the key — but the
+ * record it lands on has already settled, so nothing further will ever arrive to
+ * move it off `running`, and the rail sits on "Asking the coach…" for good. It is a
+ * transient state with its own retry instead.
+ *
+ * A non-`busy` `BusError` is a `failed` state. Its recovery is the generic one: a
+ * TYPED coach failure carries the backend's own named recovery, and an operational
+ * error has no such thing — but a failure card with no way forward is a dead end,
+ * so "try again" is stated rather than left blank.
+ */
+type RailState =
+  | { kind: "idle" }
+  | { kind: "running"; note: string | null }
+  | { kind: "busy"; note: string; contested: string | null }
+  | { kind: "modifying" }
+  | { kind: "rejecting" }
+  | { kind: "accepting" }
+  | { kind: "proposal"; session: CoachSessionDto; refusal: BusError | null }
+  | { kind: "failed"; session: CoachSessionDto | null; error: BusError | null }
+  | { kind: "completed"; session: CoachSessionDto; accepted: AcceptedCoachDto };
+
+/**
+ * The states in which THIS rail has a call of its own still going, so asking again
+ * would be a duplicate rather than a retry.
+ *
+ * `busy` is deliberately NOT one of them. A busy record has already settled — the
+ * call it collided with belongs to someone else — so nothing further will arrive to
+ * move it along, and asking again is exactly how the trader picks that other
+ * result up. Listing it here made the "Check again" button a no-op.
+ */
+const IN_FLIGHT_KINDS = new Set<RailState["kind"]>([
+  "running",
+  "modifying",
+  "rejecting",
+  "accepting",
+]);
+
+/** The label each decision runs under, so a remount can still name what is in
+ * flight rather than only that something is. */
+const DECIDING: Record<string, RailState["kind"]> = {
+  modify: "modifying",
+  reject: "rejecting",
+  accept: "accepting",
+};
+
+/** Project the shared operation record into the rail's own state machine. */
+function railStateOf(record: OperationRecord | undefined): RailState {
+  if (record === undefined) {
+    return { kind: "idle" };
+  }
+  if (record.running) {
+    const deciding = record.label === undefined ? undefined : DECIDING[record.label];
+    if (deciding === "modifying") return { kind: "modifying" };
+    if (deciding === "rejecting") return { kind: "rejecting" };
+    if (deciding === "accepting") return { kind: "accepting" };
+    return { kind: "running", note: null };
+  }
+  const outcome = record.outcome as BusResult<CoachOutcome> | undefined;
+  if (outcome === undefined) {
+    return { kind: "idle" };
+  }
+  if (outcome.status === "error") {
+    return outcome.error.code === "busy"
+      ? {
+          kind: "busy",
+          note: outcome.error.message,
+          // The id crosses as a FIELD; the message names it too, but a screen that
+          // parses prose to learn an id it must act on is one message rewording
+          // away from starting a second billable turn.
+          contested: outcome.error.session_id,
+        }
+      : { kind: "failed", session: null, error: outcome.error };
+  }
+  // A REFUSED decision keeps its proposal: the backend rejected the edit, not the
+  // turn, so the card the trader was working in stays on screen with the reason
+  // attached rather than being replaced by it.
+  if (outcome.data.kind === "refused") {
+    return { kind: "proposal", session: outcome.data.session, refusal: outcome.data.error };
+  }
+  const session =
+    outcome.data.kind === "turn" ? outcome.data.session : outcome.data.decision.session;
+  const accepted = outcome.data.kind === "decision" ? outcome.data.decision.accepted : null;
+  if (accepted !== null) {
+    return { kind: "completed", session, accepted };
+  }
+  if (session.outcome === "failed") {
+    return { kind: "failed", session, error: null };
+  }
+  if (session.outcome === "proposed") {
+    return { kind: "proposal", session, refusal: null };
+  }
+  // A `pending` session is a claim that has not settled — the honest reading is
+  // that the turn is still going, which is what the trader sees.
+  return { kind: "running", note: null };
+}
+
+/** The session id a settled record names, so a decision can quote it back. */
+function sessionIdOf(state: RailState): string | null {
+  switch (state.kind) {
+    case "proposal":
+    case "completed":
+      return state.session.sessionId;
+    case "failed":
+      return state.session?.sessionId ?? null;
+    default:
+      return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fixed display constants (pinned by the spec, asserted by the tests)
 // ---------------------------------------------------------------------------
@@ -108,80 +269,171 @@ const TRADE_FIELDS = [
 export default function BacktestLabScreen() {
   const [catalog, setCatalog] = useState<CatalogState>({ kind: "loading" });
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [run, setRun] = useState<RunState>({ kind: "idle" });
-  /** Bumped on every selector change so a run whose result lands after the
-   * selection moved cannot attach itself to the newly selected version. */
-  const runToken = useRef(0);
+  /** Every active operation, held above the route (#141). The Lab READS it. */
+  const operations = useActiveOperations();
+
+  /**
+   * Read the catalog and project it into the selector's state.
+   *
+   * Extracted from the mount effect because an ACCEPT mints a child version that
+   * the once-fetched catalog cannot contain: selecting that child without
+   * refetching sets the selector to an id no option carries, which renders it
+   * blank, drops the rail and the result, and points Run at a version the trader
+   * cannot see.
+   *
+   * `alive` is the caller's — the mount effect passes its own cleanup flag so a
+   * response arriving after unmount sets no state.
+   */
+  const loadCatalog = useCallback(
+    async (alive: () => boolean = () => true): Promise<Set<string>> => {
+      try {
+        const result = await commands.libraryOverview();
+        if (!alive()) return new Set();
+        if (result.status === "ok") {
+          const options = catalogOptions(result.data);
+          setCatalog(options.length === 0 ? { kind: "empty" } : { kind: "ready", options });
+          return new Set(options.map((option) => option.value));
+        }
+        setCatalog({
+          kind: "error",
+          code: result.error.code,
+          message: result.error.message,
+        });
+      } catch {
+        // The IPC call itself failing (no app handle under a non-Tauri
+        // preview) — the honest error state, never fabricated options.
+        if (alive()) {
+          setCatalog({ kind: "error", code: "internal", message: "The library read failed." });
+        }
+      }
+      return new Set();
+    },
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
-    commands
-      .libraryOverview()
-      .then((result) => {
-        if (!alive) return;
-        if (result.status === "ok") {
-          const options = catalogOptions(result.data);
-          setCatalog(
-            options.length === 0 ? { kind: "empty" } : { kind: "ready", options },
-          );
-        } else {
-          setCatalog({
-            kind: "error",
-            code: result.error.code,
-            message: result.error.message,
-          });
-        }
-      })
-      .catch(() => {
-        // The IPC call itself failing (no app handle under a non-Tauri
-        // preview) — the honest error state, never fabricated options.
-        if (alive) {
-          setCatalog({ kind: "error", code: "internal", message: "The library read failed." });
-        }
-      });
+    void loadCatalog(() => alive);
     return () => {
       alive = false;
     };
-  }, []);
+  }, [loadCatalog]);
 
   const options = catalog.kind === "ready" ? catalog.options : [];
   const currentId = selectedId ?? options[0]?.value ?? null;
+  /** This version's operation, whoever started it and whenever. Keyed by version,
+   * so a result can never be attributed to a version it was not run for — the
+   * property the old bumped token approximated. */
+  const run = runStateOf(
+    currentId === null ? undefined : operations.lookup(backtestKey(currentId)),
+  );
 
-  /** Selecting a version clears any rendered result: a stale result must not
-   * appear attributable to the newly selected version. The selector is disabled
-   * while a run is in flight (see the `<select>` below): a mid-run change here
-   * would reset the state to `idle` and re-enable Run while the original,
-   * uncancellable request was still executing — a second click would launch an
-   * overlapping engine run whose persisted result the token check then drops. */
+  /** Selecting a version shows THAT version's operation. Nothing is cleared and
+   * nothing is cancelled: each version's record is its own, so a run still going
+   * for the previous selection stays going, and coming back to it shows it. The
+   * coach rail is per-run, so it closes with the selection. */
   function onSelectorChange(id: string) {
-    runToken.current += 1;
     setSelectedId(id);
-    setRun({ kind: "idle" });
+  }
+
+  /**
+   * Select the child an accept just minted — after refetching the catalog.
+   *
+   * The child did not exist when the catalog was read, so selecting it against the
+   * stale list sets the selector to an id no option carries: the select renders
+   * blank, this screen's projection finds no operation for it, and Run targets a
+   * version the trader cannot see. Refetch first, and only select what the fresh
+   * catalog actually contains.
+   */
+  async function onSelectChild(versionId: string) {
+    const known = await loadCatalog();
+    if (known.has(versionId)) {
+      setSelectedId(versionId);
+    }
   }
 
   /** The screen's ONLY invocation of the backtest command — the Run button's
-   * click handler. No mount effect reaches this. */
+   * click handler. No mount effect reaches this.
+   *
+   * The store refuses a key already in flight before the bus is called, and the
+   * backend's latch refuses it again if reached, so a double-click that beats
+   * this re-render still starts exactly one run. */
   function onRun() {
     if (currentId === null || run.kind === "running") return;
-    const token = ++runToken.current;
-    setRun({ kind: "running" });
-    commands
-      .runBacktestVersion({ versionId: currentId })
-      .then((result) => {
-        if (token !== runToken.current) return;
-        if (result.status === "ok") {
-          setRun({ kind: "done", dto: result.data });
-        } else {
-          setRun({ kind: "failed", error: result.error });
+    operations.start(backtestKey(currentId), () =>
+      commands.runBacktestVersion({ versionId: currentId }),
+    );
+  }
+
+  // --- the coach rail (r1.s4.w3) ------------------------------------------
+  //
+  // Keyed by the persisted RUN, not by the session: one run has one rail, and
+  // keying it this way is what lets a remount find the rail again — and read the
+  // session id back out of the record — without the screen persisting anything
+  // itself.
+  const runId = run.kind === "done" ? run.dto.runId : null;
+  const rail = railStateOf(runId === null ? undefined : operations.lookup(coachKey(runId)));
+
+  /**
+   * "Ask the coach": the DESKTOP mints the session id, once, here.
+   *
+   * A settled rail is cleared FIRST. Without that the guard below rejects every
+   * ask after the first outcome, which made the failure card's own recovery text
+   * unactionable — it told the trader to ask again on a rail that could not.
+   *
+   * Every SETTLED session gets a fresh id, not only an `interrupted` one. W1's
+   * claim semantics make a settled row terminal whatever settled it, so asking
+   * again under its id meets the recorded outcome instead of starting a turn — the
+   * previous id is reusable only while its claim is still PENDING, which is the
+   * reload case the backend resolves for itself.
+   */
+  function onAskCoach() {
+    if (runId === null || IN_FLIGHT_KINDS.has(rail.kind)) return;
+    // A busy rail is DEFERRING to another turn. Checking again has to reload THAT
+    // session — a fresh id would ask a new question and bill for it, which is the
+    // opposite of what the button offers. Every other settled state is terminal and
+    // takes a fresh id.
+    const sessionId =
+      rail.kind === "busy" && rail.contested !== null ? rail.contested : crypto.randomUUID();
+    if (rail.kind !== "idle") {
+      operations.clear(coachKey(runId));
+    }
+    operations.start(
+      coachKey(runId),
+      async () => {
+        const result = await commands.coachTurn({ runId, sessionId });
+        return result.status === "ok"
+          ? { status: "ok" as const, data: { kind: "turn" as const, session: result.data } }
+          : result;
+      },
+      "asking",
+    );
+  }
+
+  /** Modify, reject or accept — always quoting back the session id the record
+   * already holds, never a fresh one. */
+  function onDecide(action: CoachActionDto) {
+    const sessionId = sessionIdOf(rail);
+    if (runId === null || sessionId === null) return;
+    // The proposal as it stands, captured before the call: a REFUSED decision
+    // returns it unchanged rather than replacing the card with the refusal.
+    const current = rail.kind === "proposal" ? rail.session : null;
+    operations.start(
+      coachKey(runId),
+      async () => {
+        const result = await commands.coachDecide({ sessionId, action });
+        if (result.status === "error" && current !== null && result.error.code !== "busy") {
+          return {
+            status: "ok" as const,
+            data: { kind: "refused" as const, session: current, error: result.error },
+          };
         }
-      })
-      .catch(() => {
-        if (token !== runToken.current) return;
-        setRun({
-          kind: "failed",
-          error: { code: "internal", message: "The backtest run failed.", run_id: null },
-        });
-      });
+        return result.status === "ok"
+          ? { status: "ok" as const, data: { kind: "decision" as const, decision: result.data } }
+          : result;
+      },
+      action.kind,
+    );
   }
 
   return (
@@ -269,6 +521,16 @@ export default function BacktestLabScreen() {
         <div className="bt-result" key={run.dto.runId}>
           <ProvenanceBand dto={run.dto} />
           <KpiTiles dto={run.dto} />
+          {/* The coach rail sits directly beneath the run it coaches on, and is
+              hidden entirely until the trader asks — opt-in, never a pane that
+              appears with a result nobody requested. */}
+          <CoachRail
+            state={rail}
+            onAsk={onAskCoach}
+            onRun={onRun}
+            onDecide={onDecide}
+            onSelectChild={(id) => void onSelectChild(id)}
+          />
           <EquityChart
             points={run.dto.equity}
             startingEquity={run.dto.startingEquity}
@@ -684,5 +946,403 @@ function ChartTwins({ dto }: { dto: BacktestRunDto }) {
         </table>
       ))}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The coach rail (r1.s4.w3) — one proposal or one recorded failure, never both
+// ---------------------------------------------------------------------------
+//
+// Every number below is a DTO string, rendered as delivered. The rail computes no
+// money value, no percentage and no delta: the before/after comparison is two
+// columns of the backend's own strings side by side, and the reader does the
+// subtraction, because a number this screen invented would be a number nothing
+// persisted.
+//
+// The failure card's `recovery` is the DTO's own field. A `kind → text` mapping
+// here would be a second copy of a decision the backend already made, and the one
+// that a new failure variant silently slips past.
+
+/** The rail's whole surface. Hidden until the trader presses "Ask the coach". */
+function CoachRail({
+  state,
+  onAsk,
+  onRun,
+  onDecide,
+  onSelectChild,
+}: {
+  state: RailState;
+  onAsk: () => void;
+  onRun: () => void;
+  onDecide: (action: CoachActionDto) => void;
+  onSelectChild: (versionId: string) => void;
+}) {
+  if (state.kind === "idle") {
+    return (
+      <section className="bt-section coach-invite" aria-label="Coach">
+        <button type="button" className="coach-ask btn-prim" onClick={onAsk}>
+          Ask the coach
+        </button>
+        <span className="coach-invite-note">
+          One change at a time, on this run's own recorded results.
+        </span>
+      </section>
+    );
+  }
+
+  return (
+    <section className="bt-section coach-rail" aria-label="Coach rail">
+      <h3 className="bt-h">Coach</h3>
+      <CoachBody
+        state={state}
+        onAsk={onAsk}
+        onRun={onRun}
+        onDecide={onDecide}
+        onSelectChild={onSelectChild}
+      />
+      <CoachProvenance state={state} />
+    </section>
+  );
+}
+
+/** The in-flight lines, one per state, each naming what is actually happening. */
+const IN_FLIGHT: Record<string, string> = {
+  running: "Asking the coach…",
+  modifying: "Re-validating your change…",
+  rejecting: "Recording the rejection…",
+  accepting: "Re-backtesting the accepted child…",
+};
+
+function CoachBody({
+  state,
+  onAsk,
+  onRun,
+  onDecide,
+  onSelectChild,
+}: {
+  state: RailState;
+  onAsk: () => void;
+  onRun: () => void;
+  onDecide: (action: CoachActionDto) => void;
+  onSelectChild: (versionId: string) => void;
+}) {
+  if (
+    state.kind === "running" ||
+    state.kind === "modifying" ||
+    state.kind === "rejecting" ||
+    state.kind === "accepting"
+  ) {
+    return (
+      <div className="coach-state dim" role="status">
+        {IN_FLIGHT[state.kind]}
+        {state.kind === "running" && state.note !== null && (
+          <p className="coach-busy">{state.note}</p>
+        )}
+      </div>
+    );
+  }
+  // A `busy` refusal is not a failure — nothing broke, and the answer is coming
+  // from whoever holds the key. It is not `running` either: THIS record has
+  // settled, so nothing further will arrive to move it along, and the retry is
+  // how the trader picks the result up.
+  if (state.kind === "busy") {
+    return (
+      <div className="coach-state dim" role="status">
+        {IN_FLIGHT.running}
+        <p className="coach-busy">{state.note}</p>
+        <button type="button" className="coach-retry btn-sec" onClick={onAsk}>
+          Check again
+        </button>
+      </div>
+    );
+  }
+  if (state.kind === "failed") {
+    return (
+      <FailureCard session={state.session} error={state.error} onAsk={onAsk} onRun={onRun} />
+    );
+  }
+  if (state.kind === "proposal") {
+    return (
+      <ProposalCard session={state.session} refusal={state.refusal} onDecide={onDecide} />
+    );
+  }
+  if (state.kind === "completed") {
+    return (
+      <AcceptedPanel
+        session={state.session}
+        accepted={state.accepted}
+        onSelectChild={onSelectChild}
+      />
+    );
+  }
+  // `idle` is handled by the invitation above and never reaches the body. Stated
+  // as a branch rather than a fall-through so the union stays exhaustive for the
+  // compiler too — a ninth state would fail to typecheck here.
+  return null;
+}
+
+/**
+ * One recorded failure: the typed kind, its detail, and the BACKEND's recovery.
+ *
+ * Every failure card carries a recovery AND the action that performs it. A typed
+ * coach failure names its own; an operational error has none to name, so the
+ * generic one is stated rather than left blank — a failure card with no way
+ * forward is a dead end, and the recovery text was previously advice the rail
+ * could not act on.
+ */
+function FailureCard({
+  session,
+  error,
+  onAsk,
+  onRun,
+}: {
+  session: CoachSessionDto | null;
+  error: BusError | null;
+  onAsk: () => void;
+  onRun: () => void;
+}) {
+  const failure = session?.failure ?? null;
+  const recovery = failure?.recovery ?? "try again";
+  // `missing_backtest_inputs` is the one failure asking the coach again cannot
+  // recover from. The parent run is immutable, so it can never acquire the
+  // provenance it lacks, and every re-ask against it records the identical failure
+  // for ever. Its recovery says to run the version again, so THAT is the button it
+  // gets — an action that performs the stated recovery rather than one that
+  // contradicts it.
+  const rerun = failure?.kind === "missing_backtest_inputs";
+  return (
+    <div className="coach-failure" role="alert">
+      <p className="coach-failure-kind mono">{failure?.kind ?? error?.code ?? "internal"}</p>
+      <p className="coach-failure-detail">{failure?.detail ?? error?.message ?? ""}</p>
+      <p className="coach-recovery">
+        <span className="coach-recovery-label">What to do</span> {recovery}
+      </p>
+      {rerun ? (
+        <button type="button" className="coach-retry btn-prim" onClick={onRun}>
+          Run this version again
+        </button>
+      ) : (
+        <button type="button" className="coach-retry btn-prim" onClick={onAsk}>
+          Ask the coach again
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** The one proposed change, its hypothesis, and the three actions. */
+function ProposalCard({
+  session,
+  refusal,
+  onDecide,
+}: {
+  session: CoachSessionDto;
+  refusal: BusError | null;
+  onDecide: (action: CoachActionDto) => void;
+}) {
+  const proposal = session.proposal;
+  const [draft, setDraft] = useState<string | null>(null);
+
+  if (proposal === null) {
+    return null;
+  }
+  const settled = proposal.disposition === "rejected" || proposal.disposition === "accepted";
+
+  return (
+    <div className="coach-proposal">
+      <div className="coach-change">
+        <span className="coach-change-path mono">{proposal.mutation.path}</span>
+        <span className="coach-change-arrow">→</span>
+        <span className="coach-change-value mono">{proposal.mutation.newValue}</span>
+      </div>
+      <p className="coach-hypothesis">{proposal.hypothesis}</p>
+      {/* A refused decision, shown ON the card rather than in place of it: the
+          backend rejected the edit, not the turn, so the proposal is still here
+          to correct and act on. */}
+      {refusal !== null && (
+        <p className="coach-refusal" role="alert">
+          <span className="mono">{refusal.code}</span> {refusal.message}
+        </p>
+      )}
+      <p className="coach-disposition">
+        <span className="coach-disposition-label">Status</span>{" "}
+        <span className="mono">{proposal.disposition}</span>
+      </p>
+      {proposal.acceptFailure !== null && (
+        <p className="coach-accept-failure" role="alert">
+          The last accept stopped at{" "}
+          <span className="mono">{proposal.acceptFailure.stage}</span>:{" "}
+          {proposal.acceptFailure.message}
+          {proposal.acceptFailure.subject !== null && (
+            <>
+              {" "}
+              (<span className="mono">{proposal.acceptFailure.subject}</span>)
+            </>
+          )}
+        </p>
+      )}
+      {!settled && draft === null && (
+        <div className="coach-actions">
+          <button
+            type="button"
+            className="coach-modify"
+            onClick={() => setDraft(proposal.mutation.newValue)}
+          >
+            Modify
+          </button>
+          <button
+            type="button"
+            className="coach-reject"
+            onClick={() => onDecide({ kind: "reject" })}
+          >
+            Reject
+          </button>
+          <button
+            type="button"
+            className="coach-accept btn-prim"
+            onClick={() => onDecide({ kind: "accept" })}
+          >
+            Accept
+          </button>
+        </div>
+      )}
+      {!settled && draft !== null && (
+        <div className="coach-edit">
+          <label className="coach-edit-label" htmlFor="coach-new-value">
+            New value
+          </label>
+          <input
+            id="coach-new-value"
+            className="coach-edit-input mono"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button
+            type="button"
+            className="coach-revalidate btn-prim"
+            onClick={() => {
+              onDecide({
+                kind: "modify",
+                path: proposal.mutation.path,
+                newValue: draft,
+              });
+              setDraft(null);
+            }}
+          >
+            Re-validate
+          </button>
+          <button type="button" className="coach-cancel-edit" onClick={() => setDraft(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The `SummaryDto` rows the before/after table compares, in one fixed order. */
+const SUMMARY_ROWS: { key: keyof SummaryDto; label: string }[] = [
+  { key: "expectancy", label: "Expectancy" },
+  { key: "netPnl", label: "Net P&L" },
+  { key: "winRate", label: "Win rate" },
+  { key: "tradeCount", label: "Trades" },
+  { key: "winCount", label: "Wins" },
+  { key: "lossCount", label: "Losses" },
+  { key: "profitFactor", label: "Profit factor" },
+  { key: "grossProfit", label: "Gross profit" },
+  { key: "grossLoss", label: "Gross loss" },
+  { key: "avgWin", label: "Avg win" },
+  { key: "avgLoss", label: "Avg loss" },
+  { key: "maxDrawdown", label: "Max drawdown" },
+  { key: "maxWinStreak", label: "Max win streak" },
+  { key: "maxLossStreak", label: "Max loss streak" },
+  { key: "commissionTotal", label: "Fees" },
+  { key: "fundingTotal", label: "Funding" },
+  { key: "sharpe", label: "Sharpe" },
+  { key: "sortino", label: "Sortino" },
+];
+
+/** One summary cell, exactly as delivered — `null` is an em dash, never a zero. */
+function cell(summary: SummaryDto, key: keyof SummaryDto) {
+  const value = summary[key];
+  return value === null ? EM_DASH : String(value);
+}
+
+/** The committed accept: the child beside its parent, and both links. */
+function AcceptedPanel({
+  session,
+  accepted,
+  onSelectChild,
+}: {
+  session: CoachSessionDto;
+  accepted: AcceptedCoachDto;
+  onSelectChild: (versionId: string) => void;
+}) {
+  const unreadable = accepted.readBack !== "ok" ? accepted.readBack.failure : null;
+  return (
+    <div className="coach-accepted">
+      <p className="coach-accepted-line">
+        Accepted — one coach-attributed child version and one re-backtest.
+      </p>
+      <div className="coach-links">
+        <a className="coach-link" href="#/library">
+          Child version <span className="mono">{accepted.childVersionId}</span>
+        </a>
+        <button
+          type="button"
+          className="coach-link-run"
+          onClick={() => onSelectChild(accepted.childVersionId)}
+        >
+          Select the child in the Lab — child run{" "}
+          <span className="mono">{accepted.acceptedRunId}</span>
+        </button>
+      </div>
+      {unreadable !== null && (
+        <p className="coach-unreadable" role="note">
+          The child run was saved but could not be read back, so there is no “after”
+          column to show: {unreadable}
+        </p>
+      )}
+      {accepted.after !== null && (
+        <table className="coach-compare" aria-label="Before and after">
+          <thead>
+            <tr>
+              <th scope="col">metric</th>
+              <th scope="col">before (parent)</th>
+              <th scope="col">after (child)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {SUMMARY_ROWS.map((row) => (
+              <tr key={row.key}>
+                <th scope="row">{row.label}</th>
+                <td className="mono">{cell(accepted.before, row.key)}</td>
+                <td className="mono">{cell(accepted.after as SummaryDto, row.key)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <p className="coach-session-line mono">session {session.sessionId}</p>
+    </div>
+  );
+}
+
+/** Cost, currency and prompt version — visible with every outcome that had a call. */
+function CoachProvenance({ state }: { state: RailState }) {
+  const session =
+    state.kind === "proposal" || state.kind === "completed"
+      ? state.session
+      : state.kind === "failed"
+        ? state.session
+        : null;
+  if (session === null || session.llmCallId === null) {
+    return null;
+  }
+  return (
+    <p className="coach-provenance mono">
+      cost {session.cost === null ? EM_DASH : `${session.cost.amount} ${session.cost.currency}`} ·
+      prompt {session.promptVersion ?? EM_DASH} · call {session.llmCallId}
+    </p>
   );
 }

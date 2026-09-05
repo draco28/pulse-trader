@@ -40,7 +40,7 @@
 // the crate-wide pedantic posture is untouched everywhere else.
 #![allow(clippy::needless_pass_by_value, clippy::used_underscore_binding)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,10 @@ use crate::domain::strategy::VersionId;
 use crate::domain::{Pair, Timeframe};
 
 use super::backtest::{BacktestRunDto, BacktestRunRequest, backtest_run_dto};
+use super::coach::{
+    CoachDecisionDto, CoachDecisionRequestDto, CoachSessionDto, CoachTurnDeps, CoachTurnRequestDto,
+    coach_decide_core, coach_turn_core,
+};
 use super::error::{BusError, BusErrorCode};
 use super::events::{BusEvent, BusEventPayload, EventSink, RunId};
 use super::library::{
@@ -69,11 +73,16 @@ use crate::adapters::db::{
     open_migrated,
 };
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::Redactor;
 use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
 use crate::agent::ComposerEvent;
-use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
+use crate::agent::config::{
+    load_coach_prompt_from, load_composer_prompt, load_llm_transport, load_price_table,
+    prompt_override_dir,
+};
+use crate::application::coach::CoachTurnRegistry;
 use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
+use crate::domain::CoachingSessionId;
+use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, Strategy, StrategyVersion};
 use crate::domain::{
     BacktestRunRepository, Clock, Comparator, Condition, CredentialStatus, DataError, Direction,
@@ -112,6 +121,8 @@ pub const BUS_COMMANDS: &[&str] = &[
     "compose_strategy",
     "compose_cancel",
     "run_backtest_version",
+    "coach_turn",
+    "coach_decide",
 ];
 
 // ---------------------------------------------------------------------------
@@ -145,6 +156,70 @@ pub struct DesktopState {
     /// A `std::sync::Mutex`, deliberately never held across an `.await`: every accessor
     /// below locks, performs one map operation, and drops the guard before it returns.
     compose_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The process-local coach-turn single-flight registry (r1.s4.w1), ONE per
+    /// process.
+    ///
+    /// It lives here for the reason `compose_runs` does: it must outlive the command
+    /// that created it. A registry minted per turn is not wrong, it is blind — it can
+    /// never say "in flight", and telling a LIVE claim from one an earlier process
+    /// abandoned is the whole reason it exists.
+    coach_registry: CoachTurnRegistry,
+    /// Every operation currently running, by key (r1.s4.w3, `#141`).
+    ///
+    /// The single-flight latch behind "navigating away and back reattaches the same
+    /// operation, and a second overlapping invocation is refused". The UI refuses an
+    /// overlap before the bus is called; this is what refuses it if reached — from a
+    /// second window, a double-click that beats a re-render, or a screen whose state
+    /// was rebuilt by a remount.
+    ///
+    /// A `std::sync::Mutex` around a plain set, never held across an `.await`:
+    /// [`DesktopState::begin_operation`] locks, performs one set operation and drops
+    /// the guard before returning the RAII guard that releases the key.
+    operations: Mutex<HashSet<OperationKey>>,
+}
+
+/// What the `#141` latch is keyed on: one running operation per version, and one
+/// per coaching session.
+///
+/// A typed key rather than a formatted string, so a version id and a session id
+/// that happen to share text cannot collide, and so the exhaustive `match` in
+/// [`OperationKey::describe`] names every kind rather than defaulting one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OperationKey {
+    /// A backtest of one strategy version.
+    Backtest(VersionId),
+    /// A coach turn or decision for one coaching session.
+    Coach(CoachingSessionId),
+}
+
+impl OperationKey {
+    /// How the refusal names this key — the text the rail shows.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Backtest(version) => format!("a backtest of version `{}`", version.as_str()),
+            Self::Coach(session) => format!("a coach operation for session `{}`", session.as_str()),
+        }
+    }
+}
+
+/// One held operation key, released on drop.
+///
+/// RAII rather than a manual release at each return, because "every exit path"
+/// includes the ones nobody writes: a `?`, an unwinding panic, and the future being
+/// dropped when the webview navigates away mid-call. A guard releases on all three.
+///
+/// Dropping it releases the KEY, never the work: a durable result already written
+/// by the operation stays written, because this guard owns no result.
+pub struct OperationGuard<'a> {
+    state: &'a DesktopState,
+    key: OperationKey,
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        self.state.held_operations().remove(&self.key);
+    }
 }
 
 impl DesktopState {
@@ -177,6 +252,8 @@ impl DesktopState {
             db,
             candles,
             compose_runs: Mutex::new(HashMap::new()),
+            coach_registry: CoachTurnRegistry::new(),
+            operations: Mutex::new(HashSet::new()),
         })
     }
 
@@ -194,6 +271,61 @@ impl DesktopState {
     #[must_use]
     pub fn candles(&self) -> CandleStore {
         self.candles.clone()
+    }
+
+    /// The process-local coach-turn registry (r1.s4.w1) every turn claims through.
+    #[must_use]
+    pub fn coach_registry(&self) -> &CoachTurnRegistry {
+        &self.coach_registry
+    }
+
+    /// The held-operation set, with a poisoned lock RECOVERED rather than
+    /// propagated (`CoachTurnRegistry::lock`'s discipline).
+    ///
+    /// A panicking operation must not make every LATER operation unrunnable: the
+    /// guard's `Drop` runs during that same unwind, and a poisoned lock there would
+    /// leave the key held forever — the latch would have turned one fault into a
+    /// permanently jammed screen.
+    fn held_operations(&self) -> std::sync::MutexGuard<'_, HashSet<OperationKey>> {
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take single-flight ownership of `key`, or refuse with
+    /// [`BusErrorCode::Busy`] when this process is already running it (`#141`).
+    ///
+    /// The returned guard releases the key on EVERY exit path — return, `?`,
+    /// panic-unwind, and the future being dropped by a navigation — because it
+    /// releases in `Drop` rather than at a call site someone can forget. It releases
+    /// the KEY and nothing else: a durable result the operation already wrote stays
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BusError`] with [`BusErrorCode::Busy`], naming the key, when the
+    /// operation is already in flight.
+    pub fn begin_operation(&self, key: OperationKey) -> Result<OperationGuard<'_>, BusError> {
+        if !self.held_operations().insert(key.clone()) {
+            return Err(BusError::new(
+                BusErrorCode::Busy,
+                format!(
+                    "{} is already running; its result will appear here when it finishes",
+                    key.describe()
+                ),
+            ));
+        }
+        Ok(OperationGuard { state: self, key })
+    }
+
+    /// Is `key`'s operation running in this process right now?
+    ///
+    /// Exists so "the latch was released" is an assertion rather than a claim —
+    /// including on the paths (a `BusError`, an unwinding panic) where the release
+    /// is the guard's `Drop` and nothing else observable happens.
+    #[must_use]
+    pub fn operation_in_flight(&self, key: &OperationKey) -> bool {
+        self.held_operations().contains(key)
     }
 
     /// A strategy repository over the shared pool.
@@ -1204,6 +1336,12 @@ pub async fn compose_cancel(
 /// path: cancelling between the commit and the read-back would produce exactly the
 /// ambiguous half-state this item exists to eliminate.
 ///
+/// **Single-flight (r1.s4.w3, `#141`).** The whole call is held under the
+/// operation latch keyed on the version, released through an RAII guard on every
+/// exit path. A second invocation for the SAME version while one is in flight is
+/// refused with [`BusErrorCode::Busy`] and starts no second engine run — the case
+/// that used to persist two runs when a remount re-enabled the Run button.
+///
 /// # Errors
 ///
 /// Returns a [`BusError`]. When the run was saved but could not be read back, its
@@ -1212,6 +1350,8 @@ pub async fn run_backtest_version_core(
     state: &DesktopState,
     request: BacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
+    let _operation =
+        state.begin_operation(OperationKey::Backtest(VersionId::new(&request.version_id)))?;
     let strategies = state.strategy_repo();
     let runs = state.backtest_run_repo();
     let candles = state.candles();
@@ -1247,6 +1387,90 @@ pub async fn run_backtest_version(
     request: BacktestRunRequest,
 ) -> Result<BacktestRunDto, BusError> {
     run_backtest_version_core(&state, request).await
+}
+
+/// `coach_turn` — start or reload one coach turn for a persisted run (r1.s4.w3).
+///
+/// This wrapper is where the credential lives, exactly as [`compose_strategy`]'s
+/// is: the config overlays load, the key resolves, the redactor and the provider
+/// are built from it, and the core receives everything EXCEPT the key. It therefore
+/// appears in no argument, no return value, no event, no error and no DTO, because
+/// it never leaves this function (ADR-0016).
+///
+/// The prompt and its version resolve together from the same bytes (audit C2), so
+/// the ledger row's `prompt_version` is a true answer to "which prompt produced
+/// this?" — including when an operator's `$PULSE_PROMPT_DIR/coach.md` overlay won.
+///
+/// **The transport makes ONE attempt per turn** ([`OpenAiCompatProvider::single_attempt`]),
+/// matching `pulse coach`: a turn records one exchange and names one ledger row, and
+/// the retrying default would put three upstream attempts and their cost behind that
+/// one record.
+///
+/// # Errors
+///
+/// Returns a [`BusError`] on a config-load failure, an unresolvable credential, a
+/// live duplicate (`busy`), an absent run, or an unrecordable turn. A provider
+/// TRANSPORT fault is not an error — it comes back as a recorded failed session.
+#[tauri::command]
+#[specta::specta]
+pub async fn coach_turn(
+    state: tauri::State<'_, DesktopState>,
+    request: CoachTurnRequestDto,
+) -> Result<CoachSessionDto, BusError> {
+    let transport =
+        load_llm_transport().map_err(|e| BusError::internal(format!("load llm transport: {e}")))?;
+    let prices =
+        load_price_table().map_err(|e| BusError::internal(format!("load price table: {e}")))?;
+    // The operator's overlay is honoured here for the same reason `pulse coach`
+    // honours it: an overlay edit must change what the coach says AND what the
+    // ledger records.
+    let prompt = load_coach_prompt_from(prompt_override_dir().as_deref())
+        .map_err(|e| BusError::internal(format!("load coach prompt: {e}")))?;
+
+    // The credential resolves inside the ring and is consumed by exactly two
+    // things — the redactor (so the persisted copy is scrubbed) and the provider
+    // constructor — then dropped with this frame.
+    let key = resolve_llm_api_key().map_err(BusError::from)?;
+    let key_source = key.source();
+    let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
+    let provider = match transport.base_url.as_deref() {
+        Some(base_url) => OpenAiCompatProvider::single_attempt_with_base_url(
+            key.expose().to_owned(),
+            base_url.to_owned(),
+        ),
+        None => OpenAiCompatProvider::single_attempt(key.expose().to_owned()),
+    };
+
+    let deps = CoachTurnDeps {
+        provider,
+        prices,
+        redactor,
+        key_source: Some(key_source),
+        config: compose_config(transport.model.as_deref()),
+        prompt: prompt.text,
+        prompt_version: Some(prompt.version),
+        turn_timeout: None,
+        max_dsl_bytes: None,
+    };
+    coach_turn_core(&state, deps, request).await
+}
+
+/// `coach_decide` — modify, reject or accept one recorded proposal (r1.s4.w3).
+///
+/// No credential, no provider and no config overlay: an accept re-runs the parent
+/// run's exact persisted inputs through the real engine and asks the coach nothing,
+/// so this wrapper is a thin adapter over the core and nothing else.
+///
+/// # Errors
+///
+/// Returns a [`BusError`]; see [`coach_decide_core`].
+#[tauri::command]
+#[specta::specta]
+pub async fn coach_decide(
+    state: tauri::State<'_, DesktopState>,
+    request: CoachDecisionRequestDto,
+) -> Result<CoachDecisionDto, BusError> {
+    coach_decide_core(&state, request).await
 }
 
 #[cfg(test)]

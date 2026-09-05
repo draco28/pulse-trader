@@ -23,6 +23,10 @@ mod error;
 // `PULSE_TARGET_TRIPLE`) plus the FR-7 `compare()` warning mechanism (built but
 // unwired this slice — VS-1.2.4 surfaces it).
 mod fingerprint;
+// r1.s4.w4: the `IdSource` port — "a fresh opaque row id" as an injected
+// dependency, so the coach accept's transaction-minted child/run ids are
+// deterministic under test the way `Clock` made `created_at` deterministic.
+mod ids;
 // VS-1.2.2 work-2.01: the dedicated exchange-port error taxonomy (audit C5).
 mod exchange;
 mod indicator;
@@ -49,6 +53,12 @@ pub(crate) mod strategy;
 // (`adapters::llm::redacting_logging`), so the persisted copy is never weaker than
 // the compose-time scrub. Pure string logic, zero-I/O — a domain-kernel utility.
 mod secret;
+// r1.s4.w2 (#150, ADR-0012 / ADR-0015 / ADR-0016): the PURE text-redaction kernel.
+// `pub(crate)` so `adapters::llm`'s decorator can reach the placeholder constant and
+// the two message-level helpers; `Redactor` itself is re-exported below. Moving it
+// inward is what returns the application ring to ADR-0015's ONE deliberate adapters
+// import. Provider concerns and credential HANDLING did not move.
+pub(crate) mod redaction;
 mod timeframe;
 mod version;
 
@@ -102,10 +112,16 @@ pub use dsl::{
 // r1.s2.w2 (ADR-0021): the coaching session domain. Re-exported so `lib.rs` can
 // curate the crate surface — an un-re-exported public domain type is a `dead_code`
 // BUILD error under `deny(warnings)`.
+// r1.s4.w4 adds the lifecycle half: the pre-call claim, the settling move, and the
+// accept outcome pair.
 pub use coaching::{
-    CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
-    DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
+    AcceptFailureStage, AcceptedCoachOutcome, CoachAcceptFailure, CoachContext, CoachFailure,
+    CoachRequestFingerprint, CoachSessionClaim, CoachSessionClaimResult, CoachTurnProjection,
+    CoachingError, CoachingSession, CoachingSessionId, Disposition, DispositionKind, Hypothesis,
+    InitialCoachOutcome, MfeMaeAggregates, PreparedBacktest, PreparedCoachAcceptance, ProjectedRun,
+    Proposal, SessionOutcome,
 };
+pub use ids::IdSource;
 // VS-1.1.2 work-2.04: the compiler → executable evaluator tree (FR-3). `compile`
 // turns a `ValidatedDsl` into a `CompiledStrategy` the backtester walks; the
 // `Compiled*` types + `EvalContext` seam + pure exit-geometry helpers are its
@@ -125,9 +141,14 @@ pub use pair::Pair;
 // via the `pub(crate) mod strategy` path directly (matching the
 // `adapters::binance::` precedent), so they are NOT re-listed here.
 pub use port::{
-    BacktestRunRepository, CandleSeriesRepository, CoachingRepository, ExchangeAdapter,
-    LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
+    BacktestRunRepository, CandleSeriesRepository, CoachAcceptanceRepository, CoachingRepository,
+    ExchangeAdapter, LlmCallRepository, LlmProvider, MarketDataSource, StrategyRepository,
 };
+// r1.s4.w1 (ADR-0015, one home for ports): the sealed coach turn's two ports. They
+// live in `port` like every other port and are re-exported `pub(crate)` rather than
+// `pub` because the use case they serve is crate-internal — the composition root
+// picks the implementations, and no consumer outside this crate names them.
+pub(crate) use port::{AttributedCoachProvider, CoachTurnSource};
 // VS-1.3.2 slice-close FIX C: the shared secret-token heuristic. `pub(crate)` (an
 // internal cross-ring utility, not a public API surface) — used by the composer
 // (agent ring) + the redacting-logging decorator (adapters ring), so it is never
@@ -156,7 +177,15 @@ pub use llm::{
 // re-export additions merge cleanly. Re-exported here so `lib.rs` can curate the
 // crate surface — an un-re-exported public domain type is a `dead_code` BUILD error.
 pub use llm::ToolDefinition;
+// r1.s4.w2 (#150): the scoped, config-driven secret scrubber, now a domain kernel.
+// Re-exported here so `lib.rs` can keep the SAME `pulse::Redactor` surface every
+// composition root and test binary already names — the move is an address change,
+// not an API change.
 pub use llm_call::{LlmCall, LlmCallId};
+pub use redaction::Redactor;
+// r1.s4.w1: the attributed-call pair the sealed coach turn's provider port
+// returns. `pub(crate)`: a crate-internal use case's vocabulary (ADR-0015).
+pub(crate) use llm_call::{AttributedCall, AttributedCallError};
 // VS-1.2.2 work-2.01: the shared sizer surface (FR-5 / NFR-3, BACKLOG-5).
 // `compute_position_size` is the single exchange-constrained sizing entry; the
 // `SymbolFilters` value type + its `unconstrained()` ctor, and the

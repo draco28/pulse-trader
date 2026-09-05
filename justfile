@@ -14,7 +14,7 @@
 # the Rust targets means clippy and the tests compile against the REAL bundle
 # rather than build.rs's placeholder.
 
-# The aggregate gate: frontend + Rust + the nine content check scripts.
+# The aggregate gate: frontend + Rust + the ten content check scripts.
 check: ui fmt clippy test gates
 
 # --- frontend ---------------------------------------------------------------
@@ -55,9 +55,9 @@ clippy:
 test:
     cargo nextest run
 
-# --- content gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2, r1.s2.w1) --
+# --- content gates (r1.s1.w1, r1.s1.w5, r1.s1.w6, r1.s5.w1, r1.s5.w2, r1.s2.w1, r1.s4.w1) --
 
-# The nine content gates. Each asserts a property that review
+# The ten content gates. Each asserts a property that review
 # cannot be trusted to hold: ADR-0020's decision is recorded and the ADR-0001 /
 # ADR-0019 class sweep landed; no fs/shell/http capability is reachable from the
 # frontend; the window stays 1440x900 non-resizable with no scale-transform; the
@@ -70,12 +70,16 @@ test:
 # (r1.s5.w1, AC-2); and the specta/tauri-specta generator workaround
 # (`post_process_bindings`, a post-write transform of `bindings.ts`, or a
 # re-pin to the pre-bump rc.21/rc.22 versions) has not come back (r1.s5, d5);
+# and the coach boundary holds (r1.s4.w1, AC-2): no public `Coach::new`/`run_turn`,
+# no production `save_session` caller, and `record_inapplicable` advertised only
+# alongside `propose_mutation` -- the #132 seal and the #131 honesty protocol, both
+# of which are source properties that decay silently unless something asserts them;
 # and ADR-0021 records the coach decisions r1.s2's work items implement against,
 # now `Accepted` (authored `Proposed` at r1.s2.w1 per AC-1, flipped at r1.s2's
 # close on 2026-08-29 with check-adr-0021.sh's Status assertion updated in the SAME
 # act -- the check-adr-0020.sh precedent). Only that close may flip it.
 
-# Run the nine content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround, ADR-0021).
+# Run the ten content gates (ADR-0020, capabilities, window, bindings, design system, shell navigation, ADR-0022, no-specta-workaround, ADR-0021, coach boundary).
 gates:
     bash scripts/check-adr-0020.sh
     bash scripts/check-capabilities.sh
@@ -86,6 +90,7 @@ gates:
     bash scripts/check-adr-0022.sh
     bash scripts/check-adr-0021.sh
     bash scripts/check-no-specta-workaround.sh
+    bash scripts/check-coach-boundary.sh
 
 # VS-1.1.4 work-1.01 — regenerate the committed .sqlx offline query cache
 # (NFR-12). Needs sqlx-cli (a developer-local tool, NOT installed in this slice's
