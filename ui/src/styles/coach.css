@@ -1,0 +1,297 @@
+/* ============================================================
+   PulseTrader — coach.css
+   The coach rail's screen sheet (r1.s4.w3), scoped to `.coach-rail` and
+   `.coach-invite` and reaching nothing else.
+
+   NOT a port of any mock sheet — `check-design-system.sh` forbids porting a
+   per-screen stylesheet, so every rule here is authored against `tokens.css`'s
+   custom properties. It introduces NO colour of its own: the rail borrows the
+   `--ai-*` accent, which `tokens.css` reserves for agent actions, precisely so
+   the one part of the Lab an LLM authored reads as such without a second
+   palette to keep in sync.
+
+   Interaction floors: every control is at least 24px in its interactive
+   dimension, matching `backtest.css`'s own floors, and the one motion this
+   sheet has is disabled under `prefers-reduced-motion`.
+   ============================================================ */
+
+/* ---- the invitation (the rail before it is opened) ---- */
+
+.coach-invite {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.coach-ask {
+  min-height: 28px;
+  padding: var(--sp-1) var(--sp-4);
+  border-radius: var(--r-6);
+}
+
+.coach-invite-note {
+  color: var(--text-3);
+  font-size: var(--fs-12);
+  line-height: var(--lh-normal);
+}
+
+/* ---- the rail itself ---- */
+
+.coach-rail {
+  border: 1px solid var(--ai-line);
+  background: var(--ai-bg);
+  border-radius: var(--r-8);
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.coach-state {
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  min-height: 24px;
+}
+
+/* A `busy` refusal is a STATE, not a failure — quiet, never alarming. */
+.coach-busy {
+  margin: var(--sp-1) 0 0;
+  color: var(--text-3);
+  font-size: var(--fs-12);
+}
+
+/* ---- the one proposed change ---- */
+
+.coach-change {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-raised);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-6);
+  min-height: 24px;
+}
+
+.coach-change-path {
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
+
+.coach-change-arrow {
+  color: var(--text-3);
+}
+
+.coach-change-value {
+  color: var(--ai-1);
+  font-size: var(--fs-15);
+  font-weight: var(--fw-semibold);
+}
+
+.coach-hypothesis {
+  margin: 0;
+  color: var(--text-1);
+  font-size: var(--fs-14);
+  line-height: var(--lh-normal);
+}
+
+.coach-disposition,
+.coach-session-line,
+.coach-provenance {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+}
+
+.coach-disposition-label,
+.coach-recovery-label {
+  color: var(--text-4);
+  text-transform: uppercase;
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+}
+
+/* ---- actions ---- */
+
+.coach-actions,
+.coach-edit,
+.coach-links {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.coach-actions button,
+.coach-edit button {
+  min-height: 24px;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-4);
+  font-size: var(--fs-13);
+}
+
+.coach-edit-label {
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
+
+.coach-edit-input {
+  min-height: 24px;
+  min-width: 96px;
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--bg-input);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  color: var(--text-1);
+}
+
+.coach-edit-input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* ---- the recorded failure ---- */
+
+.coach-failure {
+  border: 1px solid var(--warn-line);
+  background: var(--warn-bg);
+  border-radius: var(--r-6);
+  padding: var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.coach-failure-kind {
+  margin: 0;
+  color: var(--warn-1);
+  font-size: var(--fs-12);
+}
+
+.coach-failure-detail {
+  margin: 0;
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  line-height: var(--lh-normal);
+}
+
+.coach-recovery {
+  margin: 0;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+}
+
+.coach-accept-failure {
+  margin: 0;
+  color: var(--warn-1);
+  font-size: var(--fs-12);
+  line-height: var(--lh-normal);
+}
+
+/* ---- the accepted child, beside its parent ---- */
+
+.coach-accepted {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.coach-accepted-line {
+  margin: 0;
+  color: var(--text-1);
+  font-size: var(--fs-14);
+  font-weight: var(--fw-medium);
+}
+
+.coach-link,
+.coach-link-run {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+
+/* The child-run affordance is a BUTTON, not an anchor: its destination is this
+   screen's own selector, not a route, and a link that navigates nowhere is a lie
+   to anyone reading the status bar or opening it in a new context. */
+.coach-link-run {
+  padding: var(--sp-1) var(--sp-3);
+  background: var(--bg-raised);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-4);
+  cursor: pointer;
+}
+
+.coach-link-run:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.coach-link {
+  color: var(--ai-1);
+  text-decoration: none;
+  border-bottom: 1px solid var(--ai-line);
+}
+
+.coach-link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.coach-unreadable {
+  margin: 0;
+  color: var(--warn-1);
+  font-size: var(--fs-13);
+  line-height: var(--lh-normal);
+}
+
+.coach-compare {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-13);
+}
+
+.coach-compare th,
+.coach-compare td {
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid var(--line-1);
+  text-align: right;
+  min-height: 24px;
+}
+
+.coach-compare th[scope="row"] {
+  text-align: left;
+  color: var(--text-2);
+  font-weight: var(--fw-regular);
+}
+
+.coach-compare thead th {
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+/* The child column is the one the eye should land on — weight, not a second
+   hue, because "better" is the reader's judgement and not this sheet's. */
+.coach-compare tbody td:last-child {
+  color: var(--text-1);
+  font-weight: var(--fw-medium);
+}
+
+/* ---- motion ---- */
+
+.coach-rail {
+  transition: border-color 120ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .coach-rail {
+    transition: none;
+  }
+}

@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
 import { CredentialBanner } from "./components/CredentialBanner";
+import { ActiveOperationsProvider } from "./hooks/useActiveOperations";
 import { NAV_ALL, Sidebar, WindowChrome } from "./shell/AppShell";
 import { resolveNavId, resolveRoute } from "./routes";
 import type { Route } from "./routes";
@@ -56,16 +57,24 @@ export function App() {
   // content in (see `LibraryScreen.tsx`).
   const showDetailsPane = route?.details === true;
 
+  // r1.s4.w3 (#141): active operations are held ABOVE `RouteContent`, which is
+  // the line a navigation re-mounts across. A backtest or a coach turn started in
+  // the Lab therefore survives a trip to the Library and is still there — running
+  // or settled — when the trader comes back, and the screen re-invokes nothing to
+  // find that out. Mounting this inside a screen would put it back under the
+  // remount it exists to survive.
   return (
-    <WindowChrome docTitle={title}>
-      <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
-        <Sidebar active={navId} />
-        <main className="content">
-          <CredentialBanner />
-          <RouteContent route={route} />
-        </main>
-        {showDetailsPane && <aside className="details" id="details-pane" />}
-      </div>
-    </WindowChrome>
+    <ActiveOperationsProvider>
+      <WindowChrome docTitle={title}>
+        <div className={`layout${showDetailsPane ? "" : " layout-no-details"}`}>
+          <Sidebar active={navId} />
+          <main className="content">
+            <CredentialBanner />
+            <RouteContent route={route} />
+          </main>
+          {showDetailsPane && <aside className="details" id="details-pane" />}
+        </div>
+      </WindowChrome>
+    </ActiveOperationsProvider>
   );
 }

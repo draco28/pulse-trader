@@ -11,7 +11,9 @@
 // (r1.s1.w3) is the Strategy Library's screen sheet and `designer.css`
 // (r1.s1.w4) the Designer's — appended in load order, each after the shell
 // sheets it builds on. `backtest.css` (r1.s3.w4) is the Backtest Lab's,
-// carrying its scoped chart palette.
+// carrying its scoped chart palette. `coach.css` (r1.s4.w3) is the coach rail's
+// own sheet, loaded after `backtest.css` because the rail renders INSIDE the
+// Lab's result column and builds on its section rules.
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -24,6 +26,7 @@ import "./styles/content.css";
 import "./styles/library.css";
 import "./styles/designer.css";
 import "./styles/backtest.css";
+import "./styles/coach.css";
 
 function element(id: string): HTMLElement {
   const found = document.getElementById(id);

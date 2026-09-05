@@ -210,6 +210,57 @@ fn domain_error_maps_to_one_serializable_shape() {
     );
 }
 
+/// Every `BusErrorCode`'s wire token, pinned by exact string.
+///
+/// The frontend branches on these words. A rename is therefore a breaking change
+/// to a contract no compiler checks — TypeScript sees `string`, and a screen
+/// comparing against the old spelling silently stops matching. r1.s4.w3 added
+/// `busy` (`#141`'s single-flight refusal) and pins it here beside the others for
+/// exactly that reason: it is the one code the coach rail renders as a STATE
+/// ("already running") rather than as an error, so its spelling is load-bearing
+/// in a way the others' are not.
+#[test]
+fn every_bus_error_code_serializes_as_its_pinned_token() {
+    let pinned: Vec<(BusErrorCode, &str)> = vec![
+        (BusErrorCode::Data, "data"),
+        (BusErrorCode::Validation, "validation"),
+        (BusErrorCode::Backtest, "backtest"),
+        (BusErrorCode::Exchange, "exchange"),
+        (BusErrorCode::Llm, "llm"),
+        (BusErrorCode::Composer, "composer"),
+        (BusErrorCode::Busy, "busy"),
+        (BusErrorCode::Internal, "internal"),
+    ];
+
+    for (code, token) in &pinned {
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            serde_json::json!(token),
+            "{code:?} must serialize as {token:?}"
+        );
+        // And back, so the generated TypeScript union is a faithful description of
+        // the wire in both directions.
+        let round_tripped: BusErrorCode = serde_json::from_value(serde_json::json!(token)).unwrap();
+        assert_eq!(round_tripped, *code);
+    }
+
+    // The list is exhaustive by construction: a new variant added without a row
+    // here fails this match, not merely this assertion.
+    for (code, _) in &pinned {
+        match code {
+            BusErrorCode::Data
+            | BusErrorCode::Validation
+            | BusErrorCode::Backtest
+            | BusErrorCode::Exchange
+            | BusErrorCode::Llm
+            | BusErrorCode::Composer
+            | BusErrorCode::Busy
+            | BusErrorCode::Internal => {}
+        }
+    }
+    assert_eq!(pinned.len(), 8, "every code is pinned exactly once");
+}
+
 /// The one crossable error that CAN name a persisted run. The shape test above
 /// loops only the domain-family errors, every one of which serializes `run_id`
 /// as null — so without this case the `with_run_id` serialization path, the exact
