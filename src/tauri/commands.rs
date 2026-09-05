@@ -80,6 +80,7 @@ use crate::agent::config::{
     prompt_override_dir,
 };
 use crate::application::coach::CoachTurnRegistry;
+use crate::cli::coach::coach_config;
 use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
 use crate::domain::CoachingSessionId;
 use crate::domain::Redactor;
@@ -1446,7 +1447,10 @@ pub async fn coach_turn(
         prices,
         redactor,
         key_source: Some(key_source),
-        config: compose_config(transport.model.as_deref()),
+        // The COACH's knobs, shared with `pulse coach` (#164) — a coach turn asks a
+        // whole backtest's worth of question and the model reasons before it calls a
+        // tool, so the composer's step-sized cap cut the turn off mid-thought.
+        config: coach_config(transport.model.as_deref()),
         prompt: prompt.text,
         prompt_version: Some(prompt.version),
         turn_timeout: None,

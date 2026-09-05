@@ -66,6 +66,53 @@ use crate::domain::{
 
 use crate::adapters::llm::capturing::CapturingRepo;
 
+/// The coach's RESPONSE TOKEN CAP — the coach's own answer to the question, not the
+/// CLI reasoning constant it used to borrow (#164).
+///
+/// glm-5.3-flash reasons BEFORE it calls a tool, and its thinking tokens are billed
+/// against this cap. On the real run `23e890d0` the reasoning alone ran 7 176 and
+/// 9 074 output tokens; under the old 4 096 the provider returned
+/// `finish_reason: "length"` with an empty `content` and NO tool call, which the
+/// taxonomy could only record as `ZeroCalls` — a cap that was too small, reading as
+/// a model that declined. 16 384 clears the worst turn measured with headroom, and
+/// the endpoint accepts it.
+///
+/// Separate from `llm::REASONING_MAX_TOKENS` on purpose: `llm-check` sends a
+/// one-sentence prompt and the coach sends a whole backtest, so one number cannot
+/// be right for both. Changing it moves the coach's REQUEST FINGERPRINT (the
+/// single-flight key feeds `max_tokens`), which is deliberate: a turn asked under a
+/// different cap is a different request.
+pub(crate) const COACH_MAX_TOKENS: u32 = 16_384;
+
+/// The coach's sampling temperature — 0.0, the most deterministic setting the wire
+/// offers, for BOTH surfaces.
+///
+/// The CLI already sent 0.0 while the desktop rail sent the composer's 0.2 (it was
+/// wired to `compose_config`), so the two surfaces asked the same question two ways
+/// and neither was chosen on purpose. Like the cap, this feeds the request
+/// fingerprint.
+const COACH_TEMPERATURE: f32 = 0.0;
+
+/// The coach chat config — the ONE place both coach surfaces read their transport
+/// knobs from (`run_coach` here, `coach_turn` in the Tauri ring).
+///
+/// MODEL resolves the config `[llm].model` override → the shipped
+/// [`COMPOSE_MODEL`](super::compose::COMPOSE_MODEL) fallback, exactly as the
+/// composer's does; the CAP and the TEMPERATURE are the coach's own
+/// ([`COACH_MAX_TOKENS`] / [`COACH_TEMPERATURE`]). The composer keeps its own
+/// config untouched — a coach turn and a composer step are not the same size of
+/// question.
+pub(crate) fn coach_config(model_override: Option<&str>) -> LlmConfig {
+    LlmConfig {
+        backend: LlmBackend::Ollama,
+        model: model_override
+            .unwrap_or(super::compose::COMPOSE_MODEL)
+            .to_owned(),
+        temperature: COACH_TEMPERATURE,
+        max_tokens: COACH_MAX_TOKENS,
+    }
+}
+
 /// `pulse coach <RUN_ID> [--db <path>]`.
 #[derive(Debug, clap::Args)]
 pub struct CoachArgs {
@@ -260,10 +307,6 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
     let transport =
         crate::agent::config::load_llm_transport().context("loading the [llm] transport config")?;
     let prices = crate::agent::config::load_price_table().context("loading the price table")?;
-    let model = transport
-        .model
-        .clone()
-        .unwrap_or_else(|| super::compose::COMPOSE_MODEL.to_owned());
     let provider = coach_provider(key.expose(), transport.base_url.as_deref());
 
     let clock = SystemClock;
@@ -281,17 +324,12 @@ pub async fn run_coach(db: Option<&Db>, args: &CoachArgs) -> anyhow::Result<()> 
         prices,
         clock,
         key_source,
-        config: LlmConfig {
-            backend: LlmBackend::Ollama,
-            model,
-            temperature: 0.0,
-            // The shared reasoning-model cap, not a second private guess at it
-            // (#124): GLM spends thinking tokens against this budget BEFORE the
-            // tool call, so a tight cap produces a turn with no tool call — which
-            // this taxonomy records as `ZeroCalls`, indistinguishable from a model
-            // that genuinely declined to propose.
-            max_tokens: super::llm::REASONING_MAX_TOKENS,
-        },
+        // The coach's own knobs, shared with the desktop rail (#164): GLM spends
+        // thinking tokens against the cap BEFORE the tool call, so a cap sized for
+        // a one-sentence `llm-check` prompt produces a turn with no tool call —
+        // which this taxonomy records as `ZeroCalls`, indistinguishable from a
+        // model that genuinely declined to propose.
+        config: coach_config(transport.model.as_deref()),
         // The live arm honours the operator's `$PULSE_PROMPT_DIR/coach.md` overlay
         // — the whole point of the resolved-bytes prompt version (audit C2) is that
         // an overlay edit changes what the coach says AND what the ledger records.
@@ -450,7 +488,8 @@ fn coach_provider(api_key: &str, base_url: Option<&str>) -> OpenAiCompatProvider
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::coach_provider;
+    use super::{COACH_MAX_TOKENS, COACH_TEMPERATURE, coach_config, coach_provider};
+    use crate::domain::LlmBackend;
 
     /// The coach's transport posture is chosen HERE, so it is proven here (PR #128,
     /// finding H1). `OpenAiCompatProvider` cannot enforce it — a caller reaching for
@@ -467,6 +506,51 @@ mod tests {
             coach_provider("k", Some("https://example.test/v1")).max_retries(),
             0,
             "and a [llm].base_url override does not restore retries"
+        );
+    }
+
+    /// The coach's OUTPUT CAP is its own constant, and the coach config is the one
+    /// place both surfaces read it from (#164). The old wiring answered the same
+    /// question twice — the CLI took `llm::REASONING_MAX_TOKENS` (4096) and the
+    /// desktop took the composer's `compose_config` (4096, temperature 0.2) — and
+    /// a reasoning model that spends 7k-9k output tokens before its tool call was
+    /// cut off by both, which the taxonomy could only record as `ZeroCalls`.
+    #[test]
+    fn the_coach_config_carries_the_coach_output_cap() {
+        let config = coach_config(None);
+        assert_eq!(config.backend, LlmBackend::Ollama);
+        assert_eq!(
+            config.max_tokens, COACH_MAX_TOKENS,
+            "the coach reads its own cap, not the CLI reasoning constant"
+        );
+        assert_eq!(
+            COACH_MAX_TOKENS, 16_384,
+            "the cap is the value #164's real turns qualified"
+        );
+        assert!(
+            config.max_tokens > crate::cli::llm::REASONING_MAX_TOKENS,
+            "and it is bigger than the cap that produced the empty completions"
+        );
+        // Bit-compared: the wire carries this f32 exactly, and an approximate
+        // assertion would pass for a temperature the model would not sample at.
+        assert_eq!(config.temperature.to_bits(), COACH_TEMPERATURE.to_bits());
+        assert_eq!(
+            COACH_TEMPERATURE.to_bits(),
+            0.0_f32.to_bits(),
+            "one deterministic posture for both surfaces"
+        );
+    }
+
+    /// MODEL still resolves the config `[llm].model` override -> the shared const
+    /// fallback, exactly as the composer's does: the cap is what forks, not the
+    /// model resolution.
+    #[test]
+    fn the_coach_config_prefers_the_configured_model() {
+        assert_eq!(coach_config(Some("kimi-k2.6")).model, "kimi-k2.6");
+        assert_eq!(
+            coach_config(None).model,
+            crate::cli::compose::COMPOSE_MODEL,
+            "no override falls back to the shipped model id"
         );
     }
 }

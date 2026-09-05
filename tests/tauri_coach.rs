@@ -1442,3 +1442,41 @@ async fn the_credential_never_reaches_a_dto_an_error_or_a_persisted_row() {
     .expect_err("no such session");
     assert!(!refused.message.contains(FAKE_KEY));
 }
+
+// ---------------------------------------------------------------------------
+// The live desktop wiring (#164)
+// ---------------------------------------------------------------------------
+
+mod source_scan;
+
+/// The `coach_turn` bus command builds the COACH config, not the composer's.
+///
+/// A source scan because the wrapper is the one line of the desktop coach that no
+/// test can reach: it resolves a credential and constructs a live transport, so it
+/// is unreachable offline, and it is exactly where the two surfaces drifted. Until
+/// #164 it built `compose_config` — the composer's 4 096-token cap and 0.2
+/// temperature — while `pulse coach` sent 0.0 and the CLI reasoning constant, so
+/// "the desktop coach's cap" was a number nobody had chosen for the coach.
+#[test]
+fn the_desktop_coach_turn_builds_the_shared_coach_config() {
+    let code = source_scan::blank_comments(&source_scan::read_source("src/tauri/commands.rs"));
+    let start = code
+        .find("pub async fn coach_turn(")
+        .expect("the `coach_turn` bus command is still declared in the Tauri ring");
+    let body = &code[start..];
+    let end = body
+        .find("coach_turn_core(")
+        .expect("`coach_turn` still delegates to `coach_turn_core`");
+    let wiring = &body[..end];
+
+    assert!(
+        wiring.contains("coach_config("),
+        "`coach_turn` must build the shared `coach_config` so both coach surfaces \
+         send the same cap and temperature"
+    );
+    assert!(
+        !wiring.contains("compose_config("),
+        "`coach_turn` must not borrow the COMPOSER's config — a composer step and a \
+         coach turn are not the same size of question (#164)"
+    );
+}
