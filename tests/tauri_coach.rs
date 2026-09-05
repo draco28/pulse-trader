@@ -235,6 +235,16 @@ fn deps<P>(provider: P) -> CoachTurnDeps<P> {
     }
 }
 
+/// The same deps after a release changed the prompt — which moves the request
+/// fingerprint, exactly as a new model or a new tool definition would.
+fn deps_after_a_prompt_change<P>(provider: P) -> CoachTurnDeps<P> {
+    CoachTurnDeps {
+        prompt: "You are PulseTrader's coach. (reworded in a later release)".to_owned(),
+        prompt_version: Some("promptver-def456".to_owned()),
+        ..deps(provider)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The fixture world — everything but the provider is real
 // ---------------------------------------------------------------------------
@@ -639,6 +649,82 @@ async fn age_pending_claim(pool: &sqlx::SqlitePool, session: &str, minutes: i64)
         )],
     )
     .await;
+}
+
+/// An abandoned claim settles even when the prompt or config has moved on.
+///
+/// Adoption used to re-claim under the old id through the ordinary turn path, which
+/// recomputes the request fingerprint from CURRENT settings; `claim_session` refuses
+/// a reused id whose fingerprint moved. So any release that reworded the prompt,
+/// changed the model or added a tool left the crash-era row pending, every later ask
+/// selected that same row and failed the same way, and coaching for the run was
+/// blocked for good.
+///
+/// An abandoned claim is settled directly instead. The fingerprint answers "is this
+/// the same request?", which is the wrong question about a claim already proven
+/// abandoned by age — what is being recorded is that a turn ended without an answer.
+#[tokio::test]
+async fn an_abandoned_claim_settles_even_after_the_prompt_changed() {
+    let world = world().await;
+    let state = world.state().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let hanging = HangingProvider {
+        entered: Mutex::new(Some(entered_tx)),
+    };
+
+    {
+        let first = coach_turn_core(
+            &state,
+            deps(hanging),
+            turn_request("sess-before-release", &world.parent_run_id),
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("the hanging provider must not complete the turn"),
+            entered = entered_rx => entered.expect("the provider was entered"),
+        }
+    }
+    age_pending_claim(world.db().await.pool(), "sess-before-release", 10).await;
+
+    // The release lands: a different prompt, so a different fingerprint.
+    let (provider2, calls2) = ScriptedProvider::new(vec![propose_call(
+        RSI_PERIOD,
+        &json!({ "type": "Period", "value": 21 }),
+        "no call may be made on an abandoned claimant's behalf",
+    )]);
+    let dto = coach_turn_core(
+        &state,
+        deps_after_a_prompt_change(provider2),
+        turn_request("sess-after-release", &world.parent_run_id),
+    )
+    .await
+    .expect("the abandoned claim settles despite the changed fingerprint");
+
+    assert_eq!(dto.outcome, "failed");
+    assert_eq!(dto.session_id, "sess-before-release");
+    assert_eq!(
+        dto.failure.as_ref().expect("a reason").kind,
+        "interrupted",
+        "settled as interrupted, not refused as a session conflict"
+    );
+    assert_eq!(calls2.load(Ordering::SeqCst), 0, "settling spends no money");
+
+    // AND the run is not blocked: the next ask starts a fresh turn under its own id.
+    let (provider3, calls3) = ScriptedProvider::new(vec![propose_call(
+        RSI_PERIOD,
+        &json!({ "type": "Period", "value": 21 }),
+        "a slower RSI trades less often on this chop",
+    )]);
+    let next = coach_turn_core(
+        &state,
+        deps_after_a_prompt_change(provider3),
+        turn_request("sess-fresh", &world.parent_run_id),
+    )
+    .await
+    .expect("the run is workable again");
+    assert_eq!(next.outcome, "proposed");
+    assert_eq!(next.session_id, "sess-fresh");
+    assert_eq!(calls3.load(Ordering::SeqCst), 1, "and it really asked");
 }
 
 /// A YOUNG pending claim is never adopted — it may be a turn running elsewhere.

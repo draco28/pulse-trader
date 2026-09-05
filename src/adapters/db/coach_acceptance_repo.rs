@@ -217,6 +217,33 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             ))
         })?;
 
+        // THE PROPOSAL MUST STILL SAY WHAT THE CHILD WAS BUILT FROM, and this is
+        // checked BEFORE the already-accepted branch below, not after it.
+        //
+        // A modify recorded while this accept was applying, loading and re-running —
+        // all of it necessarily outside this transaction — leaves the proposal
+        // carrying a DIFFERENT mutation. Two shapes follow from that, and the guard
+        // has to cover both:
+        //
+        //   - the proposal is still open: writing now would record a child its own
+        //     stored mutation did not produce, with every constraint passing;
+        //   - the proposal was already ACCEPTED by the process that modified it:
+        //     returning its child and run ids as an idempotent replay would tell
+        //     THIS caller that the mutation their trader reviewed was accepted,
+        //     when the stored child came from someone else's.
+        //
+        // Checking after the replay branch caught only the first. It also put this
+        // adapter out of step with the in-memory one, which checks first — and two
+        // adapters disagreeing about an invariant is the defect this guard exists
+        // to prevent, one layer up.
+        if proposal.mutation != acceptance.expected_mutation {
+            return Err(DataError::Db(format!(
+                "coaching session `{id}`: the proposal changed while this accept was being \
+                 computed, so the child would not match the mutation now on record; \
+                 re-run the accept against the current proposal"
+            )));
+        }
+
         if opened != 1 {
             // Nothing was open. Either this is the retry of an accept that already
             // landed — the session id IS the accept idempotency key, so that must
@@ -235,23 +262,6 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
                     other.kind()
                 ))),
             };
-        }
-
-        // THE PROPOSAL MUST STILL SAY WHAT THE CHILD WAS BUILT FROM. `opened == 1`
-        // proves only that the proposal is open, and a modify recorded while this
-        // accept was applying, loading and re-running — all of it necessarily
-        // outside this transaction — leaves it open with a DIFFERENT mutation. That
-        // is the whole window: another process's modify commits, this accept then
-        // writes a child produced from the old mutation, every constraint passes,
-        // and the row now claims a child that its stored mutation did not produce.
-        // Refuse instead, and let the caller recompute from what the proposal
-        // actually says.
-        if proposal.mutation != acceptance.expected_mutation {
-            return Err(DataError::Db(format!(
-                "coaching session `{id}`: the proposal changed while this accept was being \
-                 computed, so the child would not match the mutation now on record; \
-                 re-run the accept against the current proposal"
-            )));
         }
 
         let session = self.coached_session(&mut tx, &id).await?;

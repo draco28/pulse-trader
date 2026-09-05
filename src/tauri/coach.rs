@@ -63,9 +63,9 @@ use crate::domain::backtest::SummaryStats;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
     AcceptFailureStage, BacktestRunId, Clock, CoachAcceptFailure, CoachFailure, CoachingRepository,
-    CoachingSession, CoachingSessionId, CredentialSource, Disposition, LlmCallRepository,
-    LlmConfig, LlmProvider, Mutation, ParamKind, ParamValue, PriceTable, Proposal, Redactor,
-    SessionOutcome,
+    CoachingSession, CoachingSessionId, CredentialSource, Disposition, InitialCoachOutcome,
+    LlmCallRepository, LlmConfig, LlmProvider, Mutation, ParamKind, ParamValue, PriceTable,
+    Proposal, Redactor, SessionOutcome,
 };
 
 use super::commands::{DesktopState, OperationKey};
@@ -759,8 +759,41 @@ where
     // registries are process-local, so adopting on "pending" alone steals turns
     // running in another process.
     let reload_sessions = SqliteCoachingRepo::with_deps(state.db().pool().clone(), SystemClock);
-    let session_id = match pending_claim_for_run(&reload_sessions, &run_id, &SystemClock).await? {
-        Some(PendingClaim::Abandoned(pending)) => pending,
+    match pending_claim_for_run(&reload_sessions, &run_id, &SystemClock).await? {
+        Some(PendingClaim::Abandoned(pending)) => {
+            // SETTLE IT HERE, not by re-claiming under its id.
+            //
+            // Going through `run_coach_turn` would recompute the request fingerprint
+            // from the CURRENT prompt, model config and tool definitions, and
+            // `claim_session` refuses a reused id whose fingerprint has moved — so
+            // any release that changed one of those left the row pending, every
+            // later ask selected the same row and failed the same way, and coaching
+            // for that run was blocked for good short of restoring the old config or
+            // editing the database.
+            //
+            // The fingerprint answers "is this the same request?", which is the
+            // wrong question about a claim already proven abandoned by age. What is
+            // being recorded is that a turn ended without an answer; the settlement
+            // is the same whatever the request was.
+            let settled = reload_sessions
+                .finish_session(
+                    &pending,
+                    InitialCoachOutcome {
+                        llm_call_id: None,
+                        outcome: SessionOutcome::Failed {
+                            failure: CoachFailure::Interrupted {
+                                detail: format!(
+                                    "the claim on run `{}` was left unfinished by an earlier \
+                                     process lifetime",
+                                    run_id.as_str()
+                                ),
+                            },
+                        },
+                    },
+                )
+                .await?;
+            return session_dto(&state.llm_call_repo(), &settled).await;
+        }
         Some(PendingClaim::MaybeLive(pending)) => {
             // The message says only what is known: this run has an UNSETTLED turn,
             // too recent to treat as abandoned. Whether it is still running cannot
@@ -782,8 +815,10 @@ where
                 pending.as_str().to_owned(),
             ));
         }
-        None => CoachingSessionId::new(request.session_id),
-    };
+        // No unfinished claim: this run's next turn is the caller's own.
+        None => {}
+    }
+    let session_id = CoachingSessionId::new(request.session_id);
 
     // Acquired after the id is settled and dropped last: every exit below — the
     // `?`s, a panic, the future being dropped by a navigation — releases it,

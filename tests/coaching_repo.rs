@@ -596,6 +596,84 @@ async fn an_accept_whose_proposal_changed_underneath_it_is_refused() {
     }
 }
 
+/// An accept whose proposal was modified AND accepted by someone else is refused —
+/// it does not get the other accept's ids back as an idempotent replay.
+///
+/// The replay branch exists so a client that lost the response can retry: the
+/// session id is the accept idempotency key, so the same accept must return the
+/// same two ids. It is not a licence to hand ANY caller the accepted ids. Process A
+/// prepares an accept for M1, process B modifies to M2 and accepts first, and A's
+/// commit lands on a proposal that is accepted and carries M2 — returning B's child
+/// would tell A's trader the mutation they reviewed was accepted, when the stored
+/// child came from a different one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_replay_is_refused_when_the_accepted_mutation_is_not_the_one_prepared() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    // B's accept lands first, against the proposal as it stands.
+    let landed = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect("B's accept commits");
+
+    // A arrives with a child built from a mutation the proposal no longer carries.
+    let err = accepts(&pool)
+        .commit_acceptance(prepared_from_stale_mutation("sess-1"))
+        .await
+        .expect_err("A's accept is refused, not replayed");
+    assert!(
+        err.to_string().contains("changed while this accept"),
+        "the refusal says the proposal moved: {err}"
+    );
+    assert!(
+        !err.to_string().contains(landed.child_version_id.as_str()),
+        "and it does not hand back the other accept's child: {err}"
+    );
+
+    // B's accept is untouched — the refusal settled nothing and minted nothing.
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => assert_eq!(
+            proposal.disposition,
+            Disposition::Accepted {
+                child_version_id: landed.child_version_id.clone(),
+                accepted_run_id: landed.accepted_run_id.clone(),
+            },
+            "the accepted row still names B's child and run"
+        ),
+        other => panic!("expected an accepted proposal, got {other:?}"),
+    }
+}
+
+/// The in-memory adapter refuses the same replay, in the same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_refuses_a_replay_of_a_different_accepted_mutation() {
+    let repo = in_memory_repo();
+
+    let landed = repo
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect("B's accept commits");
+
+    let err = repo
+        .commit_acceptance(prepared_from_stale_mutation("sess-1"))
+        .await
+        .expect_err("A's accept is refused, not replayed");
+    assert!(
+        err.to_string().contains("changed while this accept"),
+        "the refusal says the proposal moved: {err}"
+    );
+
+    let children = repo.accepted_children().expect("read the children");
+    assert_eq!(
+        children.len(),
+        1,
+        "the refused replay minted nothing further"
+    );
+    assert_eq!(children[0].child_version_id, landed.child_version_id);
+}
+
 /// The in-memory adapter refuses the same race the SQLite one refuses.
 ///
 /// A test adapter that admits an interleaving the real one rejects certifies the
