@@ -509,6 +509,20 @@ mod tests {
         );
     }
 
+    /// The coach's REQUEST TIMEOUT is chosen at the same composition site, and for
+    /// the same reason: `OpenAiCompatProvider::new` would hand this turn the 60s
+    /// posture, under which a turn that actually spends [`COACH_MAX_TOKENS`] is cut
+    /// off mid-reasoning (#164).
+    #[test]
+    fn the_live_coach_provider_waits_out_a_full_reasoning_budget() {
+        assert_eq!(coach_provider("k", None).timeout_secs(), 110);
+        assert_eq!(
+            coach_provider("k", Some("https://example.test/v1")).timeout_secs(),
+            110,
+            "and a [llm].base_url override does not restore the short timeout"
+        );
+    }
+
     /// The coach's OUTPUT CAP is its own constant, and the coach config is the one
     /// place both surfaces read it from (#164). The old wiring answered the same
     /// question twice — the CLI took `llm::REASONING_MAX_TOKENS` (4096) and the
