@@ -53,6 +53,12 @@ pub(crate) mod strategy;
 // (`adapters::llm::redacting_logging`), so the persisted copy is never weaker than
 // the compose-time scrub. Pure string logic, zero-I/O — a domain-kernel utility.
 mod secret;
+// r1.s4.w2 (#150, ADR-0012 / ADR-0015 / ADR-0016): the PURE text-redaction kernel.
+// `pub(crate)` so `adapters::llm`'s decorator can reach the placeholder constant and
+// the two message-level helpers; `Redactor` itself is re-exported below. Moving it
+// inward is what returns the application ring to ADR-0015's ONE deliberate adapters
+// import. Provider concerns and credential HANDLING did not move.
+pub(crate) mod redaction;
 mod timeframe;
 mod version;
 
@@ -171,7 +177,12 @@ pub use llm::{
 // re-export additions merge cleanly. Re-exported here so `lib.rs` can curate the
 // crate surface — an un-re-exported public domain type is a `dead_code` BUILD error.
 pub use llm::ToolDefinition;
+// r1.s4.w2 (#150): the scoped, config-driven secret scrubber, now a domain kernel.
+// Re-exported here so `lib.rs` can keep the SAME `pulse::Redactor` surface every
+// composition root and test binary already names — the move is an address change,
+// not an API change.
 pub use llm_call::{LlmCall, LlmCallId};
+pub use redaction::Redactor;
 // r1.s4.w1: the attributed-call pair the sealed coach turn's provider port
 // returns. `pub(crate)`: a crate-internal use case's vocabulary (ADR-0015).
 pub(crate) use llm_call::{AttributedCall, AttributedCallError};

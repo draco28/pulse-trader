@@ -56,11 +56,12 @@ use anyhow::Context as _;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo, SqliteStrategyRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::config::{load_composer_prompt, load_llm_transport, load_price_table};
 use crate::agent::{
     ComposeOutcome, Composer, ComposerEvent, LlmCallCapture, builder_tool_definitions,
 };
+use crate::domain::Redactor;
 use crate::domain::strategy::{CreatedBy, NewVersion, Strategy, StrategyVersion};
 use crate::domain::{
     ApiKey, Clock, CredentialSource, LlmBackend, LlmCallId, LlmCallRepository, LlmConfig,

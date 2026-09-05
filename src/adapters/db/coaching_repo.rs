@@ -688,7 +688,7 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
     ) -> Result<(), DataError> {
         let id_str = id.as_str();
 
-        // The two targets this operation cannot honestly write.
+        // The three targets this operation cannot honestly write.
         //
         // `Proposed`: nothing returns to the initial state — the same rule
         // `Proposal::transition` enforces, which the store must not be able to
@@ -699,9 +699,16 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         // the disposition columns only — so recording `modified` here would move
         // the state while leaving the ORIGINAL mutation in the row: a proposal that
         // says it was edited and carries the un-edited value, with no way to tell
-        // from the row which it is. Refused rather than half-written; the operation
-        // that writes both in one statement belongs to the rail that has the edited
-        // mutation to write.
+        // from the row which it is. Refused rather than half-written;
+        // `record_modification` writes both in one statement.
+        //
+        // `Accepted` (r1.s4.w2, `pulseai-labs/pulse-trader#149`): accepted lineage
+        // has exactly ONE writer, `CoachAcceptanceRepository::commit_acceptance`,
+        // which mints the child version and its run inside the transaction that
+        // settles the proposal. This operation could only be handed ids something
+        // else minted, and a second writer of the same fact is how the version tree
+        // acquires an edge nobody can reproduce. So the one target left is
+        // `Rejected`.
         match disposition {
             Disposition::Proposed => {
                 return Err(DataError::Db(format!(
@@ -714,16 +721,24 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
                      together with the edited mutation, not by itself"
                 )));
             }
-            Disposition::Accepted { .. } | Disposition::Rejected => {}
+            Disposition::Accepted { .. } => {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id_str}`: an accepted disposition is written only by \
+                     `commit_acceptance`, which mints the child version and its run in the \
+                     same transaction; this operation cannot be a second writer of accepted \
+                     lineage"
+                )));
+            }
+            Disposition::Rejected => {}
         }
 
         let tag = disposition_tag(disposition);
+        // `Rejected` is now the only reachable target, so both links are NULL — but
+        // they stay derived from the value rather than hard-coded, so a future
+        // target that DOES name one cannot silently write NULL.
         let child_version_id = disposition
             .child_version_id()
             .map(|v| v.as_str().to_owned());
-        // r1.s4.w4: the run half of the accepted payload. `0008` refuses an
-        // accepted row that names one without the other, so the two travel
-        // together here or the write is refused rather than half-applied.
         let accepted_run_id = disposition.accepted_run_id().map(|r| r.as_str().to_owned());
 
         // One transaction: the conditional write and the read that interprets a
@@ -766,14 +781,13 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         .rows_affected();
 
         if affected == 1 {
-            // PROVENANCE before the commit (PR #128, finding G2). `0005`'s FK can
-            // say the child version exists; it cannot say the child is THIS
-            // proposal's child. An `Err` here drops `tx`, so the row the UPDATE
-            // touched is rolled back and the proposal stays exactly as open as it
-            // was.
-            if let Some(child) = disposition.child_version_id() {
-                Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
-            }
+            // r1.s4.w2: the in-transaction child-provenance proof that used to run
+            // here went with the accepted arm. `commit_acceptance` DERIVES the
+            // parent and the strategy from the claimed session row rather than
+            // accepting them from a caller, so the lineage this checked is no
+            // longer constructible through any caller-supplied id; `0008`'s
+            // `coaching_proposals_accept_lineage_*` triggers remain the SQL-layer
+            // proof for the one writer that is left.
             tx.commit()
                 .await
                 .map_err(|e| DataError::Db(e.to_string()))?;
@@ -809,12 +823,6 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
         // proposal, which is what the key exists to refuse. `Disposition`'s
         // equality compares the payload, so the two cases separate themselves.
         if &current == disposition {
-            // A replay is validated too, not waved through on the strength of the
-            // first accept having been checked: this is the branch a retrying client
-            // lands on, and it must not be the cheap way past the lineage rule.
-            if let Some(child) = disposition.child_version_id() {
-                Self::check_child_provenance(&mut tx, id_str, child.as_str()).await?;
-            }
             tx.commit()
                 .await
                 .map_err(|e| DataError::Db(e.to_string()))?;
@@ -828,69 +836,65 @@ impl<C: Clock + Send + Sync> CoachingRepository for SqliteCoachingRepo<C> {
             disposition.kind()
         )))
     }
+
+    async fn record_modification(
+        &self,
+        id: &CoachingSessionId,
+        mutation: &Mutation,
+    ) -> Result<Proposal, DataError> {
+        let id_str = id.as_str();
+        let mutation_json =
+            serde_json::to_string(mutation).map_err(|e| DataError::Db(e.to_string()))?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+
+        // ONE statement writes the edited mutation AND the state, so a row can never
+        // say "edited" while carrying the un-edited value. It is the transaction's
+        // first statement — a WRITE, taking the lock outright rather than upgrading a
+        // read snapshot (the PR #128 finding-H2 ordering) — and it is CONDITIONAL on
+        // the proposal still being open, so a settled proposal cannot be re-edited.
+        //
+        // The stale accept failure goes with it: a failure recorded against the
+        // PREVIOUS mutation says nothing about this one, and leaving it would show
+        // the trader a reason that belongs to a value the row no longer holds.
+        let affected = sqlx::query!(
+            "UPDATE coaching_proposals \
+             SET mutation = ?1, disposition = 'modified', \
+                 accept_failure_stage = NULL, accept_failure_detail = NULL \
+             WHERE session_id = ?2 AND disposition IN ('proposed', 'modified')",
+            mutation_json,
+            id_str,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| DataError::Db(e.to_string()))?
+        .rows_affected();
+
+        if affected != 1 {
+            return Err(DataError::Db(format!(
+                "coaching session `{id_str}`: no open proposal to modify (absent session, a \
+                 turn that failed, or an already-settled proposal)"
+            )));
+        }
+
+        // Read back on the SAME transaction, so what is returned is what committed.
+        let proposal = fetch_proposal_tx(&mut tx, id_str).await?.ok_or_else(|| {
+            DataError::Db(format!(
+                "coaching session `{id_str}`: the proposal vanished between write and read"
+            ))
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| DataError::Db(e.to_string()))?;
+        Ok(proposal)
+    }
 }
 
 impl<C: Clock> SqliteCoachingRepo<C> {
-    /// Prove the accepted child version really is THIS proposal's child, using the
-    /// caller's transaction (PR #128, finding G2).
-    ///
-    /// An accept naming a root version, a version parented elsewhere, or another
-    /// strategy's version records a lineage that never happened — and `r1.s4` reads
-    /// that lineage AS the version tree, so the false edge is not recoverable from
-    /// the row afterwards. It runs on the caller's `tx`, after the conditional write
-    /// and before the commit (PR #128, finding H2): the write has to be the
-    /// transaction's first statement so it never upgrades a read snapshot, and the
-    /// proof has to precede the commit so a rejection leaves the proposal exactly as
-    /// open as it was.
-    async fn check_child_provenance(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        session_id: &str,
-        child_id: &str,
-    ) -> Result<(), DataError> {
-        let lineage = sqlx::query!(
-            r#"SELECT
-                 child.parent_version_id AS "child_parent?: String",
-                 child.strategy_id       AS "child_strategy!: String",
-                 parent.strategy_id      AS "parent_strategy!: String",
-                 s.strategy_version_id   AS "coached_version!: String"
-               FROM coaching_sessions s
-               JOIN strategy_version parent ON parent.id = s.strategy_version_id
-               JOIN strategy_version child ON child.id = ?2
-               WHERE s.id = ?1"#,
-            session_id,
-            child_id,
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| DataError::Db(e.to_string()))?;
-
-        let Some(row) = lineage else {
-            return Err(DataError::Db(format!(
-                "coaching session `{session_id}`: no such session, or child version \
-                 `{child_id}` does not exist"
-            )));
-        };
-
-        if row.child_parent.as_deref() != Some(row.coached_version.as_str()) {
-            return Err(DataError::Db(format!(
-                "coaching session `{session_id}`: version `{child_id}` is not a child of the \
-                 coached version `{}` (its parent is {})",
-                row.coached_version,
-                row.child_parent
-                    .as_deref()
-                    .unwrap_or("nothing — it is a root version"),
-            )));
-        }
-        if row.child_strategy != row.parent_strategy {
-            return Err(DataError::Db(format!(
-                "coaching session `{session_id}`: version `{child_id}` belongs to strategy \
-                 `{}`, not `{}`",
-                row.child_strategy, row.parent_strategy,
-            )));
-        }
-        Ok(())
-    }
-
     /// The proposal row for a session, decoded into the domain type.
     async fn fetch_proposal(&self, session_id: &str) -> Result<Option<Proposal>, DataError> {
         let row = sqlx::query!(

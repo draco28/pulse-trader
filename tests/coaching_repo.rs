@@ -11,7 +11,11 @@
 //!      `InapplicableMutation`, which carries a w1 `MutationError` verbatim;
 //!   3. `llm_call_id` persists NULL and non-NULL, and NULL means "no ledger row was
 //!      correlated to this turn" (audit C3) — not that no attempt was made;
-//!   4. recording a disposition persists `child_version_id` only for `Accepted`;
+//!   4. `record_disposition` writes exactly one target — `Rejected` — and REFUSES
+//!      the accepted disposition outright (r1.s4.w2, `#149`): accepted lineage has
+//!      one writer, `CoachAcceptanceRepository::commit_acceptance`, which mints the
+//!      child and its run inside the transaction that settles the proposal, so the
+//!      accepted cases here drive THAT and this operation owes a refusal;
 //!   5. at most one proposal per session, end to end — the accept idempotency key.
 //!
 //! Offline (`SQLX_OFFLINE=true` + the committed `.sqlx/` + the in-process
@@ -25,7 +29,8 @@ use pulse::{
     Disposition, ExitRule, FakeClock, Hypothesis, InMemoryCoachAcceptanceRepo, IndicatorSpec,
     LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue, PreparedBacktest,
     PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource, SessionOutcome,
-    SqliteCoachingRepo, StrategyDsl, StrategyId, SweepableValue, ValueSource, VersionId, apply,
+    SqliteCoachAcceptanceRepo, SqliteCoachingRepo, StrategyDsl, StrategyId, SweepableValue,
+    ValueSource, VersionId, apply,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -515,11 +520,37 @@ async fn llm_call_id_persists_null_and_non_null() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Disposition — dormant until r1.s4, exercised here
+// 4. Disposition — `Rejected` is the only target this operation writes
+//
+//    r1.s4.w2 (`pulseai-labs/pulse-trader#149`): the accepted arm is RETIRED.
+//    `CoachAcceptanceRepository::commit_acceptance` is the ONE writer of accepted
+//    lineage — it mints the child version and its run inside the transaction that
+//    settles the proposal — so the cases below that used to drive `Accepted` through
+//    `record_disposition` now drive it through the acceptance adapter, and what
+//    `record_disposition` owes is a refusal.
 // ---------------------------------------------------------------------------
 
+/// The SQLite acceptance adapter over the test pool, deterministic in both the ids
+/// it mints and the timestamp it stamps.
+fn accepts(pool: &SqlitePool) -> SqliteCoachAcceptanceRepo<FakeClock, SeqIdSource> {
+    SqliteCoachAcceptanceRepo::with_deps(
+        pool.clone(),
+        FakeClock::at(NOW_MS),
+        SeqIdSource::with_prefix("minted"),
+    )
+}
+
+/// A prepared acceptance for `session`, with an empty trade log — these cases are
+/// about the LINKS an accept writes, not about the run's contents.
+fn prepared_for(session: &str) -> PreparedCoachAcceptance {
+    PreparedCoachAcceptance {
+        session_id: CoachingSessionId::new(session),
+        ..prepared_acceptance()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recording_a_disposition_persists_the_child_version_only_when_accepted() {
+async fn a_rejection_names_no_child_and_a_failed_turn_has_no_proposal() {
     let (repo, pool, _tmp) = repo().await;
     let id = CoachingSessionId::new("sess-1");
     repo.save_session(&session(
@@ -533,62 +564,25 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
     .await
     .expect("save");
 
-    // A non-accepting disposition leaves the child version NULL.
+    // A non-accepting disposition leaves BOTH links NULL.
     repo.record_disposition(&id, &Disposition::Rejected)
         .await
         .expect("record rejected");
-    let child: Option<String> =
-        sqlx::query_scalar("SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1")
-            .bind("sess-1")
-            .fetch_one(&pool)
-            .await
-            .expect("read child_version_id");
+    let (child, run): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT child_version_id, accepted_run_id FROM coaching_proposals WHERE session_id = ?1",
+    )
+    .bind("sess-1")
+    .fetch_one(&pool)
+    .await
+    .expect("read the links");
     assert!(
-        child.is_none(),
-        "only an accepted proposal names a child version, got {child:?}"
+        child.is_none() && run.is_none(),
+        "only an accepted proposal names a child and a run, got {child:?} / {run:?}"
     );
     let got = repo.get_session(&id).await.expect("get").expect("present");
     match &got.outcome {
         SessionOutcome::Proposed { proposal } => {
             assert_eq!(proposal.disposition, Disposition::Rejected);
-        }
-        SessionOutcome::Failed { .. } => panic!("still a proposal session"),
-        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
-    }
-
-    // Accepting persists the child version — from a FRESH proposal, because
-    // `Rejected` is terminal (see the transition tests below).
-    let id = CoachingSessionId::new("sess-2");
-    repo.save_session(&session(
-        "sess-2",
-        "run-1",
-        SessionOutcome::Proposed {
-            proposal: a_proposal(),
-        },
-        Some("call-1"),
-    ))
-    .await
-    .expect("save");
-    repo.record_disposition(
-        &id,
-        &Disposition::Accepted {
-            child_version_id: VersionId::new("ver-2"),
-            accepted_run_id: BacktestRunId::new("run-child-2"),
-        },
-    )
-    .await
-    .expect("record accepted");
-    let got = repo.get_session(&id).await.expect("get").expect("present");
-    match &got.outcome {
-        SessionOutcome::Proposed { proposal } => {
-            assert_eq!(
-                proposal.disposition,
-                Disposition::Accepted {
-                    child_version_id: VersionId::new("ver-2"),
-                    accepted_run_id: BacktestRunId::new("run-child-2"),
-                },
-                "the accepted disposition reads back with its child version"
-            );
         }
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
         SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
@@ -616,6 +610,45 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
     );
 }
 
+/// The accepted state is reached through `commit_acceptance`, and reads back through
+/// the ORDINARY session read carrying both links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_reads_back_with_both_links_through_the_session() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    let outcome = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect("commit the acceptance");
+
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => {
+            assert_eq!(
+                proposal.disposition,
+                Disposition::Accepted {
+                    child_version_id: outcome.child_version_id.clone(),
+                    accepted_run_id: outcome.accepted_run_id.clone(),
+                },
+                "the accepted disposition reads back with BOTH links"
+            );
+        }
+        SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
+    }
+
+    // The child really is a child of the COACHED version, derived from the session
+    // row rather than supplied — which is why no caller can name a foreign one.
+    let parent: Option<String> =
+        sqlx::query_scalar("SELECT parent_version_id FROM strategy_version WHERE id = ?1")
+            .bind(outcome.child_version_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("read the child");
+    assert_eq!(parent.as_deref(), Some("ver-1"));
+}
+
 /// Seed one `proposed` session and return its id.
 async fn a_proposed_session(repo: &SqliteCoachingRepo<FakeClock>, id: &str) -> CoachingSessionId {
     repo.save_session(&session(
@@ -635,41 +668,26 @@ async fn a_proposed_session(repo: &SqliteCoachingRepo<FakeClock>, id: &str) -> C
 async fn a_settled_proposal_cannot_be_re_dispositioned() {
     let (repo, pool, _tmp) = repo().await;
     let id = a_proposed_session(&repo, "sess-1").await;
+    let outcome = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect("accept an open proposal");
 
-    repo.record_disposition(
-        &id,
-        &Disposition::Accepted {
-            child_version_id: VersionId::new("ver-2"),
-            accepted_run_id: BacktestRunId::new("run-child-2"),
-        },
-    )
-    .await
-    .expect("accept an open proposal");
-
-    // `Accepted` is terminal (`Proposal::transition`). An unconditional UPDATE
-    // would re-point this row at a second child version and report success — the
-    // exact thing the session-id accept key exists to prevent.
-    let second_child = repo
-        .record_disposition(
-            &id,
-            &Disposition::Accepted {
-                child_version_id: VersionId::new("ver-3"),
-                accepted_run_id: BacktestRunId::new("run-child-3"),
-            },
-        )
-        .await;
-    assert!(
-        second_child.is_err(),
-        "an accepted proposal must not gain a second child version"
-    );
+    // `Accepted` is terminal (`Proposal::transition`). Neither a rejection nor a
+    // second accept may move it.
     assert!(
         repo.record_disposition(&id, &Disposition::Rejected)
             .await
             .is_err(),
         "an accepted proposal must not be re-recorded as rejected"
     );
+    let replay = accepts(&pool)
+        .commit_acceptance(prepared_for("sess-1"))
+        .await
+        .expect("replaying the accept is idempotent, not a second child");
+    assert_eq!(replay, outcome, "the SAME child and run come back");
 
-    // The row is untouched by the refused writes.
+    // The row is untouched by the refused write, and still names the first child.
     let child: Option<String> =
         sqlx::query_scalar("SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1")
             .bind("sess-1")
@@ -678,110 +696,86 @@ async fn a_settled_proposal_cannot_be_re_dispositioned() {
             .expect("read child_version_id");
     assert_eq!(
         child.as_deref(),
-        Some("ver-2"),
-        "the refused writes changed nothing"
+        Some(outcome.child_version_id.as_str()),
+        "the refused write changed nothing"
     );
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 7, "the six seeded versions plus ONE minted child");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replaying_the_same_accept_is_a_no_op() {
-    let (repo, _pool, _tmp) = repo().await;
+    let (repo, pool, _tmp) = repo().await;
     let id = a_proposed_session(&repo, "sess-1").await;
-    let accept = Disposition::Accepted {
-        child_version_id: VersionId::new("ver-2"),
-        accepted_run_id: BacktestRunId::new("run-child-2"),
-    };
+    let accepts = accepts(&pool);
 
-    repo.record_disposition(&id, &accept)
+    let first = accepts
+        .commit_acceptance(prepared_for("sess-1"))
         .await
         .expect("the accept");
     // The session id IS the accept idempotency key: a retry of the SAME accept has
     // to succeed, or a client that lost the response can never safely retry.
-    repo.record_disposition(&id, &accept)
+    let second = accepts
+        .commit_acceptance(prepared_for("sess-1"))
         .await
         .expect("replaying the identical accept is idempotent");
+    assert_eq!(first, second);
 
     let got = repo.get_session(&id).await.expect("get").expect("present");
     match &got.outcome {
-        SessionOutcome::Proposed { proposal } => assert_eq!(proposal.disposition, accept),
+        SessionOutcome::Proposed { proposal } => assert_eq!(
+            proposal.disposition,
+            Disposition::Accepted {
+                child_version_id: first.child_version_id.clone(),
+                accepted_run_id: first.accepted_run_id.clone(),
+            }
+        ),
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
         SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 
-/// An accept names the child version the mutation MINTED, and the schema can only
-/// say "some version exists" (PR #128, finding G2). Three shapes are individually
-/// legal rows and jointly a false provenance claim: a root version (no parent at
-/// all), a version parented elsewhere, and a version belonging to another strategy.
-/// Each is refused inside the same transaction, before the state update.
+/// `record_disposition` is not a writer of accepted lineage AT ALL (#149).
+///
+/// This used to be three tests, one per false-provenance shape a caller could name:
+/// a root version, a version parented elsewhere, and another strategy's version.
+/// Each was individually legal as a row and jointly a false lineage claim, and each
+/// was caught by an in-transaction provenance proof. `commit_acceptance` removes the
+/// class rather than checking it — it DERIVES the parent and the strategy from the
+/// claimed session row, so `PreparedCoachAcceptance` has nowhere to put a foreign
+/// child — and this operation now refuses the accepted disposition outright. So the
+/// three shapes collapse into one statement: whatever ids you name, including the
+/// legitimate ones, the answer is no.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepting_a_root_version_as_a_child_is_refused() {
+async fn record_disposition_refuses_every_accepted_disposition() {
     let (repo, pool, _tmp) = repo().await;
     let id = a_proposed_session(&repo, "sess-1").await;
 
-    let outcome = repo
-        .record_disposition(
-            &id,
-            &Disposition::Accepted {
-                child_version_id: VersionId::new("ver-root"),
-                accepted_run_id: BacktestRunId::new("run-root"),
-            },
-        )
-        .await;
-
-    assert!(
-        outcome.is_err(),
-        "a version with no parent cannot be this proposal's child"
-    );
-    assert_untouched(&pool, "sess-1").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepting_a_version_parented_elsewhere_is_refused() {
-    let (repo, pool, _tmp) = repo().await;
-    let id = a_proposed_session(&repo, "sess-1").await;
-
-    // `ver-sibling` descends from `ver-root`, not from the version this session
-    // coached — a real row, and the wrong lineage.
-    let outcome = repo
-        .record_disposition(
-            &id,
-            &Disposition::Accepted {
-                child_version_id: VersionId::new("ver-sibling"),
-                accepted_run_id: BacktestRunId::new("run-sibling"),
-            },
-        )
-        .await;
-
-    assert!(
-        outcome.is_err(),
-        "only a DIRECT child of the coached version may be accepted"
-    );
-    assert_untouched(&pool, "sess-1").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepting_a_child_from_another_strategy_is_refused() {
-    let (repo, pool, _tmp) = repo().await;
-    let id = a_proposed_session(&repo, "sess-1").await;
-
-    // `ver-foreign` names `ver-1` as its parent and still belongs to `strat-2`, so
-    // the parent check alone would pass it — the lineage check is what does not.
-    let outcome = repo
-        .record_disposition(
-            &id,
-            &Disposition::Accepted {
-                child_version_id: VersionId::new("ver-foreign"),
-                accepted_run_id: BacktestRunId::new("run-foreign"),
-            },
-        )
-        .await;
-
-    assert!(
-        outcome.is_err(),
-        "an accept may not move a proposal into another strategy's tree"
-    );
-    assert_untouched(&pool, "sess-1").await;
+    for (label, child, run) in [
+        ("a legitimately shaped child", "ver-2", "run-child-2"),
+        ("a root version with no parent", "ver-root", "run-root"),
+        ("a version parented elsewhere", "ver-sibling", "run-sibling"),
+        ("another strategy's version", "ver-foreign", "run-foreign"),
+    ] {
+        let outcome = repo
+            .record_disposition(
+                &id,
+                &Disposition::Accepted {
+                    child_version_id: VersionId::new(child),
+                    accepted_run_id: BacktestRunId::new(run),
+                },
+            )
+            .await;
+        let err = outcome.expect_err(&format!("`{label}` must be refused"));
+        assert!(
+            err.to_string().contains("commit_acceptance"),
+            "the refusal names the one writer that may do this: {err}"
+        );
+        assert_untouched(&pool, "sess-1").await;
+    }
 }
 
 /// The proposal row is still open and unsettled after a refused accept.
@@ -804,36 +798,36 @@ async fn assert_untouched(pool: &SqlitePool, session_id: &str) {
 /// Two clients replaying the SAME accept must both succeed (PR #128, finding H2).
 ///
 /// The accept is idempotent by session id, so a client that lost the response
-/// retries — and two retries can land together. The provenance check added in G2
-/// read before the conditional UPDATE wrote, which on a DEFERRED transaction means
-/// the write is an upgrade: in WAL, if the other transaction commits in between,
-/// SQLite answers `SQLITE_BUSY_SNAPSHOT` at once and `busy_timeout` does not apply
-/// to snapshot conflicts. Taking the write first removes the upgrade.
+/// retries — and two retries can land together. `commit_acceptance` takes the write
+/// lock with its FIRST statement rather than upgrading a read snapshot: in WAL, an
+/// upgrade whose snapshot another commit has moved past fails immediately with
+/// `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` does not cover.
 ///
 /// Rounds rather than a single pair, because the interleaving is the scheduler's to
-/// choose: each round is an independent session, and every one of them must settle.
+/// choose: each round is an independent session, and every one of them must settle
+/// on exactly one child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_identical_accepts_both_succeed() {
     let (repo, pool, _tmp) = repo().await;
-    let accept = Disposition::Accepted {
-        child_version_id: VersionId::new("ver-2"),
-        accepted_run_id: BacktestRunId::new("run-child-2"),
-    };
+    let accepts = accepts(&pool);
 
     for round in 0..20 {
         let session_id = format!("sess-race-{round}");
-        let id = a_proposed_session(&repo, &session_id).await;
+        a_proposed_session(&repo, &session_id).await;
 
         let (first, second) = tokio::join!(
-            repo.record_disposition(&id, &accept),
-            repo.record_disposition(&id, &accept),
+            accepts.commit_acceptance(prepared_for(&session_id)),
+            accepts.commit_acceptance(prepared_for(&session_id)),
         );
 
-        for (label, outcome) in [("first", first), ("second", second)] {
-            outcome.unwrap_or_else(|e| {
-                panic!("round {round}: the {label} identical accept must succeed, got {e}")
-            });
-        }
+        let first = first
+            .unwrap_or_else(|e| panic!("round {round}: the first accept must succeed, got {e}"));
+        let second = second
+            .unwrap_or_else(|e| panic!("round {round}: the second accept must succeed, got {e}"));
+        assert_eq!(
+            first, second,
+            "round {round}: both accepts must settle on the ONE child"
+        );
 
         let child: Option<String> = sqlx::query_scalar(
             "SELECT child_version_id FROM coaching_proposals WHERE session_id = ?1",
@@ -844,8 +838,8 @@ async fn concurrent_identical_accepts_both_succeed() {
         .expect("read child_version_id");
         assert_eq!(
             child.as_deref(),
-            Some("ver-2"),
-            "round {round}: both accepts must settle on the one child"
+            Some(first.child_version_id.as_str()),
+            "round {round}: the stored link is the one both accepts returned"
         );
     }
 }

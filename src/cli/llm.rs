@@ -42,9 +42,10 @@ use std::sync::{Arc, Mutex};
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{Db, SqliteLlmCallRepo};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
-use crate::adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::adapters::secrets::glm_api_key;
 use crate::agent::LlmCallCapture;
+use crate::domain::Redactor;
 use crate::domain::{
     Clock, CredentialSource, DataError, LlmBackend, LlmCall, LlmCallId, LlmCallRepository,
     LlmConfig, LlmProvider, LlmResponse, Message, PriceTable,

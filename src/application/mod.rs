@@ -23,7 +23,9 @@
 //! capability. r1 is backtest-only, and the risk gate's kill-switch and
 //! progressive-exposure controls are discharged by the dependency set being
 //! *incapable* of placing an order rather than by a flag that disables one.
-//! `tests/tauri_backtest.rs` scans this ring for exactly that.
+//! `tests/tauri_backtest.rs` scans this ring — EVERY file in it, by glob since
+//! r1.s4.w2 — for exactly that, and for the ADR-0015 rule that
+//! `crate::adapters::backtest` is the ring's ONE deliberate adapter import.
 
 pub(crate) mod backtest;
 
@@ -33,3 +35,10 @@ pub(crate) mod backtest;
 // the claim once. It replaces the `Coach::new` + `Coach::run_turn` fragment surface
 // the desktop rail (w3) and the decision module (w2) would otherwise consume.
 pub(crate) mod coach;
+
+// r1.s4.w2 (ADR-0010 / ADR-0019 / ADR-0021): the coach DECISION use case. One
+// session id and one action — modify, reject or accept — in; one durable outcome
+// out. On accept it re-applies the CURRENT mutation, re-runs the backtest on the
+// parent run's exact persisted inputs through `backtest::prepare_backtest`, and
+// commits child version + run + trades + links in W4's one transaction.
+pub(crate) mod coach_decision;

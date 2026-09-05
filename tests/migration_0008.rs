@@ -1218,6 +1218,202 @@ async fn the_disposition_transition_matrix_is_pinned_by_a_trigger() {
     );
 }
 
+/// `pulseai-labs/pulse-trader#149` — the `accepted_run_id` CHECK, bound.
+///
+/// The lineage triggers fire only `WHEN NEW.disposition = 'accepted'`, so a run
+/// link smuggled onto a still-OPEN proposal passes every one of them. What refuses
+/// it is `CHECK ((disposition = 'accepted') = (accepted_run_id IS NOT NULL))`, and
+/// until now nothing exercised that half from the open side. An open proposal
+/// carrying a run link is a proposal that says a re-backtest happened for a decision
+/// nobody made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_proposal_cannot_be_given_an_accepted_run_id() {
+    let (_tmp, db) = db_at_0008().await;
+    let pool = db.pool();
+
+    for (label, state) in [("proposed", "proposed"), ("modified", "modified")] {
+        let session = format!("s-open-{state}");
+        let proposal = format!("p-open-{state}");
+        seed_open_proposal(pool, &session, &proposal).await;
+        if state == "modified" {
+            sqlx::query("UPDATE coaching_proposals SET disposition='modified' WHERE id=?1")
+                .bind(&proposal)
+                .execute(pool)
+                .await
+                .expect("proposed → modified");
+        }
+
+        // `run-child-2` is a real run of a real child of the coached version, so
+        // every FK and every lineage trigger would be satisfied if the disposition
+        // said `accepted`. The only thing standing between this row and a false
+        // "this proposal has a re-backtest" claim is the CHECK.
+        assert!(
+            sqlx::query("UPDATE coaching_proposals SET accepted_run_id='run-child-2' WHERE id=?1")
+                .bind(&proposal)
+                .execute(pool)
+                .await
+                .is_err(),
+            "a `{label}` proposal must not name an accepted run"
+        );
+
+        // The symmetric half: clearing the run link off an accepted row is refused
+        // by the same CHECK (the transition trigger would also refuse it, so this
+        // pair is what tells the two apart).
+        let read_back: Option<String> =
+            sqlx::query_scalar("SELECT accepted_run_id FROM coaching_proposals WHERE id=?1")
+                .bind(&proposal)
+                .fetch_one(pool)
+                .await
+                .expect("read the proposal back");
+        assert!(
+            read_back.is_none(),
+            "the refused UPDATE left no run link on the `{label}` proposal"
+        );
+    }
+}
+
+/// `pulseai-labs/pulse-trader#149` — ALL EIGHT illegal moves, enumerated.
+///
+/// The state machine has four states. Twelve of the sixteen ordered pairs are moves
+/// (the other four are identity rewrites), five of those twelve are legal, and the
+/// remaining seven are refused — plus the eighth illegal move an identity rewrite
+/// can still express: re-accepting with a DIFFERENT child and run. Enumerating them
+/// in one table is what makes "the matrix is pinned" a checkable statement rather
+/// than a sample.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_eight_illegal_disposition_transitions_are_refused() {
+    let (_tmp, db) = db_at_0008().await;
+    let pool = db.pool();
+
+    // (label, starting state, the illegal UPDATE's SET clause)
+    let illegal: [(&str, &str, &str); 8] = [
+        (
+            "modified → proposed",
+            "modified",
+            "disposition='proposed', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "accepted → proposed",
+            "accepted",
+            "disposition='proposed', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "accepted → modified",
+            "accepted",
+            "disposition='modified', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "accepted → rejected",
+            "accepted",
+            "disposition='rejected', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "accepted → a SECOND child",
+            "accepted",
+            "child_version_id='ver-3', accepted_run_id='run-child-3'",
+        ),
+        (
+            "rejected → proposed",
+            "rejected",
+            "disposition='proposed', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "rejected → modified",
+            "rejected",
+            "disposition='modified', child_version_id=NULL, accepted_run_id=NULL",
+        ),
+        (
+            "rejected → accepted",
+            "rejected",
+            "disposition='accepted', child_version_id='ver-2', accepted_run_id='run-child-2'",
+        ),
+    ];
+
+    for (index, (label, from, set_clause)) in illegal.iter().enumerate() {
+        let session = format!("s-matrix-{index}");
+        let proposal = format!("p-matrix-{index}");
+        seed_in_state(pool, &session, &proposal, from).await;
+
+        let outcome = sqlx::query(&format!(
+            "UPDATE coaching_proposals SET {set_clause} WHERE id='{proposal}'"
+        ))
+        .execute(pool)
+        .await;
+        assert!(outcome.is_err(), "`{label}` must be refused");
+
+        // The refused write changed nothing.
+        let still: String =
+            sqlx::query_scalar("SELECT disposition FROM coaching_proposals WHERE id=?1")
+                .bind(&proposal)
+                .fetch_one(pool)
+                .await
+                .expect("read the proposal back");
+        assert_eq!(&still, from, "`{label}` left the row where it was");
+    }
+
+    // The five LEGAL moves, so the table above is a statement about the matrix
+    // rather than a claim that every UPDATE fails.
+    for (index, (from, set_clause)) in [
+        ("proposed", "disposition='modified'"),
+        ("proposed", "disposition='rejected'"),
+        (
+            "proposed",
+            "disposition='accepted', child_version_id='ver-2', accepted_run_id='run-child-2'",
+        ),
+        ("modified", "disposition='rejected'"),
+        (
+            "modified",
+            "disposition='accepted', child_version_id='ver-2', accepted_run_id='run-child-2'",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let session = format!("s-legal-{index}");
+        let proposal = format!("p-legal-{index}");
+        seed_in_state(pool, &session, &proposal, from).await;
+        sqlx::query(&format!(
+            "UPDATE coaching_proposals SET {set_clause} WHERE id='{proposal}'"
+        ))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("`{from}` → `{set_clause}` must be legal, got {e}"));
+    }
+}
+
+/// Seed one proposal already in `state`, reaching it only through LEGAL moves.
+async fn seed_in_state(pool: &SqlitePool, session: &str, proposal: &str, state: &str) {
+    seed_open_proposal(pool, session, proposal).await;
+    match state {
+        "proposed" => {}
+        "modified" => {
+            sqlx::query("UPDATE coaching_proposals SET disposition='modified' WHERE id=?1")
+                .bind(proposal)
+                .execute(pool)
+                .await
+                .expect("proposed → modified");
+        }
+        "rejected" => {
+            sqlx::query("UPDATE coaching_proposals SET disposition='rejected' WHERE id=?1")
+                .bind(proposal)
+                .execute(pool)
+                .await
+                .expect("proposed → rejected");
+        }
+        "accepted" => {
+            sqlx::query(
+                "UPDATE coaching_proposals SET disposition='accepted', \
+                 child_version_id='ver-2', accepted_run_id='run-child-2' WHERE id=?1",
+            )
+            .bind(proposal)
+            .execute(pool)
+            .await
+            .expect("proposed → accepted");
+        }
+        other => panic!("no such disposition `{other}`"),
+    }
+}
+
 // ===========================================================================
 // 4. Down — exact `0005` shape, and a transactional refusal when it would lie
 // ===========================================================================
@@ -1958,4 +2154,108 @@ async fn an_accept_against_a_session_that_never_proposed_writes_nothing() {
         .await
         .unwrap();
     assert_eq!(before, after, "a refused accept rolls the whole write back");
+}
+
+/// `pulseai-labs/pulse-trader#149` — a failure AFTER the child insert rolls back the
+/// child, its run, its trades and the proposal's links TOGETHER.
+///
+/// `commit_acceptance` writes four kinds of row in one transaction, and the ones
+/// that matter most are written LAST: the run belongs to the just-minted child, the
+/// trades belong to the just-minted run. A fault in the trade insert is therefore
+/// the case where a non-atomic implementation would leave the worst residue — a
+/// child version with no run, which is exactly the shape release exit criterion 4
+/// forbids.
+///
+/// The injected fault is a ROW-level one: a trade whose `mfe_r` trips a constraint
+/// on the `trade` table, installed for this test. It fires after the child and the
+/// run are already inserted on the open transaction.
+///
+/// The proof is **"no settled row exists"**, not `COUNT(*) = 0`: the session and its
+/// open proposal are supposed to still be there, and a bare count would pass for the
+/// wrong reason (r1.s4.w1 §8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fault_after_the_child_insert_rolls_the_whole_accept_back() {
+    let (repo, pool, _tmp) = coaching_repo().await;
+    let id = proposed_turn(&repo, "sess-rollback").await;
+    let accepts = acceptance_repo(&pool);
+
+    sqlx::query(
+        "CREATE TRIGGER _t_149_trade_guard BEFORE INSERT ON trade \
+         WHEN NEW.mfe_r = '99999' \
+         BEGIN SELECT RAISE(ABORT, 'trade: injected constraint violation'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install the trade constraint");
+
+    let versions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backtest_run")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mut acceptance = prepared("sess-rollback");
+    for trade in &mut acceptance.prepared_run.result.trades {
+        trade.mfe_r = Decimal::new(99_999, 0);
+    }
+
+    let outcome = accepts.commit_acceptance(acceptance).await;
+    assert!(
+        outcome.is_err(),
+        "a refused trade insert must fail the whole accept"
+    );
+
+    // Child, run and trades are all gone together — not one of them survived the
+    // other's rollback.
+    let versions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM strategy_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backtest_run")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let trades_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trade")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions_after, versions_before, "no child version survived");
+    assert_eq!(runs_after, runs_before, "no run survived");
+    assert_eq!(trades_after, 0, "no trade survived");
+
+    // NO SETTLED ROW EXISTS. The session and its proposal are still there — that is
+    // the point — so the assertion is about the DISPOSITION, not about absence.
+    let settled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM coaching_proposals \
+         WHERE disposition = 'accepted' OR child_version_id IS NOT NULL \
+            OR accepted_run_id IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(settled, 0, "no accepted row and no dangling link exists");
+
+    let open = repo
+        .get_session(&id)
+        .await
+        .expect("read")
+        .expect("the session is still there");
+    match open.outcome {
+        SessionOutcome::Proposed { proposal } => {
+            assert_eq!(
+                proposal.disposition,
+                Disposition::Proposed,
+                "the proposal is exactly as open as it was"
+            );
+            assert!(
+                proposal.accept_failure.is_none(),
+                "commit_acceptance records no failure — that is `record_accept_failure`'s \
+                 job, in its own transaction"
+            );
+        }
+        other => panic!("expected the proposal back, got {other:?}"),
+    }
 }

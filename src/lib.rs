@@ -255,6 +255,19 @@ pub use cli::coach::{CoachArgs, CoachCliOutcome, CoachWiring, run_coach, run_coa
 // `scripts/check-coach-boundary.sh` is what keeps them gone.
 pub use application::coach::{CoachTurnError, CoachTurnRegistry, coach_request_fingerprint};
 
+// r1.s4.w2: the coach DECISION use case — modify / reject / accept over one
+// coaching session. Re-exported on the `run_version_backtest` precedent (the module
+// stays private and `lib.rs` curates what crosses): `tests/coach_decision.rs` drives
+// this exact function over the REAL SQLite repositories, the REAL acceptance
+// adapter, REAL `apply()` and the REAL engine, and an integration-test binary is a
+// separate crate that cannot reach a `pub(crate)` item. Nothing here is a fragment
+// the `#132` seal is about — the request carries a session id and an action, and
+// every port it names is already public.
+pub use application::coach_decision::{
+    AcceptedCoachResult, CoachAction, CoachActionKind, CoachDecisionError, CoachDecisionOutcome,
+    CoachDecisionRequest, run_coach_decision,
+};
+
 // VS-1.1.3 work-3.01: the indicator-adapter surface. `Ema` is the walking-skeleton
 // `Indicator` adapter; `decimal_to_f64`/`f64_to_decimal_rounded`/`INDICATOR_SCALE`
 // are the `Decimal↔f64` conversion seam (the ONLY place floats are allowed).
@@ -520,7 +533,11 @@ pub use domain::{ApiKey, CredentialSource, CredentialStatus};
 // REQUIRED under `deny(warnings)` + `pub(crate) mod adapters` — a new public
 // adapter type unused outside its module is a `dead_code` BUILD error, not a
 // warning (the `llm/mod.rs` re-export alone is necessary but NOT sufficient).
-pub use adapters::llm::redacting_logging::{RedactingLoggingProvider, Redactor};
+// r1.s4.w2 (#150): `Redactor` moved to `domain::redaction` — the pure text kernel
+// crossed inward so the application ring keeps ADR-0015's ONE adapters import. The
+// crate surface is unchanged: `pulse::Redactor` still resolves, to the same type.
+pub use adapters::llm::redacting_logging::RedactingLoggingProvider;
+pub use domain::Redactor;
 
 // VS-1.3.2 work-2.04: the composer agent loop surface (FR-3 / FR-4, README C7). The
 // `Composer<P>` orchestrator + `compose()` + the `ComposeOutcome` value it RETURNS +
