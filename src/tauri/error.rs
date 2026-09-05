@@ -64,7 +64,8 @@ pub enum BusErrorCode {
 
 /// The single serializable error shape that crosses the Tauri boundary.
 ///
-/// **Three fields, always all present** (r1.s3.w3 added `run_id`), so the TypeScript
+/// **Four fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
+/// added `session_id`), so the TypeScript
 /// type generated from this struct describes every error the frontend can receive and
 /// one rendering path handles all of them. An ordinary error serializes
 /// `run_id: null` — the field is never skipped, because a field that sometimes
@@ -86,6 +87,16 @@ pub struct BusError {
     /// committed: reporting an id for a row that does not exist would be worse than
     /// reporting none.
     pub run_id: Option<String>,
+    /// The coaching session this error is ABOUT, when the caller must act on that
+    /// session rather than on the one it asked under.
+    ///
+    /// `Some` on a `Busy` refusal that defers to a turn already running for this
+    /// run — the id being deferred TO. The rail's "Check again" has to reload that
+    /// session, and reloading a freshly minted id instead starts a second billable
+    /// turn, which is the opposite of what a button offering the other turn's
+    /// result promises. The message names it too; the same rule as `run_id` applies,
+    /// that a screen must not parse prose to learn an id it has to act on.
+    pub session_id: Option<String>,
 }
 
 impl BusError {
@@ -96,6 +107,7 @@ impl BusError {
             code,
             message,
             run_id: None,
+            session_id: None,
         }
     }
 
@@ -106,6 +118,18 @@ impl BusError {
             code,
             message,
             run_id: Some(run_id),
+            session_id: None,
+        }
+    }
+
+    /// The same, naming the coaching session the caller must act on (r1.s4.w3).
+    #[must_use]
+    pub fn with_session_id(code: BusErrorCode, message: String, session_id: String) -> Self {
+        Self {
+            code,
+            message,
+            run_id: None,
+            session_id: Some(session_id),
         }
     }
 

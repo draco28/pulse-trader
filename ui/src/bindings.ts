@@ -306,7 +306,8 @@ export type BacktestRunRequest = {
 /**
  *  The single serializable error shape that crosses the Tauri boundary.
  * 
- *  **Three fields, always all present** (r1.s3.w3 added `run_id`), so the TypeScript
+ *  **Four fields, always all present** (r1.s3.w3 added `run_id`; r1.s4.w3's review
+ *  added `session_id`), so the TypeScript
  *  type generated from this struct describes every error the frontend can receive and
  *  one rendering path handles all of them. An ordinary error serializes
  *  `run_id: null` — the field is never skipped, because a field that sometimes
@@ -330,6 +331,18 @@ export type BusError = {
 	 *  reporting none.
 	 */
 	run_id: string | null,
+	/**
+	 *  The coaching session this error is ABOUT, when the caller must act on that
+	 *  session rather than on the one it asked under.
+	 * 
+	 *  `Some` on a `Busy` refusal that defers to a turn already running for this
+	 *  run — the id being deferred TO. The rail's "Check again" has to reload that
+	 *  session, and reloading a freshly minted id instead starts a second billable
+	 *  turn, which is the opposite of what a button offering the other turn's
+	 *  result promises. The message names it too; the same rule as `run_id` applies,
+	 *  that a screen must not parse prose to learn an id it has to act on.
+	 */
+	session_id: string | null,
 };
 
 /**

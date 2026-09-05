@@ -79,6 +79,12 @@ fn manifest_path(rel: &str) -> std::path::PathBuf {
 // AC-4 — one serializable error shape
 // ---------------------------------------------------------------------------
 
+/// The ONE key set every `BusError` serializes to, sorted.
+///
+/// Pinned as a constant so the two places that assert it cannot drift apart, and so
+/// adding a field is a deliberate edit here rather than a quiet widening somewhere.
+const BUS_ERROR_KEYS: [&str; 4] = ["code", "message", "run_id", "session_id"];
+
 #[test]
 fn domain_error_maps_to_one_serializable_shape() {
     // Every domain error that can cross the boundary, mapped through `From`.
@@ -139,18 +145,21 @@ fn domain_error_maps_to_one_serializable_shape() {
             .as_object()
             .unwrap_or_else(|| panic!("{label} must serialize to a JSON OBJECT, got {value}"));
 
-        let mut keys: Vec<String> = object.keys().cloned().collect();
-        keys.sort();
-        // r1.s3.w3 widened the shape to {code, message, run_id}. The invariant this
-        // asserts is unchanged and, if anything, stronger: ONE key set for every
-        // error, so the frontend still renders with one code path. `run_id` is
-        // ALWAYS present rather than skipped-when-absent — a field that sometimes
-        // vanishes reaches TypeScript as `undefined` while its generated type says
-        // `string | null`, which is exactly the mismatch this clause exists to stop.
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        // r1.s3.w3 widened the shape to {code, message, run_id}; r1.s4.w3's review
+        // added `session_id` for the same reason `run_id` exists — a Busy refusal
+        // defers to a coach turn the caller must then RELOAD, and a screen that
+        // parses the id out of the prose is one rewording away from starting a
+        // second billable turn. The invariant this asserts is unchanged and, if
+        // anything, stronger: ONE key set for every error, so the frontend still
+        // renders with one code path. Both optional fields are ALWAYS present
+        // rather than skipped-when-absent — a field that sometimes vanishes reaches
+        // TypeScript as `undefined` while its generated type says `string | null`,
+        // which is exactly the mismatch this clause exists to stop.
         assert_eq!(
-            keys,
-            vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
-            "{label} must serialize to exactly {{code, message, run_id}}, got {keys:?}"
+            keys, BUS_ERROR_KEYS,
+            "{label} must serialize to exactly {BUS_ERROR_KEYS:?}, got {keys:?}"
         );
         // No DOMAIN-family error can name a persisted run: only the application
         // ring's saved-but-unreadable case knows a run id, and it is not in this set.
@@ -159,7 +168,11 @@ fn domain_error_maps_to_one_serializable_shape() {
             "{label} must carry a null run_id — only a saved-but-unreadable backtest \
              has a row to name"
         );
-        shapes.push(keys);
+        shapes.push(
+            keys.iter()
+                .map(|k| (*k).to_owned())
+                .collect::<Vec<String>>(),
+        );
 
         // `message` is the error's DISPLAY rendering, never a stringified `Debug`.
         // The cheapest reliable tell for a leaked `Debug` is Rust variant syntax:
@@ -281,11 +294,10 @@ fn the_saved_but_unreadable_case_keeps_the_one_shape_with_a_named_run() {
     );
     let value = serde_json::to_value(&saved).unwrap();
     let object = value.as_object().expect("the saved case is an object too");
-    let mut keys: Vec<String> = object.keys().cloned().collect();
-    keys.sort();
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
     assert_eq!(
-        keys,
-        vec!["code".to_owned(), "message".to_owned(), "run_id".to_owned()],
+        keys, BUS_ERROR_KEYS,
         "the saved-but-unreadable case keeps the ONE shape"
     );
     assert_eq!(

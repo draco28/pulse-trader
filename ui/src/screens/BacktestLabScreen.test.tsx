@@ -221,13 +221,13 @@ const RUN_ERROR: BusError = {
   // can only pass through the structured `run_id` field, never prose parsing.
   code: "data",
   message: "The saved run could not be read back.",
-  run_id: "run-51234",
+  run_id: "run-51234", session_id: null,
 };
 
 const CATALOG_ERROR: BusError = {
   code: "internal",
   message: "The library read failed.",
-  run_id: null,
+  run_id: null, session_id: null,
 };
 
 /** Render + wait for the catalog to land, then click Run on the seeded
@@ -1100,11 +1100,52 @@ describe("BacktestLabScreen (the coach rail)", () => {
     );
   });
 
+  it("checks the CONTESTED session when busy, never a fresh one", async () => {
+    await renderRun(SEEDED_RUN);
+    coachTurnMock.mockResolvedValue({
+      status: "error",
+      error: {
+        code: "busy",
+        message: "coach turn sess-elsewhere is already running",
+        run_id: null,
+        session_id: "sess-elsewhere",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
+    await screen.findByText(/already running/i);
+
+    // The button offers the OTHER turn's result. Asking under a fresh id would ask a
+    // new question and bill for it instead.
+    coachTurnMock.mockResolvedValue({ status: "ok", data: proposedSession() });
+    fireEvent.click(screen.getByRole("button", { name: /check again/i }));
+    await screen.findByText(/a slower RSI trades less often on this chop/i);
+    expect(coachTurnMock.mock.calls[1][0].sessionId).toBe("sess-elsewhere");
+  });
+
+  it("offers a re-run, not another ask, when the parent run has no input provenance", async () => {
+    await openRail(
+      failedSession(
+        "missing_backtest_inputs",
+        "this run predates input provenance",
+        "run this version again, then ask the coach",
+      ),
+    );
+    await screen.findByRole("button", { name: /run this version again/i });
+
+    // Asking again cannot recover this: the parent run is immutable, so it can never
+    // acquire the provenance it lacks and every re-ask records the same failure. The
+    // card offers the action its own recovery names.
+    expect(screen.queryByRole("button", { name: /ask the coach again/i })).toBeNull();
+    runMock.mockResolvedValue({ status: "ok", data: SEEDED_RUN });
+    fireEvent.click(screen.getByRole("button", { name: /run this version again/i }));
+    expect(runMock).toHaveBeenCalledTimes(2);
+  });
+
   it("gives an operational failure a recovery too, so no failure card is a dead end", async () => {
     await renderRun(SEEDED_RUN);
     coachTurnMock.mockResolvedValue({
       status: "error",
-      error: { code: "internal", message: "the provider is unreachable", run_id: null },
+      error: { code: "internal", message: "the provider is unreachable", run_id: null, session_id: null },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
 
@@ -1119,7 +1160,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await openRail(proposedSession());
     coachDecideMock.mockResolvedValue({
       status: "error",
-      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null },
+      error: { code: "validation", message: "`abc` is not a whole-number period", run_id: null, session_id: null },
     });
 
     fireEvent.click(screen.getByRole("button", { name: /^modify$/i }));
@@ -1137,7 +1178,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await renderRun(SEEDED_RUN);
     coachTurnMock.mockResolvedValue({
       status: "error",
-      error: { code: "busy", message: "a coach turn for this run is already running", run_id: null },
+      error: { code: "busy", message: "a coach turn for this run is already running", run_id: null, session_id: null },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
 
@@ -1205,7 +1246,7 @@ describe("BacktestLabScreen (the coach rail)", () => {
       error: {
         code: "busy",
         message: "a coach operation for session `sess-77` is already running",
-        run_id: null,
+        run_id: null, session_id: null,
       },
     });
 

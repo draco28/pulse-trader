@@ -146,7 +146,7 @@ type CoachOutcome =
 type RailState =
   | { kind: "idle" }
   | { kind: "running"; note: string | null }
-  | { kind: "busy"; note: string }
+  | { kind: "busy"; note: string; contested: string | null }
   | { kind: "modifying" }
   | { kind: "rejecting" }
   | { kind: "accepting" }
@@ -196,7 +196,14 @@ function railStateOf(record: OperationRecord | undefined): RailState {
   }
   if (outcome.status === "error") {
     return outcome.error.code === "busy"
-      ? { kind: "busy", note: outcome.error.message }
+      ? {
+          kind: "busy",
+          note: outcome.error.message,
+          // The id crosses as a FIELD; the message names it too, but a screen that
+          // parses prose to learn an id it must act on is one message rewording
+          // away from starting a second billable turn.
+          contested: outcome.error.session_id,
+        }
       : { kind: "failed", session: null, error: outcome.error };
   }
   // A REFUSED decision keeps its proposal: the backend rejected the edit, not the
@@ -382,7 +389,12 @@ export default function BacktestLabScreen() {
    */
   function onAskCoach() {
     if (runId === null || IN_FLIGHT_KINDS.has(rail.kind)) return;
-    const sessionId = crypto.randomUUID();
+    // A busy rail is DEFERRING to another turn. Checking again has to reload THAT
+    // session — a fresh id would ask a new question and bill for it, which is the
+    // opposite of what the button offers. Every other settled state is terminal and
+    // takes a fresh id.
+    const sessionId =
+      rail.kind === "busy" && rail.contested !== null ? rail.contested : crypto.randomUUID();
     if (rail.kind !== "idle") {
       operations.clear(coachKey(runId));
     }
@@ -515,6 +527,7 @@ export default function BacktestLabScreen() {
           <CoachRail
             state={rail}
             onAsk={onAskCoach}
+            onRun={onRun}
             onDecide={onDecide}
             onSelectChild={(id) => void onSelectChild(id)}
           />
@@ -954,11 +967,13 @@ function ChartTwins({ dto }: { dto: BacktestRunDto }) {
 function CoachRail({
   state,
   onAsk,
+  onRun,
   onDecide,
   onSelectChild,
 }: {
   state: RailState;
   onAsk: () => void;
+  onRun: () => void;
   onDecide: (action: CoachActionDto) => void;
   onSelectChild: (versionId: string) => void;
 }) {
@@ -981,6 +996,7 @@ function CoachRail({
       <CoachBody
         state={state}
         onAsk={onAsk}
+        onRun={onRun}
         onDecide={onDecide}
         onSelectChild={onSelectChild}
       />
@@ -1000,11 +1016,13 @@ const IN_FLIGHT: Record<string, string> = {
 function CoachBody({
   state,
   onAsk,
+  onRun,
   onDecide,
   onSelectChild,
 }: {
   state: RailState;
   onAsk: () => void;
+  onRun: () => void;
   onDecide: (action: CoachActionDto) => void;
   onSelectChild: (versionId: string) => void;
 }) {
@@ -1039,7 +1057,9 @@ function CoachBody({
     );
   }
   if (state.kind === "failed") {
-    return <FailureCard session={state.session} error={state.error} onAsk={onAsk} />;
+    return (
+      <FailureCard session={state.session} error={state.error} onAsk={onAsk} onRun={onRun} />
+    );
   }
   if (state.kind === "proposal") {
     return (
@@ -1074,13 +1094,22 @@ function FailureCard({
   session,
   error,
   onAsk,
+  onRun,
 }: {
   session: CoachSessionDto | null;
   error: BusError | null;
   onAsk: () => void;
+  onRun: () => void;
 }) {
   const failure = session?.failure ?? null;
   const recovery = failure?.recovery ?? "try again";
+  // `missing_backtest_inputs` is the one failure asking the coach again cannot
+  // recover from. The parent run is immutable, so it can never acquire the
+  // provenance it lacks, and every re-ask against it records the identical failure
+  // for ever. Its recovery says to run the version again, so THAT is the button it
+  // gets — an action that performs the stated recovery rather than one that
+  // contradicts it.
+  const rerun = failure?.kind === "missing_backtest_inputs";
   return (
     <div className="coach-failure" role="alert">
       <p className="coach-failure-kind mono">{failure?.kind ?? error?.code ?? "internal"}</p>
@@ -1088,9 +1117,15 @@ function FailureCard({
       <p className="coach-recovery">
         <span className="coach-recovery-label">What to do</span> {recovery}
       </p>
-      <button type="button" className="coach-retry btn-prim" onClick={onAsk}>
-        Ask the coach again
-      </button>
+      {rerun ? (
+        <button type="button" className="coach-retry btn-prim" onClick={onRun}>
+          Run this version again
+        </button>
+      ) : (
+        <button type="button" className="coach-retry btn-prim" onClick={onAsk}>
+          Ask the coach again
+        </button>
+      )}
     </div>
   );
 }

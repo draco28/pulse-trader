@@ -753,13 +753,18 @@ where
     let session_id = match pending_claim_for_run(&reload_sessions, &run_id, &SystemClock).await? {
         Some(PendingClaim::Abandoned(pending)) => pending,
         Some(PendingClaim::MaybeLive(pending)) => {
-            return Err(BusError::new(
+            // The contested id crosses as a FIELD, not only in the prose: the rail's
+            // "Check again" has to reload THAT session, and asking under a freshly
+            // minted id instead would start a second billable turn — which is the
+            // opposite of what a button offering the other turn's result promises.
+            return Err(BusError::with_session_id(
                 BusErrorCode::Busy,
                 format!(
                     "coach turn {} is already running; its result will appear here when it \
                      finishes",
                     pending.as_str()
                 ),
+                pending.as_str().to_owned(),
             ));
         }
         None => CoachingSessionId::new(request.session_id),
