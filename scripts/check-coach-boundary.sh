@@ -88,7 +88,24 @@ done < <(rust_sources)
 # `CoachTurnRegistry`, `CoachWiring` and friends are deliberately fine: they are the
 # turn's error, its registry handle and the composition root's wiring, none of which
 # can assemble a turn by hand.
-if code_of src/lib.rs | grep -E '^[[:space:]]*pub use' | grep -qE '(^|[^A-Za-z0-9_])Coach([^A-Za-z0-9_]|$)'; then
+#
+# Each `pub use` is JOINED to its terminating `;` before the match, because the
+# braced form spans lines:
+#
+#     pub use agent::{
+#         Coach,          <- not on a line beginning `pub use`
+#     };
+#
+# Matching line-by-line reads that as no re-export at all, so the gate passes on
+# exactly the shape a re-export is most likely to take.
+pub_use_statements() {
+  code_of src/lib.rs | awk '
+    /^[[:space:]]*pub[[:space:]]+use/ { collecting = 1; stmt = "" }
+    collecting { stmt = stmt " " $0 }
+    collecting && /;/ { print stmt; collecting = 0 }
+  '
+}
+if pub_use_statements | grep -qE '(^|[^A-Za-z0-9_])Coach([^A-Za-z0-9_]|$)'; then
   fail "src/lib.rs re-exports the bare \`Coach\` type — the sealed turn is reached through \`run_coach_with\`, and an exported \`Coach\` restores the fragment surface #132 names"
 fi
 

@@ -1256,9 +1256,10 @@ async fn an_open_proposal_cannot_be_given_an_accepted_run_id() {
             "a `{label}` proposal must not name an accepted run"
         );
 
-        // The symmetric half: clearing the run link off an accepted row is refused
-        // by the same CHECK (the transition trigger would also refuse it, so this
-        // pair is what tells the two apart).
+        // And the refusal wrote NOTHING. A statement that errors has still run, so
+        // "the UPDATE returned an error" and "the row is unchanged" are two separate
+        // facts; reading the link back is what makes the second one checkable rather
+        // than assumed.
         let read_back: Option<String> =
             sqlx::query_scalar("SELECT accepted_run_id FROM coaching_proposals WHERE id=?1")
                 .bind(&proposal)

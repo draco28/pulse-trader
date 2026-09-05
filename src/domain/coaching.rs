@@ -86,10 +86,10 @@ pub enum CoachingError {
     /// a proposal's clothes.
     #[error("a proposal's hypothesis must not be empty or whitespace-only")]
     EmptyHypothesis,
-    /// A [`CoachRequestFingerprint`] was empty or whitespace-only (r1.s4.w4). A
-    /// claim keyed on nothing is a row no later call can ever match, so the
-    /// single-flight guarantee the fingerprint exists to provide would silently
-    /// not hold — and `0008`'s `CHECK` refuses the shape anyway.
+    /// A [`CoachRequestFingerprint`] was empty or whitespace-only (r1.s4.w4). An
+    /// empty digest matches every later request, so the mismatched-reuse refusal the
+    /// fingerprint exists to provide would silently not hold — and `0008`'s `CHECK`
+    /// refuses the shape anyway.
     #[error("a coach request fingerprint must not be empty or whitespace-only")]
     EmptyRequestFingerprint,
     /// A disposition transition the state machine does not allow.
@@ -149,8 +149,17 @@ impl From<Hypothesis> for String {
     }
 }
 
-/// The single-flight key for one coach turn — an **opaque** digest of everything
-/// the turn's request is made of (r1.s4.w4).
+/// An **opaque** digest of everything one coach turn's request is made of
+/// (r1.s4.w4).
+///
+/// **It is not the single-flight key, and nothing looks a session up by it.** The
+/// single-flight key is the SESSION ID: `claim_session` inserts on that id, the
+/// process-local registry holds that id, and two clicks that reuse one session id
+/// meet `Busy`/`TurnInFlight` with one billing. What the fingerprint does is detect
+/// a MISMATCHED reuse — the same session id arriving with a different request — and
+/// refuse it, so an idempotent retry cannot quietly become a second, different
+/// question billed against the first one's row. There is no unique index on it and
+/// no lookup by it; it is compared, never searched.
 ///
 /// `w1` computes it: a lowercase SHA-256 over an explicit ordered feed in
 /// ADR-0010's length-prefixed style — one element each for the resolved prompt, the
@@ -464,10 +473,19 @@ pub enum CoachFailure {
         /// How many of them named `propose_mutation`.
         propose_mutation_count: u32,
     },
-    /// The tool call arrived but its arguments did not parse into a [`Mutation`].
-    #[error("the coach's propose_mutation arguments were malformed: {detail}")]
+    /// A tool call arrived that this turn could not make sense of: arguments that
+    /// did not parse, a field that failed its own validation, or a tool name the
+    /// coach does not advertise.
+    ///
+    /// **The message names no tool, deliberately.** Since r1.s4.w1 there are two
+    /// advertised tools and a third case — the unknown name — and a Display that
+    /// says `propose_mutation` reports the wrong tool for two of the three. Which
+    /// one it was is in `detail`, written by the site that knows. The persisted
+    /// `failure_kind` tag is unchanged (`malformed_arguments`); this is what the
+    /// text says, not what the row stores.
+    #[error("the coach's tool call was malformed: {detail}")]
     MalformedArguments {
-        /// What was wrong with the arguments.
+        /// What was wrong, including which tool it was about.
         detail: String,
     },
     /// The proposed mutation does not apply to the version's DSL — the w1

@@ -204,6 +204,27 @@ pub enum CoachDecisionError {
         source: MutationError,
     },
 
+    /// The accept failed AND recording that failure failed too.
+    ///
+    /// Both halves are carried because each answers a different question and the
+    /// second one erases the first if it is allowed to. The store error says why
+    /// nothing could be written down; the stage and message say what actually went
+    /// wrong with the accept — which is the half the trader needs and the half a
+    /// bare `Data(..)` would drop on the floor. Nothing is on record after this, so
+    /// the message is the only account of it that exists.
+    #[error(
+        "the accept failed at `{stage}` ({detail}), and recording that failure failed too: {source}"
+    )]
+    FailureUnrecordable {
+        /// Where the accept stopped.
+        stage: AcceptFailureStage,
+        /// What went wrong there, verbatim.
+        detail: String,
+        /// Why it could not be written down.
+        #[source]
+        source: DataError,
+    },
+
     /// The store failed.
     #[error("{0}")]
     Data(#[from] DataError),
@@ -747,17 +768,26 @@ async fn record_failure<A>(
 where
     A: CoachAcceptanceRepository,
 {
-    let proposal = acceptance
-        .record_accept_failure(
-            session_id,
-            CoachAcceptFailure {
-                stage,
-                message,
-                subject,
-            },
-        )
-        .await?;
-    Ok(CoachDecisionOutcome::AcceptFailed(proposal))
+    // A DOUBLE FAULT carries both halves. `?` here would return only the store's
+    // error, and the accept's own stage and message — the half that says what
+    // actually went wrong, and the only account of it that will exist, since
+    // nothing was written — would be gone.
+    let failure = CoachAcceptFailure {
+        stage,
+        message,
+        subject,
+    };
+    match acceptance
+        .record_accept_failure(session_id, failure.clone())
+        .await
+    {
+        Ok(proposal) => Ok(CoachDecisionOutcome::AcceptFailed(proposal)),
+        Err(source) => Err(CoachDecisionError::FailureUnrecordable {
+            stage: failure.stage,
+            detail: failure.message,
+            source,
+        }),
+    }
 }
 
 /// The coached version's DSL — the ONE document a mutation is applied to.

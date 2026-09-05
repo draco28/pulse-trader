@@ -156,6 +156,25 @@ pub(crate) enum AttributedCallError {
         /// How many ids appeared for the one call.
         seen: usize,
     },
+    /// The capture buffer is SHORTER than it was when the call began.
+    ///
+    /// Only clearing or replacing the buffer mid-call does that, and it means the
+    /// ids this call minted are gone. Reading the shrunk buffer as "no rows
+    /// appeared" would put `llm_call_id = NULL` on a turn that reached the provider
+    /// and was billed — the same false record [`LedgerRowMissing`] refuses, arrived
+    /// at by losing the evidence instead of never having it.
+    ///
+    /// [`LedgerRowMissing`]: AttributedCallError::LedgerRowMissing
+    #[error(
+        "the capture buffer shrank during the call (was {start}, now {len}): the ids this turn \
+         minted are gone, so no honest attribution is available"
+    )]
+    CaptureBufferShrank {
+        /// Where the buffer stood when the call began.
+        start: usize,
+        /// Where it stands now.
+        len: usize,
+    },
 }
 
 #[cfg(test)]

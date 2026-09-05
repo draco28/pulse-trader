@@ -689,7 +689,14 @@ where
 fn attribution_error(error: AttributedCallError) -> CoachTurnError {
     match error {
         AttributedCallError::Provider { error, .. } => CoachTurnError::LocalFault(error),
-        AttributedCallError::LedgerRowMissing => CoachTurnError::LedgerRowMissing,
+        // Both land on `LedgerRowMissing`, and the shared arm is the honest shape:
+        // the turn reached the provider and cannot say which ledger row is its own.
+        // A shrunk buffer gets there by LOSING the ids this call minted rather than
+        // by never capturing one, but the consequence — and what a caller may do
+        // about it — is identical, and the distinction survives in the source error.
+        AttributedCallError::LedgerRowMissing | AttributedCallError::CaptureBufferShrank { .. } => {
+            CoachTurnError::LedgerRowMissing
+        }
         AttributedCallError::LedgerRowsAmbiguous { seen } => {
             CoachTurnError::LedgerRowsAmbiguous { seen }
         }

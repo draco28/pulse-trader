@@ -21,7 +21,8 @@
 //! - [`classify`], the decision table that turns one response's tool calls into a
 //!   [`Proposal`], a recorded structural-advice answer, or one typed
 //!   [`CoachFailure`];
-//! - the tool-argument scrubber [`redact_json`], which runs BEFORE parsing so every
+//! - the tool-argument scrub (the domain redactor's own `redact_value`), which
+//!   runs BEFORE parsing so every
 //!   value derived from the arguments is scrubbed at once.
 //!
 //! **One provider call, and every deviation is terminal** (grill L3). Zero tool
@@ -209,7 +210,12 @@ pub(crate) fn classify(
     // stored domain value, the recorded intent/evidence, the path, and any serde
     // error text quoting the input — is derived from this value, so scrubbing here
     // covers all of them at once.
-    let arguments = redact_json(redactor, call.arguments);
+    // The domain kernel's own recursive scrubber, not a second copy of it: numbers
+    // stay untouched (the VS-1.3.1 rule — "strip any number" nukes the context that
+    // makes a proposal readable) and object keys are structural, so only the values
+    // a model writes prose into are rewritten. Two implementations of that rule
+    // would diverge, and the one that drifts is the one nobody is testing.
+    let arguments = redactor.redact_value(&call.arguments);
 
     match name.as_str() {
         PROPOSE_MUTATION_TOOL => classify_proposal(redactor, dsl, arguments),
@@ -308,27 +314,4 @@ fn bounded_field(name: &str, value: &str) -> Result<String, CoachFailure> {
         });
     }
     Ok(trimmed.to_owned())
-}
-
-/// Recursively scrub every string leaf of a tool-argument value.
-///
-/// Numbers are never touched (the VS-1.3.1 rule: a "strip any number" rule nukes
-/// the context that makes a proposal readable), and object keys are structural, so
-/// only the values a model actually writes prose into are rewritten.
-fn redact_json(redactor: &Redactor, value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => serde_json::Value::String(redactor.redact(&text)),
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .into_iter()
-                .map(|item| redact_json(redactor, item))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(key, val)| (key, redact_json(redactor, val)))
-                .collect(),
-        ),
-        other => other,
-    }
 }

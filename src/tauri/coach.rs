@@ -578,9 +578,14 @@ fn turn_failure(error: &CoachTurnError) -> BusError {
 /// on the proposal card, not an error.
 fn decision_failure(error: &CoachDecisionError) -> BusError {
     let code = match error {
+        // `FailureUnrecordable` is a STORE failure that also carries what the accept
+        // was failing at, so it codes with the store errors. Its message is the only
+        // account of that reason there is — nothing reached a row — which is why it
+        // reaches the rail whole rather than being flattened to "data error".
         CoachDecisionError::SessionNotFound(_)
         | CoachDecisionError::NoProposal(_)
         | CoachDecisionError::ParentVersionMissing(_)
+        | CoachDecisionError::FailureUnrecordable { .. }
         | CoachDecisionError::Data(_) => BusErrorCode::Data,
         CoachDecisionError::NotActionable { .. }
         | CoachDecisionError::InapplicableMutation { .. } => BusErrorCode::Validation,

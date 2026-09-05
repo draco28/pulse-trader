@@ -65,9 +65,20 @@ impl<P> AttributedProvider<P> {
     }
 
     /// The ids that appeared since `start`, in order.
-    fn ids_since(&self, start: usize) -> Vec<LlmCallId> {
+    ///
+    /// A buffer SHORTER than `start` is an error, not an empty slice. `get(start..)`
+    /// returns `None` there, and defaulting that to "no ids" reports a call that
+    /// reached the provider as having minted no ledger row — `llm_call_id = NULL` on
+    /// a turn that was made and billed, which is the same false record
+    /// `LedgerRowMissing` exists to refuse.
+    fn ids_since(&self, start: usize) -> Result<Vec<LlmCallId>, AttributedCallError> {
         let guard = self.captured.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.get(start..).unwrap_or_default().to_vec()
+        guard.get(start..).map(<[LlmCallId]>::to_vec).ok_or(
+            AttributedCallError::CaptureBufferShrank {
+                start,
+                len: guard.len(),
+            },
+        )
     }
 
     /// Record where the buffer stood as this call began.
@@ -90,7 +101,7 @@ impl<P> AttributedProvider<P> {
     /// response. Zero is legitimate (a timeout can strike before the decorator
     /// writes; a transport fault produces nothing to price); several never is.
     fn at_most_one(&self, start: usize) -> Result<Option<LlmCallId>, AttributedCallError> {
-        let mut ids = self.ids_since(start);
+        let mut ids = self.ids_since(start)?;
         match ids.len() {
             0 => Ok(None),
             1 => Ok(Some(ids.remove(0))),
@@ -113,7 +124,7 @@ impl<P: LlmProvider + Sync> AttributedCoachProvider for AttributedProvider<P> {
             Ok(response) => {
                 // A turn that got a USABLE RESPONSE names exactly one ledger row, or
                 // it is a wiring fault and not a coaching outcome.
-                let mut ids = self.ids_since(start);
+                let mut ids = self.ids_since(start)?;
                 match ids.len() {
                     1 => Ok(AttributedCall {
                         response,

@@ -672,14 +672,12 @@ pub trait CoachingRepository {
     /// Dormant in `r1.s2`: `w2` writes only the `Proposed` state, and `r1.s4`'s
     /// rail is what drives the rest.
     ///
-    /// **It settles a proposal; it does not edit one.** The two writable targets
-    /// are [`Disposition::Accepted`] and [`Disposition::Rejected`], and the write
-    /// is CONDITIONAL on the proposal still being open (`proposed` or `modified`) —
-    /// the state machine in [`Proposal::transition`](crate::domain::Proposal)
-    /// enforced where the row actually changes, so a settled proposal cannot be
-    /// re-pointed at a second child version. Replaying the IDENTICAL write is a
-    /// no-op (the session id is the accept idempotency key); replaying an accept
-    /// with a different child version is an error.
+    /// **It settles a proposal; it does not edit one.** Since r1.s4.w2 the one
+    /// writable target is [`Disposition::Rejected`] — the two refusals below say why
+    /// the others are not — and the write is CONDITIONAL on the proposal still being
+    /// open (`proposed` or `modified`), which is the state machine in
+    /// [`Proposal::transition`](crate::domain::Proposal) enforced where the row
+    /// actually changes. Replaying the identical rejection is a no-op.
     ///
     /// [`Disposition::Modified`] is refused here on purpose: a modify replaces the
     /// proposal's stored mutation, and this operation writes only the disposition
