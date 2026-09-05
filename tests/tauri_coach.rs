@@ -785,6 +785,54 @@ async fn modify_stores_the_traders_own_value_and_returns_the_durable_state() {
     }
 }
 
+/// A modify edits THIS proposal's value; it does not re-target the mutation.
+///
+/// The new value is parsed against the kind of the leaf the PROPOSAL names, so a
+/// caller-supplied different path would have its value parsed against the wrong
+/// leaf's type and stored under a path nothing validated it for.
+#[tokio::test]
+async fn modify_refuses_a_path_that_is_not_the_proposals_own() {
+    let world = world().await;
+    let state = world.state().await;
+    let session = world.seed_proposed_session("sess-modify-path", 21).await;
+
+    let error = coach_decide_core(
+        &state,
+        decision_request(
+            &session,
+            CoachActionDto::Modify {
+                path: "exits.0.distance_pct".to_owned(),
+                new_value: "9".to_owned(),
+            },
+        ),
+    )
+    .await
+    .expect_err("a modify may not re-target the mutation");
+    assert!(
+        error.message.contains(RSI_PERIOD),
+        "the refusal names the leaf this proposal actually changes: {}",
+        error.message
+    );
+
+    // Nothing was written: the proposal still carries its original value.
+    let stored = world
+        .sessions()
+        .await
+        .get_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    match stored.outcome {
+        SessionOutcome::Proposed { proposal } => match proposal.mutation {
+            Mutation::SetParam { path, new_value } => {
+                assert_eq!(path, RSI_PERIOD);
+                assert_eq!(new_value, ParamValue::Period { value: 21 });
+            }
+        },
+        other => panic!("expected an untouched proposal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn reject_is_terminal_and_mints_neither_a_child_nor_a_run() {
     let world = world().await;

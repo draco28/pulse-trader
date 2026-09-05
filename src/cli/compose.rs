@@ -33,7 +33,7 @@
 //! persisted ledger timestamp single-sourced.
 //!
 //! **One shared `LlmCallCapture` buffer.** ONE `Arc<Mutex<Vec<LlmCallId>>>` is wired
-//! into BOTH the [`CapturingRepo`](super::llm::CapturingRepo) (which pushes each
+//! into BOTH the [`CapturingRepo`](crate::adapters::llm::capturing::CapturingRepo) (which pushes each
 //! minted id as the decorator writes an `LlmCall`) AND [`Composer::new`], so the
 //! composer reads its run's provenance ids back after the loop.
 //!
@@ -68,7 +68,7 @@ use crate::domain::{
     LlmProvider, PriceTable, StrategyRepository,
 };
 
-use super::llm::CapturingRepo;
+use crate::adapters::llm::capturing::CapturingRepo;
 
 /// The FALLBACK Ollama Cloud model id the composer drives when the config
 /// `[llm].model` is absent (README C2/C8). A model-id STRING (not a price literal)

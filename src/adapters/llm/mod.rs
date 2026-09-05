@@ -12,3 +12,8 @@ pub mod redacting_logging;
 // response and the ledger row it minted together instead of a provider and a
 // capture handle it has to pair correctly.
 pub(crate) mod attributed;
+// r1.s4.w2 (#150's neighbour, close-review C2): the ledger capture decorator. It
+// is an adapter over the `LlmCallRepository` port and now lives with the other
+// adapters, so the Tauri ring no longer reaches into `mod cli` — the debug surface
+// — for a type the product path needs.
+pub(crate) mod capturing;

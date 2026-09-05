@@ -64,7 +64,7 @@ use crate::domain::{
     PriceTable, SessionOutcome,
 };
 
-use super::llm::CapturingRepo;
+use crate::adapters::llm::capturing::CapturingRepo;
 
 /// `pulse coach <RUN_ID> [--db <path>]`.
 #[derive(Debug, clap::Args)]

@@ -48,6 +48,7 @@ use crate::adapters::broker::BinanceAdapter;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::db::{SqliteCoachAcceptanceRepo, SqliteCoachTurnSource, SqliteCoachingRepo};
 use crate::adapters::llm::attributed::AttributedProvider;
+use crate::adapters::llm::capturing::CapturingRepo;
 use crate::adapters::llm::redacting_logging::RedactingLoggingProvider;
 use crate::agent::{DEFAULT_MAX_DSL_BYTES, DEFAULT_TURN_TIMEOUT};
 use crate::application::coach::{
@@ -57,7 +58,6 @@ use crate::application::coach_decision::{
     AcceptedCoachResult, CoachAction, CoachDecisionError, CoachDecisionOutcome,
     CoachDecisionRequest, run_coach_decision,
 };
-use crate::cli::llm::CapturingRepo;
 use crate::domain::backtest::SummaryStats;
 use crate::domain::strategy::CreatedBy;
 use crate::domain::{
@@ -495,8 +495,13 @@ async fn session_dto<L: LlmCallRepository>(
     // that names no row, or whose row cannot be read, shows neither rather than a
     // half-pair — a cost with no prompt beside it invites the reader to assume the
     // current one.
+    // A read FAILURE degrades exactly as a missing row does. `?` here would abort the
+    // whole projection over a price lookup and the rail would show nothing at all —
+    // no proposal, no recorded failure — for a turn that happened and is on record.
+    // The outcome is what this surface exists to show; the cost is a detail beside
+    // it, and losing the detail must not lose the thing.
     let ledger_row = match session.llm_call_id.as_ref() {
-        Some(call_id) => ledger.get_call(call_id).await?,
+        Some(call_id) => ledger.get_call(call_id).await.unwrap_or(None),
         None => None,
     };
     let (cost, prompt_version) = match ledger_row {
@@ -815,8 +820,26 @@ async fn decode_action<Q: CoachingRepository>(
                 ));
             };
             let Mutation::SetParam {
-                new_value: current, ..
+                path: proposal_path,
+                new_value: current,
             } = &proposal.mutation;
+
+            // A modify EDITS THIS PROPOSAL'S VALUE. It does not re-target the
+            // mutation at another leaf, and the two halves have to agree about
+            // which leaf that is: the value below is parsed against the kind of the
+            // leaf the PROPOSAL names, so accepting a caller's different path would
+            // parse the new value against the wrong leaf's type and store the result
+            // under a path nothing validated it for.
+            if &path != proposal_path {
+                return Err(BusError::new(
+                    BusErrorCode::Validation,
+                    format!(
+                        "this proposal changes `{proposal_path}`; a modify edits that value \
+                         rather than re-targeting the mutation at `{path}`"
+                    ),
+                ));
+            }
+
             let parsed = match current.kind() {
                 ParamKind::Period => new_value
                     .trim()
@@ -837,8 +860,10 @@ async fn decode_action<Q: CoachingRepository>(
                         )
                     })?,
             };
+            // The PROPOSAL's path, now proven equal to the caller's — the one the
+            // kind above was read from, so the path and the value cannot disagree.
             Ok(CoachAction::Modify(Mutation::SetParam {
-                path,
+                path: proposal_path.clone(),
                 new_value: parsed,
             }))
         }
