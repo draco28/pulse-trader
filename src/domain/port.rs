@@ -36,13 +36,13 @@ use crate::domain::backtest::{
 use crate::domain::candle::Candle;
 use crate::domain::coaching::{
     AcceptedCoachOutcome, CoachAcceptFailure, CoachSessionClaim, CoachSessionClaimResult,
-    CoachingSession, CoachingSessionId, Disposition, InitialCoachOutcome, PreparedCoachAcceptance,
-    Proposal,
+    CoachTurnProjection, CoachingSession, CoachingSessionId, Disposition, InitialCoachOutcome,
+    PreparedCoachAcceptance, Proposal,
 };
 use crate::domain::error::DataError;
 use crate::domain::exchange::ExchangeError;
 use crate::domain::llm::{LlmConfig, LlmError, LlmResponse, Message, ToolDefinition};
-use crate::domain::llm_call::{LlmCall, LlmCallId};
+use crate::domain::llm_call::{AttributedCall, AttributedCallError, LlmCall, LlmCallId};
 use crate::domain::pair::Pair;
 use crate::domain::series::{CandleSeries, StoredCandleSeries};
 use crate::domain::sizing::SymbolFilters;
@@ -766,6 +766,72 @@ pub trait CoachAcceptanceRepository {
         &self,
         acceptance: PreparedCoachAcceptance,
     ) -> impl Future<Output = Result<AcceptedCoachOutcome, DataError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// The coach turn's two ports (r1.s4.w1)
+// ---------------------------------------------------------------------------
+
+/// The projection port: one run id in, one consistent projection out.
+///
+/// The consistency is structural, not conventional. The application ring asks for a
+/// run by id and receives the run, its complete ordered trade set and THE VERSION
+/// THAT RUN NAMES together, read under one snapshot — so a caller cannot pair a run
+/// with a version it was not produced against, cannot substitute another run's
+/// trades, and cannot truncate the set. It has no such input. That is `#132`'s first
+/// false audit row made unconstructible.
+///
+/// `pub(crate)`: the sealed coach turn is a crate-internal use case, and nothing
+/// outside this crate implements or names the port (ADR-0015).
+pub(crate) trait CoachTurnSource {
+    /// Load the projection for `run_id`, or `Ok(None)` when no such run exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when the run, its trades or its version cannot be read
+    /// — including the fail-closed integrity and schema checks the repositories
+    /// already apply.
+    fn load_coach_turn(
+        &self,
+        run_id: &BacktestRunId,
+    ) -> impl Future<Output = Result<Option<CoachTurnProjection>, DataError>> + Send;
+}
+
+/// The provider port the sealed turn speaks to: it returns the response and the
+/// ledger row TOGETHER, so a session can never name a row another turn produced.
+///
+/// The production implementation composes the redacting/logging decorator and the
+/// capture buffer inside ONE adapter built by the composition root — the module
+/// never receives a provider and a capture handle separately, which is the pairing
+/// obligation `#132` showed a caller can get wrong.
+///
+/// `pub(crate)` for the same reason as [`CoachTurnSource`].
+pub(crate) trait AttributedCoachProvider {
+    /// Make the one call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttributedCallError`] for a transport or local fault, and for a
+    /// usable response this adapter cannot attribute to exactly one ledger row.
+    fn attributed_chat(
+        &self,
+        messages: Vec<Message>,
+        tools: &[ToolDefinition],
+        config: &LlmConfig,
+    ) -> impl Future<Output = Result<AttributedCall, AttributedCallError>> + Send;
+
+    /// The ledger row the LAST attempt correlated, when the call itself never
+    /// returned — the timeout path, where the future is cancelled mid-flight.
+    ///
+    /// Zero is legitimate here and only here: a timeout can strike before the
+    /// decorator writes, and recording `NULL` for a call that was billed would be as
+    /// dishonest as inventing an id. Several is legitimate nowhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttributedCallError::LedgerRowsAmbiguous`] when the cancelled
+    /// attempt correlated more than one row.
+    fn attempted_call_id(&self) -> Result<Option<LlmCallId>, AttributedCallError>;
 }
 
 #[cfg(test)]

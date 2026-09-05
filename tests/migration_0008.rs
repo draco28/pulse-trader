@@ -1350,7 +1350,9 @@ impl LossySeed {
                     "failed",
                     None,
                     Some("inapplicable_advice"),
-                    Some(r#"{"type":"inapplicable_advice","advice":"add an ADX filter"}"#),
+                    Some(
+                        r#"{"type":"inapplicable_advice","intent":"add an ADX filter","evidence":"ranging losses"}"#,
+                    ),
                     None,
                 )
                 .await

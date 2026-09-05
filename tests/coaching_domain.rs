@@ -203,8 +203,12 @@ fn every_failure_case() -> Vec<(CoachFailure, &'static str)> {
         // recorded reason has to carry: the advice a trader would otherwise lose,
         // the input that went missing, and what is known about the abandoned claim.
         (
+            // r1.s4.w1 (#131): the payload became `intent` + `evidence` when the
+            // `record_inapplicable` tool that produces it landed. The needle stays
+            // the ADVICE ITSELF — the thing a trader would otherwise lose.
             CoachFailure::InapplicableAdvice {
-                advice: "add an ADX filter above 25".to_owned(),
+                intent: "add an ADX filter above 25".to_owned(),
+                evidence: "most losses are in the ranging regime".to_owned(),
             },
             "add an ADX filter above 25",
         ),

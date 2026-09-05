@@ -264,8 +264,12 @@ fn every_failure_variant() -> Vec<CoachFailure> {
             detail: "HTTP 503 from upstream".to_owned(),
         },
         // r1.s4.w4 — the three `0008` adds.
+        // r1.s4.w1 (#131): two fields now — what the coach wanted to change, and
+        // which observed numbers motivated it. A serde-JSON payload column, so this
+        // is a payload change and not a schema one.
         CoachFailure::InapplicableAdvice {
-            advice: "add an ADX filter above 25".to_owned(),
+            intent: "add an ADX filter above 25".to_owned(),
+            evidence: "most losing trades opened in the ranging regime".to_owned(),
         },
         CoachFailure::MissingBacktestInputs {
             detail: "the parent run's primary snapshot `v-primary` is not in the store".to_owned(),

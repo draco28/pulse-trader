@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::llm::{LlmBackend, Message};
+use super::llm::{LlmBackend, LlmError, LlmResponse, Message};
 use super::secret::CredentialSource;
 use super::strategy::CreatedBy;
 
@@ -106,6 +106,56 @@ pub struct LlmCall {
     /// `key_source` has it, and the same reason `LLM_CALL_SCHEMA_VERSION` stays 1.
     #[serde(default)]
     pub prompt_version: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// The attributed call (r1.s4.w1)
+// ---------------------------------------------------------------------------
+
+/// One response, and the exact ledger row that call minted — learned together.
+///
+/// The pair is what makes a coach turn attributable: a session that names an
+/// [`LlmCallId`] some OTHER call produced is individually valid and collectively
+/// false, which is `#132`'s complaint. Returned by
+/// [`AttributedCoachProvider`](crate::domain::port::AttributedCoachProvider).
+pub(crate) struct AttributedCall {
+    /// The model's answer.
+    pub(crate) response: LlmResponse,
+    /// The `LlmCall` row the decorator persisted for THIS call.
+    pub(crate) llm_call_id: LlmCallId,
+}
+
+/// Why an attributed call produced no `(response, ledger row)` pair.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttributedCallError {
+    /// The call returned an error. `llm_call_id` is `Some` when the decorator still
+    /// managed to write a row for the attempt — a transport fault can be billed.
+    #[error("{error}")]
+    Provider {
+        /// What went wrong. [`LlmError::Provider`] is a TRANSPORT fault (a recorded
+        /// coaching outcome); the other two are this process faulting on the call
+        /// path and are not coaching outcomes at all (PR #128, finding 5).
+        error: LlmError,
+        /// The ledger row the attempt minted, if any.
+        llm_call_id: Option<LlmCallId>,
+    },
+    /// A usable response came back and NO ledger row appeared for it.
+    ///
+    /// `llm_call_id = NULL` on a post-call session says no row was correlated to a
+    /// turn that was made and billed — a false record, so the turn refuses instead
+    /// (PR #128, finding G1).
+    #[error(
+        "the coach turn reached the provider but captured no ledger row: the provider or the \
+         capture handle is not the one the ledger decorator writes through"
+    )]
+    LedgerRowMissing,
+    /// Several ledger rows appeared for one call. One turn is one call is one row;
+    /// no choice among several is honest.
+    #[error("the coach turn captured {seen} ledger rows; one turn is one call is one row")]
+    LedgerRowsAmbiguous {
+        /// How many ids appeared for the one call.
+        seen: usize,
+    },
 }
 
 #[cfg(test)]
