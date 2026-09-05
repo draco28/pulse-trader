@@ -21,17 +21,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pulse::{
     AcceptFailureStage, BacktestConfig, BacktestInputs, BacktestRequest, BacktestResult,
-    BacktestRunId, BacktestRunRepository, BinanceAdapter, CandleStore, CoachAction,
-    CoachDecisionError, CoachDecisionOutcome, CoachDecisionRequest, CoachRequestFingerprint,
-    CoachSessionClaim, CoachingRepository, CoachingSessionId, CreatedBy, DataError, Db,
-    Disposition, ExchangeAdapter, ExchangeError, FakeClock, Hypothesis, InitialCoachOutcome,
-    LlmCallId, MIGRATOR, Mutation, NewVersion, Pair, ParamValue, PersistedRun, Proposal,
-    ReadBackFailure, RunSummary, SeqIdSource, SessionOutcome, SqliteBacktestRunRepo,
+    BacktestRunId, BacktestRunRepository, BinanceAdapter, CandleSeriesRepository, CandleStore,
+    CoachAction, CoachDecisionError, CoachDecisionOutcome, CoachDecisionRequest,
+    CoachRequestFingerprint, CoachSessionClaim, CoachingRepository, CoachingSessionId, CreatedBy,
+    DataError, Db, Disposition, ExchangeAdapter, ExchangeError, FakeClock, Hypothesis,
+    InitialCoachOutcome, LlmCallId, MIGRATOR, Mutation, NewVersion, Pair, ParamValue, PersistedRun,
+    Proposal, ReadBackFailure, RunSummary, SeqIdSource, SessionOutcome, SqliteBacktestRunRepo,
     SqliteCoachAcceptanceRepo, SqliteCoachingRepo, SqliteStrategyRepo, StrategyDsl,
     StrategyRepository, SummaryStats, SymbolFilters, Timeframe, VersionId, run_coach_decision,
     run_version_backtest,
@@ -74,6 +74,20 @@ const MINIMAL_DSL: &str = r#"{
 
 fn manifest(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+/// Recursively copy `from` to `to`, so a test owns a writable candle store.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create the store copy");
+    for entry in std::fs::read_dir(from).expect("read the fixture store") {
+        let entry = entry.expect("a fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a fixture file");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +198,45 @@ impl World {
         self.db.pool()
     }
 
+    /// Repoint the parent run's primary snapshot at a GAPPED copy of itself.
+    ///
+    /// One candle is removed from the middle, so the series stays sorted and
+    /// non-empty — the two conditions the accept path used to check — and gains
+    /// exactly one spacing gap. The store commits it happily (a gap is reported by
+    /// `validate`, not refused by it), which is precisely why the accept path has to
+    /// do the refusing itself.
+    async fn gap_primary_snapshot(&self) {
+        let pair = Pair::new("BTCUSDT");
+        let stored = self
+            .store
+            .load_version(
+                &pair,
+                Timeframe::M15,
+                &self.parent_inputs.primary.data_version,
+            )
+            .expect("the parent's primary snapshot is in the store");
+
+        let mut candles = stored.series.candles.clone();
+        assert!(
+            candles.len() > 4,
+            "the fixture needs enough bars to punch a hole in"
+        );
+        let hole = candles.len() / 2;
+        candles.remove(hole);
+
+        let gapped = self
+            .store
+            .commit(&pair, Timeframe::M15, candles)
+            .expect("the store commits a gapped series — it reports gaps, it does not refuse them");
+
+        repoint_parent_primary_snapshot(
+            self.pool(),
+            &self.parent_run_id,
+            gapped.series.version.as_str(),
+        )
+        .await;
+    }
+
     fn strategies(&self) -> SqliteStrategyRepo<pulse::SystemClock> {
         SqliteStrategyRepo::new(self.pool().clone())
     }
@@ -271,7 +324,14 @@ async fn world_with_dsl(dsl_json: &str) -> World {
         .await
         .expect("create version");
 
-    let store = CandleStore::with_base_dir(manifest(FIXTURE_STORE));
+    // The fixture store is COPIED into the temp dir rather than opened in place: a
+    // test that needs an awkward snapshot (a gapped one, below) has to commit it
+    // somewhere, and committing into `tests/fixtures/` would edit the repository's
+    // own fixture out from under every other test. The copy is 260K and the data is
+    // byte-identical, so nothing else about these tests changes.
+    let store_dir = tmp.path().join("candles");
+    copy_dir(&manifest(FIXTURE_STORE), &store_dir);
+    let store = CandleStore::with_base_dir(store_dir);
     let runs = SqliteBacktestRunRepo::new(db.pool().clone());
 
     // The PARENT run is a real backtest over the fixture, so its persisted inputs
@@ -860,6 +920,83 @@ async fn a_missing_snapshot_records_load_snapshots_and_never_touches_the_exchang
     );
 }
 
+/// A gapped snapshot is refused here exactly as the standalone path refuses it.
+///
+/// The engine and the indicator stream assume contiguous bars and neither detects
+/// nor fills a hole, so running the child on a gapped series would persist a
+/// summary skewed by the hole and then show it beside its parent as the mutation's
+/// effect. `backtest.rs` refuses the same series loudly; an accept replays the
+/// parent's inputs, so it owes the parent's guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gapped_snapshot_records_load_snapshots_and_mints_no_child() {
+    let world = world().await;
+    let exchange = CountingExchange::default();
+
+    // Punch one candle out of the middle of the primary snapshot the parent names.
+    // The series stays sorted and non-empty — the two conditions the accept path
+    // used to check — and gains exactly one spacing gap.
+    world.gap_primary_snapshot().await;
+
+    let outcome = decide_with_exchange(&world, CoachAction::Accept, &exchange)
+        .await
+        .expect("a recorded failure is an outcome, not an error");
+
+    assert_accept_failed(&outcome, AcceptFailureStage::LoadSnapshots);
+    assert_eq!(
+        exchange.calls(),
+        0,
+        "a gapped snapshot is recorded, never re-fetched"
+    );
+    assert_eq!(world.version_count().await, 1, "no child was minted");
+    assert_eq!(
+        world.settled_proposal_count().await,
+        0,
+        "no settled row exists"
+    );
+}
+
+/// A parent produced by a different engine build refuses the accept.
+///
+/// The rail shows the two summaries side by side as before/after, so a delta the
+/// engine caused would be read as the coach's change. The standalone path compares
+/// the same two fingerprints; here the comparison IS the product, so a mismatch
+/// refuses rather than warns — and it refuses before the commit, so no child exists
+/// to mislead anyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_from_another_engine_build_refuses_the_accept() {
+    let world = world().await;
+    repoint_parent_engine_fingerprint(
+        world.pool(),
+        &world.parent_run_id,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .await;
+
+    let outcome = decide(&world, CoachAction::Accept)
+        .await
+        .expect("a recorded failure is an outcome, not an error");
+
+    assert_accept_failed(&outcome, AcceptFailureStage::Backtest);
+    let CoachDecisionOutcome::AcceptFailed(proposal) = &outcome else {
+        panic!("expected AcceptFailed, got {outcome:?}");
+    };
+    let failure = proposal
+        .accept_failure
+        .as_ref()
+        .expect("the refusal is recorded on the proposal");
+    assert_eq!(
+        failure.subject.as_deref(),
+        Some("engine fingerprint"),
+        "the refusal names what diverged, not just that something did"
+    );
+    assert_eq!(world.version_count().await, 1, "no child was minted");
+    assert_eq!(
+        world.settled_proposal_count().await,
+        0,
+        "no settled row exists"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compute_failure_records_backtest_and_leaves_the_proposal_actionable() {
     let world = world().await;
@@ -1215,6 +1352,21 @@ async fn repoint_parent_taker_fee(pool: &SqlitePool, run_id: &BacktestRunId, to:
         pool,
         &format!(
             "UPDATE backtest_run SET taker_fee_bps = '{to}' WHERE id = '{}'",
+            run_id.as_str()
+        ),
+    )
+    .await;
+}
+
+/// Stamp the parent run with an engine fingerprint this build did not produce.
+///
+/// The real shape is an app upgrade between the parent run and the accept; a
+/// fabricated hex is the same condition without waiting for one.
+async fn repoint_parent_engine_fingerprint(pool: &SqlitePool, run_id: &BacktestRunId, to: &str) {
+    with_run_updates_allowed(
+        pool,
+        &format!(
+            "UPDATE backtest_run SET engine_fingerprint = '{to}' WHERE id = '{}'",
             run_id.as_str()
         ),
     )

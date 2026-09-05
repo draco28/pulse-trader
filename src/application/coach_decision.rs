@@ -48,8 +48,8 @@ use crate::domain::strategy::VersionId;
 use crate::domain::{
     AcceptFailureStage, BacktestRunId, BacktestRunRepository, CandleSeries, CandleSeriesRepository,
     CoachAcceptFailure, CoachAcceptanceRepository, CoachingRepository, CoachingSession,
-    CoachingSessionId, DataError, Disposition, DispositionKind, ExchangeAdapter, Mutation,
-    MutationError, PersistedRun, PreparedBacktest, PreparedCoachAcceptance, Proposal,
+    CoachingSessionId, DataError, Disposition, DispositionKind, EngineFingerprint, ExchangeAdapter,
+    Mutation, MutationError, PersistedRun, PreparedBacktest, PreparedCoachAcceptance, Proposal,
     SessionOutcome, StrategyRepository, SymbolFilters, ValidatedDsl, apply,
 };
 
@@ -401,16 +401,7 @@ where
     //    a default request would produce a comparison that looks valid and is not.
     let (parent_run, inputs) = match load_parent_inputs(runs, session).await {
         Ok(loaded) => loaded,
-        Err(failure) => {
-            return record_failure(
-                acceptance,
-                &session.id,
-                failure.stage,
-                failure.message,
-                failure.subject,
-            )
-            .await;
-        }
+        Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
 
     // 4-5. LOAD SNAPSHOTS, COMPILE AND COMPUTE — off the async runtime, exactly as
@@ -427,17 +418,22 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(failure) => {
-            return record_failure(
-                acceptance,
-                &session.id,
-                failure.stage,
-                failure.message,
-                failure.subject,
-            )
-            .await;
-        }
+        Err(failure) => return record_staged(acceptance, &session.id, failure).await,
     };
+
+    // 5b. THE ENGINE MUST BE THE ONE THAT PRODUCED THE PARENT — see
+    //     `engine_divergence`. Checked before the commit, so a refusal leaves no
+    //     child behind to mislead anyone.
+    if let Some(message) = engine_divergence(&parent_run, &prepared) {
+        return record_failure(
+            acceptance,
+            &session.id,
+            AcceptFailureStage::Backtest,
+            message,
+            Some("engine fingerprint".to_owned()),
+        )
+        .await;
+    }
 
     // 6. COMMIT — W4's one transaction. The adapter mints the child id, the run id
     //    and `created_at`, and DERIVES the strategy, the parent and the creating
@@ -619,6 +615,32 @@ where
     })
 }
 
+/// The reason this child cannot be compared to this parent, when there is one.
+///
+/// The whole point of replaying the parent's exact inputs is that the only
+/// difference between the two summaries is the mutation. A child computed by a
+/// DIFFERENT engine build breaks that: the rail still shows the two side by side as
+/// before/after, and a delta the engine caused is read as the coach's doing.
+///
+/// The standalone path compares the same two fingerprints (`backtest.rs`, FR-7)
+/// because a run is only comparable to another run from the same engine. The
+/// difference here is what a mismatch costs: there the comparison is a note beside
+/// the result, so it warns; here the comparison IS the product, so it refuses.
+fn engine_divergence(parent_run: &PersistedRun, prepared: &PreparedBacktest) -> Option<String> {
+    let parent_fp = EngineFingerprint::from_stored(parent_run.engine_fingerprint.clone());
+    prepared
+        .result
+        .engine_fingerprint
+        .compare(&parent_fp)
+        .map(|divergence| {
+            format!(
+                "the parent run was produced by a different engine build, so a before/after \
+                 comparison would attribute the engine's difference to the coach's change: \
+                 {divergence}. Re-run the parent version on this build, then accept."
+            )
+        })
+}
+
 /// One snapshot BY THE IDENTITY THE INPUTS NAME — never `HEAD`, which may have
 /// moved since the parent run.
 fn load_named_snapshot<C>(
@@ -654,7 +676,58 @@ where
             version
         )));
     }
+    // The SAME refusal the standalone path applies before it runs the engine
+    // (`backtest.rs::load_snapshot`): structural corruption and spacing gaps are both
+    // refusals, because the engine and the indicator stream assume a contiguous series
+    // and neither detects nor fills a hole. Accepting a gapped snapshot here would
+    // persist a child whose summary is skewed by the hole and then show it beside its
+    // parent as the mutation's effect — silently, which is precisely what the
+    // standalone path refuses to do quietly. An accept REPLAYS the parent's inputs, so
+    // it owes the parent's guards.
+    let gaps = series.validate().map_err(|e| {
+        staged(format!(
+            "the {} {} snapshot `{}` the coached run used is structurally unsound: {e}",
+            pair,
+            timeframe.binance_interval(),
+            version
+        ))
+    })?;
+    if let Some(first) = gaps.first() {
+        return Err(staged(format!(
+            "the {} {} snapshot `{}` the coached run used has a gap: a candle was expected at \
+             {} and the next one found is at {}",
+            pair,
+            timeframe.binance_interval(),
+            version,
+            first.expected,
+            first.found
+        )));
+    }
     Ok(series)
+}
+
+/// Record a [`StagedFailure`] as it stands — the stage, message and subject the
+/// failing step already chose, unaltered.
+///
+/// The staged steps all fail the same way, so they all record the same way; spelling
+/// the three fields out at each call site is how one of them ends up dropping the
+/// subject or relabelling the stage.
+async fn record_staged<A>(
+    acceptance: &A,
+    session_id: &CoachingSessionId,
+    failure: StagedFailure,
+) -> Result<CoachDecisionOutcome, CoachDecisionError>
+where
+    A: CoachAcceptanceRepository,
+{
+    record_failure(
+        acceptance,
+        session_id,
+        failure.stage,
+        failure.message,
+        failure.subject,
+    )
+    .await
 }
 
 /// Record a typed accept failure and return the still-open proposal.
