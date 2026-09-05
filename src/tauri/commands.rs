@@ -72,6 +72,7 @@ use crate::adapters::db::{
     Db, SqliteBacktestRunRepo, SqliteLlmCallRepo, SqliteStrategyRepo, default_db_path,
     open_migrated,
 };
+use crate::adapters::llm::coach_transport::{coach_config, coach_provider};
 use crate::adapters::llm::openai_compat::OpenAiCompatProvider;
 use crate::adapters::secrets::{llm_credential_status, resolve_llm_api_key};
 use crate::agent::ComposerEvent;
@@ -80,7 +81,6 @@ use crate::agent::config::{
     prompt_override_dir,
 };
 use crate::application::coach::CoachTurnRegistry;
-use crate::cli::coach::coach_config;
 use crate::cli::compose::{COMPOSE_CANCELLED, ComposeWiring, compose_config, run_compose_with};
 use crate::domain::CoachingSessionId;
 use crate::domain::Redactor;
@@ -1402,10 +1402,10 @@ pub async fn run_backtest_version(
 /// the ledger row's `prompt_version` is a true answer to "which prompt produced
 /// this?" — including when an operator's `$PULSE_PROMPT_DIR/coach.md` overlay won.
 ///
-/// **The transport makes ONE attempt per turn** ([`OpenAiCompatProvider::single_attempt`]),
-/// matching `pulse coach`: a turn records one exchange and names one ledger row, and
-/// the retrying default would put three upstream attempts and their cost behind that
-/// one record.
+/// **The transport makes ONE attempt per turn** at the coach's own request timeout
+/// ([`coach_provider`]), the same constructor `pulse coach` builds through: a turn
+/// records one exchange and names one ledger row, and the retrying default would put
+/// three upstream attempts and their cost behind that one record.
 ///
 /// # Errors
 ///
@@ -1434,13 +1434,11 @@ pub async fn coach_turn(
     let key = resolve_llm_api_key().map_err(BusError::from)?;
     let key_source = key.source();
     let redactor = Redactor::from_config(vec![key.expose().to_owned()]);
-    let provider = match transport.base_url.as_deref() {
-        Some(base_url) => OpenAiCompatProvider::single_attempt_with_base_url(
-            key.expose().to_owned(),
-            base_url.to_owned(),
-        ),
-        None => OpenAiCompatProvider::single_attempt(key.expose().to_owned()),
-    };
+    // The SHARED coach transport (#165 review R6): one constructor, so this surface
+    // and `pulse coach` cannot end up with different retry, timeout or model
+    // postures — and so swapping in a retrying provider here would have to be a
+    // visible edit rather than a one-word substitution.
+    let provider = coach_provider(key.expose(), transport.base_url.as_deref());
 
     let deps = CoachTurnDeps {
         provider,

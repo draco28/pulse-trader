@@ -27,6 +27,8 @@
 //! NOT a serde round-trip), so the composer (2.04) can advertise its builder tools
 //! and receive `tool_calls` back. An empty slice reproduces the no-tools behavior.
 
+use std::time::Duration;
+
 use pulsehive::error::PulseHiveError;
 use pulsehive::llm::{
     LlmConfig as HiveLlmConfig, LlmProvider as HiveLlmProvider, LlmResponse as HiveLlmResponse,
@@ -59,9 +61,13 @@ const OLLAMA_BASE_URL: &str = "https://ollama.com/v1";
 /// identity test (#126).
 pub(crate) const OLLAMA_MODEL_ID: &str = "glm-5.3-flash";
 
-/// Request timeout, in seconds (audit ch4 — a stalled provider must not hang a
+/// The DEFAULT request timeout (audit ch4 — a stalled provider must not hang a
 /// future coach loop forever; an unset/infinite timeout is a v1 reliability gap).
-const OLLAMA_TIMEOUT_SECS: u64 = 60;
+///
+/// The composer, `llm-check` and every plain single-attempt caller send it. The
+/// coach passes its own, longer one explicitly
+/// ([`single_attempt_with_timeout`](OpenAiCompatProvider::single_attempt_with_timeout)).
+const OLLAMA_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max retry attempts for transient (429 / 5xx) errors (audit ch4).
 ///
@@ -79,30 +85,23 @@ const OLLAMA_MAX_RETRIES: u32 = 2;
 /// fewer silent recoveries, more honest rows (operator-approved, 2026-08-30).
 const COACH_MAX_RETRIES: u32 = 0;
 
-/// The COACH request timeout, in seconds — longer than every other surface's
-/// [`OLLAMA_TIMEOUT_SECS`], and deliberately shorter than the coach turn's own
-/// wall-clock guard (`agent::DEFAULT_TURN_TIMEOUT`, 120s).
+/// The one place a provider config is built, so everything a posture does NOT
+/// choose — the model id, the config shape — stays single-sourced.
 ///
-/// The coach sends a whole backtest and the model REASONS before it calls a tool,
-/// so a turn that spends its 16 384-token budget (`cli::coach::COACH_MAX_TOKENS`)
-/// legitimately generates for ~88s at the ~186 tok/s the real #164 turns measured.
-/// At 60s the request would be cut off in the middle of exactly the thinking the
-/// larger cap exists to permit, and a recorded `TransportFailure` would replace the
-/// recorded `ZeroCalls` — a different wrong answer, not a fix. Staying under the
-/// turn guard keeps ONE component deciding when a turn is over.
-const COACH_TIMEOUT_SECS: u64 = 110;
-
-/// The one place a provider config is built, so the two postures cannot drift
-/// beyond the retry count they exist to differ in.
+/// The two things a posture DOES choose are its parameters: how long one request
+/// may take, and how many attempts it may make. `timeout` is a [`Duration`] rather
+/// than a bare `u64` so it cannot be transposed with `max_retries` — two adjacent
+/// positional integers type-check in either order, and the resulting provider
+/// (2 seconds, 60 retries) would look right until a live call (review R9).
 fn provider_config(
     api_key: impl Into<String>,
     base_url: impl Into<String>,
-    timeout_secs: u64,
+    timeout: Duration,
     max_retries: u32,
 ) -> OpenAIConfig {
     OpenAIConfig::new(api_key, OLLAMA_MODEL_ID)
         .with_base_url(base_url)
-        .with_timeout(timeout_secs)
+        .with_timeout(timeout.as_secs())
         .with_max_retries(max_retries)
 }
 
@@ -159,28 +158,30 @@ impl OpenAiCompatProvider {
         Self::from_config(provider_config(
             api_key,
             base_url,
-            OLLAMA_TIMEOUT_SECS,
+            OLLAMA_TIMEOUT,
             OLLAMA_MAX_RETRIES,
         ))
     }
 
-    /// Build a provider that makes exactly ONE upstream attempt — the coach's
-    /// posture (PR #128, finding H1), pinned to the default [`OLLAMA_BASE_URL`].
+    /// Build a provider that makes exactly ONE upstream attempt (PR #128, finding
+    /// H1), pinned to the default [`OLLAMA_BASE_URL`].
     ///
-    /// Identical to [`new`](Self::new) but for the retry count. Use it wherever a
-    /// caller records one exchange per turn and must not bill for attempts that
-    /// exchange does not mention.
+    /// Identical to [`new`](Self::new) but for the retry count — including the
+    /// [`OLLAMA_TIMEOUT`] request timeout, which a single-attempt caller inherits
+    /// like any other. Use it wherever a caller records one exchange per turn and
+    /// must not bill for attempts that exchange does not mention; use
+    /// [`single_attempt_with_timeout`](Self::single_attempt_with_timeout) when that
+    /// caller also needs longer than the default to answer.
     ///
     /// This is a WIRING obligation, not a property of the type: a caller who builds
     /// with [`new`](Self::new) and hands the result to a `Coach` still retries.
-    /// `run_coach` selects this path (`cli::coach::coach_provider`).
     #[must_use]
     pub fn single_attempt(api_key: impl Into<String>) -> Self {
         Self::single_attempt_with_base_url(api_key, OLLAMA_BASE_URL)
     }
 
     /// [`single_attempt`](Self::single_attempt) with an explicit OpenAI-compatible
-    /// `base_url` (the config `[llm].base_url` override).
+    /// `base_url` (the config `[llm].base_url` override). Same default timeout.
     #[must_use]
     pub fn single_attempt_with_base_url(
         api_key: impl Into<String>,
@@ -189,7 +190,30 @@ impl OpenAiCompatProvider {
         Self::from_config(provider_config(
             api_key,
             base_url,
-            COACH_TIMEOUT_SECS,
+            OLLAMA_TIMEOUT,
+            COACH_MAX_RETRIES,
+        ))
+    }
+
+    /// [`single_attempt`](Self::single_attempt) with a caller-chosen request
+    /// `timeout` and an optional `base_url` (`None` = the default
+    /// [`OLLAMA_BASE_URL`]) — the COACH's path
+    /// (`adapters::llm::coach_transport::coach_provider`).
+    ///
+    /// The timeout is a per-caller decision and stays one: a coach turn must be
+    /// allowed to reason for far longer than a composer step, and shipping that
+    /// allowance to every single-attempt caller would make one surface's need the
+    /// whole adapter's default (review R2).
+    #[must_use]
+    pub fn single_attempt_with_timeout(
+        api_key: impl Into<String>,
+        base_url: Option<&str>,
+        timeout: Duration,
+    ) -> Self {
+        Self::from_config(provider_config(
+            api_key,
+            base_url.unwrap_or(OLLAMA_BASE_URL),
+            timeout,
             COACH_MAX_RETRIES,
         ))
     }
@@ -356,9 +380,9 @@ fn map_hive_error(error: PulseHiveError) -> LlmError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        COACH_MAX_RETRIES, COACH_TIMEOUT_SECS, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES,
-        OLLAMA_MODEL_ID, OLLAMA_TIMEOUT_SECS, OpenAiCompatProvider, from_hive_response,
-        map_hive_error, provider_config, to_hive_config, to_hive_message, to_hive_tool_def,
+        COACH_MAX_RETRIES, Duration, OLLAMA_BASE_URL, OLLAMA_MAX_RETRIES, OLLAMA_MODEL_ID,
+        OLLAMA_TIMEOUT, OpenAiCompatProvider, from_hive_response, map_hive_error, provider_config,
+        to_hive_config, to_hive_message, to_hive_tool_def,
     };
     use crate::domain::{LlmBackend, LlmConfig, LlmError, Message, ToolCall, ToolDefinition};
     use pulsehive::error::PulseHiveError;
@@ -537,62 +561,65 @@ mod tests {
         );
     }
 
-    /// Retries and the REQUEST TIMEOUT are the only two things the postures disagree
-    /// about — the shared builder is what keeps a future edit from widening the gap.
+    /// Retries are the ONLY thing the two DEFAULT postures disagree about — the
+    /// shared builder is what keeps a future edit from quietly widening that gap.
     #[test]
-    fn the_two_postures_differ_in_retries_and_timeout_and_nothing_else() {
+    fn the_two_default_postures_differ_in_retries_and_nothing_else() {
         let retrying = provider_config(
             "k",
             "https://example.test/v1",
-            OLLAMA_TIMEOUT_SECS,
+            OLLAMA_TIMEOUT,
             OLLAMA_MAX_RETRIES,
         );
         let single = provider_config(
             "k",
             "https://example.test/v1",
-            COACH_TIMEOUT_SECS,
+            OLLAMA_TIMEOUT,
             COACH_MAX_RETRIES,
         );
 
         assert_eq!(retrying.model, single.model);
         assert_eq!(retrying.base_url, single.base_url);
+        assert_eq!(retrying.timeout_secs, single.timeout_secs);
         assert_eq!(retrying.max_retries, 2);
         assert_eq!(single.max_retries, 0);
-        assert_eq!(retrying.timeout_secs, 60);
-        assert_eq!(single.timeout_secs, 110);
     }
 
-    /// The coach waits longer than the other surfaces, and still less than the turn
-    /// guard that owns the wall clock above it (#164).
+    /// A LONGER request timeout is a per-caller choice, not something a
+    /// single-attempt caller inherits (review R2).
     ///
-    /// A coach turn at the 16 384-token cap can legitimately spend ~88s generating
-    /// (the real turns measured 38.4s at 7 176 tokens and 48.9s at 9 074, ~186
-    /// tok/s), so the shared 60s request timeout would convert the very turns the
-    /// bigger cap exists to allow into recorded transport failures. 110 < 120 keeps
-    /// `DEFAULT_TURN_TIMEOUT` the outer bound: the turn guard still decides when a
-    /// turn is over.
+    /// The coach needs one — a turn at its 16 384-token cap generates for well over
+    /// a minute — but `single_attempt` is the general "one exchange, one row"
+    /// posture, and handing every such caller the coach's patience would make one
+    /// surface's need the adapter's default. The coach's own number and the
+    /// guard it sits under live in `adapters::llm::coach_transport`.
     #[test]
-    fn the_coach_path_waits_longer_than_the_other_surfaces_and_less_than_its_turn_guard() {
+    fn only_the_explicit_timeout_ctor_departs_from_the_default_wait() {
+        for provider in [
+            OpenAiCompatProvider::new("k"),
+            OpenAiCompatProvider::with_base_url("k", "https://example.test/v1"),
+            OpenAiCompatProvider::single_attempt("k"),
+            OpenAiCompatProvider::single_attempt_with_base_url("k", "https://example.test/v1"),
+        ] {
+            assert_eq!(
+                provider.timeout_secs(),
+                OLLAMA_TIMEOUT.as_secs(),
+                "every default-posture ctor keeps the 60s request timeout"
+            );
+        }
+        let explicit =
+            OpenAiCompatProvider::single_attempt_with_timeout("k", None, Duration::from_secs(100));
+        assert_eq!(explicit.timeout_secs(), 100);
+        assert_eq!(explicit.max_retries(), 0, "and it still attempts once");
         assert_eq!(
-            OpenAiCompatProvider::new("k").timeout_secs(),
-            OLLAMA_TIMEOUT_SECS,
-            "the composer / llm-check default keeps the 60s request timeout"
-        );
-        assert_eq!(
-            OpenAiCompatProvider::single_attempt("k").timeout_secs(),
-            COACH_TIMEOUT_SECS,
-            "the coach path waits out a full reasoning budget"
-        );
-        assert_eq!(
-            OpenAiCompatProvider::single_attempt_with_base_url("k", "https://example.test/v1")
-                .timeout_secs(),
-            COACH_TIMEOUT_SECS,
-            "and still does behind a base-url override"
-        );
-        assert_eq!(COACH_TIMEOUT_SECS, 110);
-        assert!(
-            COACH_TIMEOUT_SECS < crate::agent::DEFAULT_TURN_TIMEOUT.as_secs(),
-            "the turn's own wall-clock guard stays the outer bound"
+            OpenAiCompatProvider::single_attempt_with_timeout(
+                "k",
+                Some("https://example.test/v1"),
+                Duration::from_secs(100)
+            )
+            .timeout_secs(),
+            100,
+            "a base-url override does not restore the default wait"
         );
     }
 }
