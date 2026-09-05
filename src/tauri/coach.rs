@@ -647,30 +647,39 @@ enum PendingClaim {
     /// Old enough that no live call can still hold it: adopt its id, so W1 settles
     /// it as `interrupted`.
     Abandoned(CoachingSessionId),
-    /// Young enough to be a call in flight — in ANOTHER process, since this one's
-    /// registry would have refused the turn already. Carries the id so the refusal
-    /// can name the claim it is deferring to.
+    /// Too young to be treated as abandoned. It MAY be a call in flight in another
+    /// process, or it may be a claim whose owner died seconds ago — this cannot tell
+    /// them apart, and says so rather than guessing. Carries the id so the refusal
+    /// can name the claim it is declining to touch.
     MaybeLive(CoachingSessionId),
 }
 
 /// Classify this run's unfinished claim.
 ///
-/// A `pending` row is a session that was claimed and never settled. One run has one
-/// rail, so at most one such row is this rail's own; the LATEST is taken if a
-/// history somehow holds more than one.
+/// A `pending` row is a session that was claimed and never settled. The LATEST is
+/// taken if a history holds more than one.
 ///
 /// **Pending alone does not mean abandoned, and adopting on that alone steals live
 /// turns.** Both single-flight registries are process-local: a second process sees
 /// an adopted id as free, and `run_coach_turn` then reads `ExistingPending` as stale
 /// and settles it `interrupted` — killing a call the first process has already been
-/// billed for, and which will fail when it tries to settle its own row. That is a
-/// worse failure than the unreachable recovery adoption exists to fix.
+/// billed for, and which will fail when it tries to settle its own row.
 ///
-/// AGE is the evidence available without a durable lease (a lease is a schema
-/// change, out of this spine's scope). A turn cannot outlive
+/// AGE is the evidence available without a durable lease. A turn cannot outlive
 /// [`DEFAULT_TURN_TIMEOUT`], so a claim older than that plus a margin is held by
-/// nothing; a younger one is reported as possibly live and the caller refuses rather
-/// than guessing.
+/// nothing; a younger one is left alone.
+///
+/// **What this does NOT provide, stated because the code reads as if it might.**
+/// This is a read, not a reservation. Two processes can both complete it before
+/// either calls `claim_session`, and each then claims its own session id and makes
+/// its own billable call — the operation latch is keyed by session id and no
+/// constraint makes pending rows unique per run. So there is single-flight WITHIN a
+/// process, and adoption of rows old enough to be nobody's, and no run-level
+/// exclusivity ACROSS processes. The fix is a run-level claim in migration `0009`
+/// (a partial unique index on pending rows per run, with `claim_session` mapping the
+/// violation to `ExistingPending`), tracked as
+/// `pulseai-labs/pulse-trader#158` and out of r1.s4's scope. Nothing here should be
+/// read as promising more than the paragraph above.
 async fn pending_claim_for_run<R: CoachingRepository>(
     sessions: &R,
     run_id: &BacktestRunId,
@@ -753,15 +762,21 @@ where
     let session_id = match pending_claim_for_run(&reload_sessions, &run_id, &SystemClock).await? {
         Some(PendingClaim::Abandoned(pending)) => pending,
         Some(PendingClaim::MaybeLive(pending)) => {
+            // The message says only what is known: this run has an UNSETTLED turn,
+            // too recent to treat as abandoned. Whether it is still running cannot
+            // be determined from here — that would need the run-level claim #158
+            // tracks — and a refusal that asserted "is already running" would be
+            // promising exclusivity the code does not provide.
+            //
             // The contested id crosses as a FIELD, not only in the prose: the rail's
             // "Check again" has to reload THAT session, and asking under a freshly
-            // minted id instead would start a second billable turn — which is the
-            // opposite of what a button offering the other turn's result promises.
+            // minted id instead would start a second billable turn — the opposite of
+            // what a button offering the other turn's result promises.
             return Err(BusError::with_session_id(
                 BusErrorCode::Busy,
                 format!(
-                    "coach turn {} is already running; its result will appear here when it \
-                     finishes",
+                    "coach turn {} for this run has not settled yet; check again to see \
+                     where it got to",
                     pending.as_str()
                 ),
                 pending.as_str().to_owned(),

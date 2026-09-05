@@ -1106,13 +1106,13 @@ describe("BacktestLabScreen (the coach rail)", () => {
       status: "error",
       error: {
         code: "busy",
-        message: "coach turn sess-elsewhere is already running",
+        message: "coach turn sess-elsewhere for this run has not settled yet; check again to see where it got to",
         run_id: null,
         session_id: "sess-elsewhere",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
-    await screen.findByText(/already running/i);
+    await screen.findByText(/has not settled yet/i);
 
     // The button offers the OTHER turn's result. Asking under a fresh id would ask a
     // new question and bill for it instead.
@@ -1178,14 +1178,19 @@ describe("BacktestLabScreen (the coach rail)", () => {
     await renderRun(SEEDED_RUN);
     coachTurnMock.mockResolvedValue({
       status: "error",
-      error: { code: "busy", message: "a coach turn for this run is already running", run_id: null, session_id: null },
+      error: {
+        code: "busy",
+        message: "coach turn sess-other for this run has not settled yet; check again",
+        run_id: null,
+        session_id: null,
+      },
     });
     fireEvent.click(screen.getByRole("button", { name: /ask the coach/i }));
 
     // Not a failure — nothing broke. Not `running` either: THIS record settled, so
     // nothing further will arrive to move it along and the trader needs a way to
     // pick the other invocation's result up.
-    await screen.findByText(/already running/i);
+    await screen.findByText(/has not settled yet/i);
     expect(screen.queryByText(/what to do/i)).toBeNull();
 
     // And the button DOES something: a busy record has settled, so re-asking is

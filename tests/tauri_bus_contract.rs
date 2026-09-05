@@ -229,9 +229,9 @@ fn domain_error_maps_to_one_serializable_shape() {
 /// to a contract no compiler checks — TypeScript sees `string`, and a screen
 /// comparing against the old spelling silently stops matching. r1.s4.w3 added
 /// `busy` (`#141`'s single-flight refusal) and pins it here beside the others for
-/// exactly that reason: it is the one code the coach rail renders as a STATE
-/// ("already running") rather than as an error, so its spelling is load-bearing
-/// in a way the others' are not.
+/// exactly that reason: it is the one code the coach rail renders as a STATE — a
+/// transient "not settled yet, check again" — rather than as an error, so its
+/// spelling is load-bearing in a way the others' are not.
 #[test]
 fn every_bus_error_code_serializes_as_its_pinned_token() {
     let pinned: Vec<(BusErrorCode, &str)> = vec![
