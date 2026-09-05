@@ -237,6 +237,23 @@ impl<C: Clock + Send + Sync, I: IdSource + Send + Sync> CoachAcceptanceRepositor
             };
         }
 
+        // THE PROPOSAL MUST STILL SAY WHAT THE CHILD WAS BUILT FROM. `opened == 1`
+        // proves only that the proposal is open, and a modify recorded while this
+        // accept was applying, loading and re-running — all of it necessarily
+        // outside this transaction — leaves it open with a DIFFERENT mutation. That
+        // is the whole window: another process's modify commits, this accept then
+        // writes a child produced from the old mutation, every constraint passes,
+        // and the row now claims a child that its stored mutation did not produce.
+        // Refuse instead, and let the caller recompute from what the proposal
+        // actually says.
+        if proposal.mutation != acceptance.expected_mutation {
+            return Err(DataError::Db(format!(
+                "coaching session `{id}`: the proposal changed while this accept was being \
+                 computed, so the child would not match the mutation now on record; \
+                 re-run the accept against the current proposal"
+            )));
+        }
+
         let session = self.coached_session(&mut tx, &id).await?;
 
         // Mint identity INSIDE the transaction, from the injected sources.

@@ -738,6 +738,22 @@ pub struct PreparedBacktest {
 pub struct PreparedCoachAcceptance {
     /// The session whose proposal is being accepted.
     pub session_id: CoachingSessionId,
+    /// The mutation this child was produced from — the accept's optimistic-lock
+    /// token.
+    ///
+    /// Applying, loading snapshots and re-running all happen OUTSIDE the final
+    /// transaction, by design: none of them may hold a write lock across CPU work.
+    /// That leaves a window in which another process can record a modify, and the
+    /// conditional write's "is the proposal still open" test does not close it — a
+    /// modified proposal is open either way. The child would then be committed
+    /// against a proposal whose stored mutation is not the one it came from, and the
+    /// recorded relationship between proposal and child would be false while every
+    /// constraint still passed.
+    ///
+    /// So the adapter re-reads the proposal inside the transaction and refuses
+    /// unless its mutation is still this one. The caller recomputes from whatever
+    /// the proposal now says; nothing is silently reconciled.
+    pub expected_mutation: Mutation,
     /// The validated child candidate exactly as `apply()` produced it.
     pub child_dsl: StrategyDsl,
     /// The deterministic re-backtest of that candidate.

@@ -549,6 +549,77 @@ fn prepared_for(session: &str) -> PreparedCoachAcceptance {
     }
 }
 
+/// A prepared acceptance built from a mutation that is NOT the one on record —
+/// what an accept holds after another process modified the proposal underneath it.
+fn prepared_from_stale_mutation(session: &str) -> PreparedCoachAcceptance {
+    PreparedCoachAcceptance {
+        session_id: CoachingSessionId::new(session),
+        expected_mutation: set_period("entry.lhs.indicator.rsi.period", 99),
+        ..prepared_acceptance()
+    }
+}
+
+/// A modify that lands while an accept is being computed does not let that accept
+/// commit a child built from the mutation it replaced.
+///
+/// Applying, loading snapshots and re-running all happen outside the final
+/// transaction — they must, because none of them may hold a write lock across CPU
+/// work — so a second process can record a modify in that window. The proposal is
+/// still OPEN afterwards, so "is it open" cannot catch this; only comparing the
+/// mutation can. Without the check the child commits, every constraint passes, and
+/// the row claims a child its stored mutation never produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_whose_proposal_changed_underneath_it_is_refused() {
+    let (repo, pool, _tmp) = repo().await;
+    let id = a_proposed_session(&repo, "sess-1").await;
+
+    // The proposal on record is the fixture's; this accept was computed from
+    // another mutation, exactly as it would be after a concurrent modify.
+    let err = accepts(&pool)
+        .commit_acceptance(prepared_from_stale_mutation("sess-1"))
+        .await
+        .expect_err("an accept built from a replaced mutation is refused");
+    assert!(
+        err.to_string().contains("changed while this accept"),
+        "the refusal says the proposal moved, not merely that something failed: {err}"
+    );
+
+    // Nothing was written: no child, and the proposal is still actionable.
+    let got = repo.get_session(&id).await.expect("get").expect("present");
+    match &got.outcome {
+        SessionOutcome::Proposed { proposal } => assert_eq!(
+            proposal.disposition,
+            Disposition::Proposed,
+            "the refused accept left the proposal open"
+        ),
+        other => panic!("expected an open proposal, got {other:?}"),
+    }
+}
+
+/// The in-memory adapter refuses the same race the SQLite one refuses.
+///
+/// A test adapter that admits an interleaving the real one rejects certifies the
+/// wrong thing, so this is the same case against the other implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_refuses_an_accept_whose_proposal_changed() {
+    let repo = in_memory_repo();
+
+    let err = repo
+        .commit_acceptance(prepared_from_stale_mutation("sess-1"))
+        .await
+        .expect_err("an accept built from a replaced mutation is refused");
+    assert!(
+        err.to_string().contains("changed while this accept"),
+        "the refusal says the proposal moved: {err}"
+    );
+    assert!(
+        repo.accepted_children()
+            .expect("read the children")
+            .is_empty(),
+        "the refused accept minted no child"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejection_names_no_child_and_a_failed_turn_has_no_proposal() {
     let (repo, pool, _tmp) = repo().await;
@@ -1119,6 +1190,9 @@ fn prepared_acceptance() -> PreparedCoachAcceptance {
     );
     PreparedCoachAcceptance {
         session_id: CoachingSessionId::new("sess-1"),
+        // The accept's optimistic lock: the fixture proposal's own mutation, so the
+        // guard passes for every case that is not testing the guard itself.
+        expected_mutation: a_proposal().mutation,
         child_dsl: rsi_oversold_strategy(),
         prepared_run: PreparedBacktest {
             inputs: pulse::BacktestInputs {

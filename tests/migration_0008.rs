@@ -1925,6 +1925,9 @@ fn prepared_backtest() -> PreparedBacktest {
 fn prepared(session: &str) -> PreparedCoachAcceptance {
     PreparedCoachAcceptance {
         session_id: CoachingSessionId::new(session),
+        // The accept's optimistic lock: the fixture proposal's own mutation, so the
+        // guard passes for every case that is not testing the guard itself.
+        expected_mutation: a_proposal().mutation,
         child_dsl: child_dsl(),
         prepared_run: prepared_backtest(),
     }

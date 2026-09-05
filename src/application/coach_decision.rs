@@ -437,10 +437,13 @@ where
 
     // 6. COMMIT — W4's one transaction. The adapter mints the child id, the run id
     //    and `created_at`, and DERIVES the strategy, the parent and the creating
-    //    call from the claimed session row.
+    //    call from the claimed session row. `expected_mutation` is the optimistic
+    //    lock: everything above ran outside the transaction, so the adapter refuses
+    //    unless the proposal still carries the mutation this child came from.
     let committed = match acceptance
         .commit_acceptance(PreparedCoachAcceptance {
             session_id: session.id.clone(),
+            expected_mutation: proposal.mutation.clone(),
             child_dsl: candidate.dsl().clone(),
             prepared_run: prepared,
         })

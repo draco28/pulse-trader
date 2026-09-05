@@ -236,14 +236,34 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
     ) -> Result<AcceptedCoachOutcome, DataError> {
         let id = acceptance.session_id.as_str().to_owned();
 
-        // Read the provenance the accept DERIVES from before mutating anything, so
+        // ONE lock for the whole operation — read, guard and mutate — because the
+        // SQLite adapter does the same work in ONE transaction and a test adapter
+        // that admits an interleaving the real one refuses is a test adapter that
+        // certifies the wrong thing. Taking it twice let two concurrent accepts both
+        // observe an open proposal and each mint a child.
+        let mut state = self.lock()?;
+
+        // The provenance the accept DERIVES from, read before anything is mutated so
         // a refused accept leaves the turn exactly as it was.
         let (strategy_id, parent_version_id, llm_call_id, disposition) = {
-            let mut state = self.lock()?;
             let turn = state.turns.get(&id).cloned().ok_or_else(|| {
                 DataError::Db(format!("coaching session `{id}`: no such session"))
             })?;
             let proposal = open_proposal(&id, state.turns.get_mut(&id))?;
+
+            // The proposal must still say what this child was built from — the same
+            // optimistic-lock check the SQLite adapter makes inside its transaction.
+            // Applying and re-running happen outside any lock, so a modify recorded
+            // meanwhile leaves the proposal open with a DIFFERENT mutation, and
+            // committing then records a child its stored mutation did not produce.
+            if proposal.mutation != acceptance.expected_mutation {
+                return Err(DataError::Db(format!(
+                    "coaching session `{id}`: the proposal changed while this accept was being \
+                     computed, so the child would not match the mutation now on record; \
+                     re-run the accept against the current proposal"
+                )));
+            }
+
             (
                 turn.strategy_id,
                 turn.parent_version_id,
@@ -285,7 +305,6 @@ impl<C: Clock, I: IdSource> InMemoryCoachAcceptanceRepo<C, I> {
         let accepted_run_id = BacktestRunId::new(self.ids.next_id());
         let created_at = self.now_rfc3339()?;
 
-        let mut state = self.lock()?;
         state.children.push(MemoryAcceptedChild {
             child_version_id: child_version_id.clone(),
             accepted_run_id: accepted_run_id.clone(),
