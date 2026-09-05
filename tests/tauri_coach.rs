@@ -615,6 +615,81 @@ async fn an_abandoned_claim_is_settled_as_interrupted_with_the_new_session_recov
     );
 }
 
+/// The post-RESTART shape: a fresh session id still settles the abandoned claim.
+///
+/// The test above reuses the stale id explicitly, which is what a running app can
+/// do because it still holds it. After a restart it does not: the operation store
+/// that held it is gone and the rail mints a new id. Nothing then reached the
+/// pending row, so W1's `interrupted` recovery — written, tested at the unit level,
+/// and named in the DTO — could never fire in production.
+///
+/// A reload adopts this run's unfinished claim, so the recovery is reachable by the
+/// road a trader actually travels.
+#[tokio::test]
+async fn a_reload_under_a_fresh_session_id_still_settles_this_runs_abandoned_claim() {
+    let world = world().await;
+    let state = world.state().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let hanging = HangingProvider {
+        entered: Mutex::new(Some(entered_tx)),
+    };
+
+    {
+        let first = coach_turn_core(
+            &state,
+            deps(hanging),
+            turn_request("sess-before-restart", &world.parent_run_id),
+        );
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("the hanging provider must not complete the turn"),
+            entered = entered_rx => entered.expect("the provider was entered"),
+        }
+        // Dropped: the claim is committed and unfinished, as a killed process
+        // leaves it.
+    }
+
+    // The rail after a restart: a NEW id, because nothing remembers the old one.
+    let (provider2, calls2) = ScriptedProvider::new(vec![propose_call(
+        RSI_PERIOD,
+        &json!({ "type": "Period", "value": 21 }),
+        "no call may be made on an abandoned claimant's behalf",
+    )]);
+    let dto = coach_turn_core(
+        &state,
+        deps(provider2),
+        turn_request("sess-after-restart", &world.parent_run_id),
+    )
+    .await
+    .expect("the reload settles the stale claim");
+
+    assert_eq!(dto.outcome, "failed");
+    assert_eq!(
+        dto.session_id, "sess-before-restart",
+        "the reload adopted this run's unfinished claim rather than opening a second one"
+    );
+    let failure = dto
+        .failure
+        .as_ref()
+        .expect("a failed turn states its reason");
+    assert_eq!(failure.kind, "interrupted");
+    assert_eq!(failure.recovery, "start a new coaching session");
+    assert_eq!(
+        calls2.load(Ordering::SeqCst),
+        0,
+        "settling an abandoned claim spends no money"
+    );
+
+    // And exactly ONE session exists for the run: the reload settled the claim
+    // rather than leaving it pending beside a second one.
+    let sessions = world.sessions().await;
+    let recorded = sessions
+        .list_sessions_for_run(&world.parent_run_id)
+        .await
+        .expect("read the run's turns");
+    assert_eq!(recorded.len(), 1, "no second session was opened");
+}
+
 // ---------------------------------------------------------------------------
 // 5. a pre-0006 run is MissingBacktestInputs, with its recovery and no call
 // ---------------------------------------------------------------------------

@@ -633,6 +633,26 @@ pub struct CoachTurnDeps<P> {
     pub max_dsl_bytes: Option<usize>,
 }
 
+/// The id of this run's unfinished claim, when it has one.
+///
+/// A `pending` row is a session that was claimed and never settled. One run has one
+/// rail, so at most one such row is this rail's own; the LATEST is taken if a
+/// history somehow holds more than one, because that is the claim a reload is about.
+///
+/// This is a read, not a judgement: whether the claim is live or stale is W1's to
+/// decide, and it can only decide it for a turn that arrives under the claim's own
+/// id. Supplying that id is all this does.
+async fn pending_session_for_run<R: CoachingRepository>(
+    sessions: &R,
+    run_id: &BacktestRunId,
+) -> Result<Option<CoachingSessionId>, BusError> {
+    let recorded = sessions.list_sessions_for_run(run_id).await?;
+    Ok(recorded
+        .into_iter()
+        .rfind(|session| matches!(session.outcome, SessionOutcome::Pending))
+        .map(|session| session.id))
+}
+
 /// Start or reload one coach turn for a persisted run — the drivable core behind
 /// the `coach_turn` command.
 ///
@@ -655,11 +675,28 @@ pub async fn coach_turn_core<P>(
 where
     P: LlmProvider + Send + Sync,
 {
-    let session_id = CoachingSessionId::new(request.session_id);
     let run_id = BacktestRunId::new(request.run_id);
-    // Acquired FIRST and dropped last: every exit below — the `?`s, a panic, the
-    // future being dropped by a navigation — releases it, because it releases in
-    // `Drop` rather than at a call site someone can forget.
+
+    // ADOPT this run's unfinished claim, if it has one.
+    //
+    // W1 settles a stale `pending` row as `interrupted` — but only when a turn
+    // arrives under that row's OWN session id, and nothing reached it: the desktop
+    // mints a fresh id per ask, and after a restart the operation store that held
+    // the previous one is empty. So a claim left by a killed process stayed pending
+    // for ever, and the recovery W1 wrote for it was unreachable in production.
+    //
+    // One run has one rail, so a pending row for this run IS this rail's unfinished
+    // business. Reloading under its id is what lets W1 tell a live claim from a
+    // stale one and settle the stale one honestly.
+    let reload_sessions = SqliteCoachingRepo::with_deps(state.db().pool().clone(), SystemClock);
+    let session_id = match pending_session_for_run(&reload_sessions, &run_id).await? {
+        Some(pending) => pending,
+        None => CoachingSessionId::new(request.session_id),
+    };
+
+    // Acquired after the id is settled and dropped last: every exit below — the
+    // `?`s, a panic, the future being dropped by a navigation — releases it,
+    // because it releases in `Drop` rather than at a call site someone can forget.
     let _operation = state.begin_operation(OperationKey::Coach(session_id.clone()))?;
 
     let CoachTurnDeps {
