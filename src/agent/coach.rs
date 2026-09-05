@@ -694,6 +694,10 @@ fn classify(
             mutation,
             hypothesis,
             disposition: Disposition::Proposed,
+            // r1.s4.w4: a freshly proposed mutation has no accept attempt behind
+            // it. The field records what the LATEST accept did, and nothing has
+            // accepted this yet.
+            accept_failure: None,
         }),
         Err(error) => Err(CoachFailure::InapplicableMutation { mutation, error }),
     }

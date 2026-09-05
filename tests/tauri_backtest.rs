@@ -918,13 +918,28 @@ fn save_run_commits_and_returns_the_id_without_reading_back() {
         body.contains("Ok(BacktestRunId::new(run_id))"),
         "positive control: save_run still returns the minted id"
     );
+    // r1.s4.w4: the two INSERT mappings moved OUT of `save_run` into the
+    // crate-private `insert_run_row` / `insert_trade_rows`, which the coach's
+    // accept transaction now reuses rather than copying. The positive control has
+    // to follow them, and it is checked in two halves so it still fails loudly if
+    // either the call or the mapping disappears: `save_run` must still drive both
+    // writes, and the file must still contain both statements.
+    let file = blank_comments(&read_source("src/adapters/db/backtest_run_repo.rs"));
     assert!(
-        body.contains("INSERT INTO backtest_run"),
-        "positive control: the run insert is still here"
+        body.contains("insert_run_row("),
+        "positive control: save_run still writes the run"
     );
     assert!(
-        body.contains("INSERT INTO trade"),
-        "positive control: the trade inserts are still here"
+        body.contains("insert_trade_rows("),
+        "positive control: save_run still writes the trades"
+    );
+    assert!(
+        file.contains("INSERT INTO backtest_run"),
+        "positive control: the run insert mapping is still in this adapter"
+    );
+    assert!(
+        file.contains("INSERT INTO trade"),
+        "positive control: the trade insert mapping is still in this adapter"
     );
     // The actual rule.
     assert!(

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE coaching_proposals SET disposition = ?1, child_version_id = ?2, accepted_run_id = ?3, accept_failure_stage = NULL, accept_failure_detail = NULL WHERE session_id = ?4 AND disposition IN ('proposed', 'modified')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "856a09a5c5420a4499ca8c47701c196b70a087c14fe12101eb4c2259acd0af73"
+}

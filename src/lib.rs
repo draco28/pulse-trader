@@ -155,6 +155,25 @@ pub use domain::{
     CoachContext, CoachFailure, CoachingError, CoachingSession, CoachingSessionId, Disposition,
     DispositionKind, Hypothesis, MfeMaeAggregates, Proposal, SessionOutcome,
 };
+// r1.s4.w4 (ADR-0010 / ADR-0018 / ADR-0019 / ADR-0021 as amended): the coach
+// LIFECYCLE value types migration `0008` makes storable — the pre-call claim and
+// its three semantic results, the one settling move, the typed accept failure, and
+// the identity-free prepared acceptance whose child/run ids the adapter mints.
+// Re-exported because `tests/migration_0008.rs` and `tests/coaching_repo.rs` drive
+// the real adapters through them, and because an un-re-exported public domain type
+// is a `dead_code` BUILD error under `deny(warnings)`.
+pub use domain::{
+    AcceptFailureStage, AcceptedCoachOutcome, CoachAcceptFailure, CoachRequestFingerprint,
+    CoachSessionClaim, CoachSessionClaimResult, InitialCoachOutcome, PreparedBacktest,
+    PreparedCoachAcceptance,
+};
+// r1.s4.w4: the `IdSource` port and its two adapters. Minting a row id became an
+// injected dependency when the coach accept started minting child/run identity
+// INSIDE its transaction: the in-memory test adapter has to mint "the same way" as
+// the SQLite one, and two hidden `Uuid::new_v4()` calls cannot be the same way as
+// anything.
+pub use adapters::ids::{SeqIdSource, UuidIdSource};
+pub use domain::IdSource;
 
 // Binance bulk-ingest API surface (WI-1.1.1.02). The adapter module stays
 // private (`mod adapters`); these curated re-exports are the entrypoints WI-05
@@ -306,6 +325,10 @@ pub use adapters::db::SqliteLlmCallRepo;
 // `deny(warnings)` + `pub(crate) mod adapters` (the `db/mod.rs` re-export alone is
 // necessary but NOT sufficient). `w3`'s coach turn and `r1.s4`'s rail construct it.
 pub use adapters::db::SqliteCoachingRepo;
+// r1.s4.w4: the accept half of the coach seam — the real SQLite adapter and the
+// deterministic in-memory test adapter at the same product-owned port.
+pub use adapters::db::SqliteCoachAcceptanceRepo;
+pub use adapters::memory::{InMemoryCoachAcceptanceRepo, MemoryAcceptedChild, MemoryCoachTurn};
 // VS-1.1.4 work-1.04: the backup-before-migrate protocol surface. `open_migrated`
 // is 1.05's single startup entry (migrate-then-open); `run_migrations_with_backup`
 // + `undo_to` + `MigrationOutcome` are the protocol vocabulary tests + the
@@ -442,6 +465,11 @@ pub use domain::LlmCallRepository;
 // `deny(warnings)` + `pub(crate) mod domain`. `w3` writes through it; `r1.s4`'s rail
 // reads and dispositions through it.
 pub use domain::CoachingRepository;
+// r1.s4.w4: the accept persistence port. Separate from `CoachingRepository`
+// because it answers a different question — that one records what a TURN produced,
+// this one records what a DECISION did — and because its two semantic operations
+// carry an atomicity promise a turn-recording port has no business making.
+pub use domain::CoachAcceptanceRepository;
 
 // VS-1.3.1 work-1.03 / VS-1.3.2 work-2.01: the OpenAI-compatible transport adapter +
 // the macOS Keychain READ accessor (README C8/C2, FR-23 / FR-3 / FR-1 / NFR-5).

@@ -20,11 +20,12 @@
 
 use chrono::{DateTime, SecondsFormat};
 use pulse::{
-    BacktestRunId, CoachFailure, CoachingRepository, CoachingSession, CoachingSessionId,
-    Comparator, Condition, Db, Direction, Disposition, ExitRule, FakeClock, Hypothesis,
-    IndicatorSpec, LlmCallId, MIGRATOR, Mutation, MutationError, ParamValue, Proposal, RiskParams,
-    SchemaVersion, SessionOutcome, SqliteCoachingRepo, StrategyDsl, SweepableValue, ValueSource,
-    VersionId, apply,
+    AcceptFailureStage, BacktestRunId, CoachAcceptFailure, CoachAcceptanceRepository, CoachFailure,
+    CoachingRepository, CoachingSession, CoachingSessionId, Comparator, Condition, Db, Direction,
+    Disposition, ExitRule, FakeClock, Hypothesis, InMemoryCoachAcceptanceRepo, IndicatorSpec,
+    LlmCallId, MIGRATOR, MemoryCoachTurn, Mutation, MutationError, ParamValue, PreparedBacktest,
+    PreparedCoachAcceptance, Proposal, RiskParams, SchemaVersion, SeqIdSource, SessionOutcome,
+    SqliteCoachingRepo, StrategyDsl, StrategyId, SweepableValue, ValueSource, VersionId, apply,
 };
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -119,7 +120,20 @@ async fn seed_parents(pool: &SqlitePool) {
         .expect("seed strategy_version");
     }
 
-    for run in ["run-1", "run-2"] {
+    // r1.s4.w4: ONE RUN PER VERSION, not two runs on `ver-1`. `0008` requires an
+    // accepted proposal to name the re-backtest OF its child, so every version an
+    // accept could name — the two real children and the three wrong-shaped ones —
+    // needs a run of its own. Without them the run-ownership trigger would refuse
+    // the wrong-lineage tests first and they would stop testing lineage at all.
+    for (run, version) in [
+        ("run-1", "ver-1"),
+        ("run-2", "ver-1"),
+        ("run-child-2", "ver-2"),
+        ("run-child-3", "ver-3"),
+        ("run-root", "ver-root"),
+        ("run-sibling", "ver-sibling"),
+        ("run-foreign", "ver-foreign"),
+    ] {
         // r1.s3.w2: `0006`'s BEFORE INSERT completeness trigger requires every fresh
         // row to name its input provenance. These are FK parents for coaching rows,
         // so the tuple is a plain complete one.
@@ -129,11 +143,12 @@ async fn seed_parents(pool: &SqlitePool) {
               engine_target, result_content_hash, starting_equity, net_pnl, fees_total, \
               funding_total, slippage_total, pair, primary_timeframe, primary_data_version, \
               taker_fee_bps, slippage_bps, funding_config) \
-             VALUES (?1, 'ver-1', '1', '2026-08-29T00:00:00.000Z', 'fp-1', 'test-target', \
+             VALUES (?1, ?2, '1', '2026-08-29T00:00:00.000Z', 'fp-1', 'test-target', \
                      'rch-1', '10000', '0', '0', '0', '0', \
                      'BTCUSDT', '15m', 'v-primary', '4', '1', 'snapshot_rates')",
         )
         .bind(run)
+        .bind(version)
         .execute(pool)
         .await
         .expect("seed backtest_run");
@@ -216,6 +231,8 @@ fn a_proposal() -> Proposal {
         hypothesis: Hypothesis::new("a slower RSI should cut the whipsaw entries")
             .expect("non-empty"),
         disposition: Disposition::Proposed,
+        // r1.s4.w4: nothing has tried to accept this yet.
+        accept_failure: None,
     }
 }
 
@@ -246,6 +263,16 @@ fn every_failure_variant() -> Vec<CoachFailure> {
         CoachFailure::TransportFailure {
             detail: "HTTP 503 from upstream".to_owned(),
         },
+        // r1.s4.w4 — the three `0008` adds.
+        CoachFailure::InapplicableAdvice {
+            advice: "add an ADX filter above 25".to_owned(),
+        },
+        CoachFailure::MissingBacktestInputs {
+            detail: "the parent run's primary snapshot `v-primary` is not in the store".to_owned(),
+        },
+        CoachFailure::Interrupted {
+            detail: "claimed at 2026-08-29T00:00:00Z by a process that did not finish".to_owned(),
+        },
     ];
 
     let mut tags: Vec<&'static str> = all
@@ -258,6 +285,9 @@ fn every_failure_variant() -> Vec<CoachFailure> {
             CoachFailure::ProviderTimeout { .. } => "provider_timeout",
             CoachFailure::ContextOverflow { .. } => "context_overflow",
             CoachFailure::TransportFailure { .. } => "transport_failure",
+            CoachFailure::InapplicableAdvice { .. } => "inapplicable_advice",
+            CoachFailure::MissingBacktestInputs { .. } => "missing_backtest_inputs",
+            CoachFailure::Interrupted { .. } => "interrupted",
         })
         .collect();
     tags.sort_unstable();
@@ -307,6 +337,7 @@ async fn a_proposal_session_round_trips_with_its_typed_mutation() {
             assert_eq!(proposal.disposition, Disposition::Proposed);
         }
         SessionOutcome::Failed { failure } => panic!("expected a proposal, got {failure:?}"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     // An absent id is Ok(None), not an error.
@@ -327,7 +358,7 @@ async fn every_failure_variant_round_trips() {
     let (repo, _pool, _tmp) = repo().await;
 
     let failures = every_failure_variant();
-    assert_eq!(failures.len(), 7, "every failure kind must round-trip");
+    assert_eq!(failures.len(), 10, "every failure kind must round-trip");
 
     for (i, failure) in failures.into_iter().enumerate() {
         let id = format!("sess-fail-{i}");
@@ -339,11 +370,23 @@ async fn every_failure_variant_round_trips() {
         // NULL records what was correlated here, not what was spent there. An eighth
         // variant has to answer this question before this file compiles.
         let call = match &failure {
-            CoachFailure::ContextOverflow { .. } | CoachFailure::TransportFailure { .. } => None,
+            // r1.s4.w4: `MissingBacktestInputs` is decided while BUILDING the
+            // context, before the provider is reached, so it correlates nothing —
+            // the `ContextOverflow` case exactly. `Interrupted` is written by a
+            // process that did not make the call and therefore cannot name one;
+            // that NULL is the strongest kind, since nothing here even attempted.
+            CoachFailure::ContextOverflow { .. }
+            | CoachFailure::TransportFailure { .. }
+            | CoachFailure::MissingBacktestInputs { .. }
+            | CoachFailure::Interrupted { .. } => None,
+            // `InapplicableAdvice` is a turn that got a usable RESPONSE — the coach
+            // answered, it just answered with structure this release cannot apply —
+            // so it names its ledger row like every other answered turn.
             CoachFailure::ZeroCalls
             | CoachFailure::SeveralCalls { .. }
             | CoachFailure::MalformedArguments { .. }
             | CoachFailure::InapplicableMutation { .. }
+            | CoachFailure::InapplicableAdvice { .. }
             | CoachFailure::ProviderTimeout { .. } => Some("call-1"),
         };
         let saved = session(
@@ -366,6 +409,7 @@ async fn every_failure_variant_round_trips() {
         match got.outcome {
             SessionOutcome::Failed { failure: back } => assert_eq!(back, failure),
             SessionOutcome::Proposed { .. } => panic!("a failed turn must read back failed"),
+            SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
         }
     }
 }
@@ -505,6 +549,7 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
             assert_eq!(proposal.disposition, Disposition::Rejected);
         }
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     // Accepting persists the child version — from a FRESH proposal, because
@@ -524,6 +569,7 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
         &id,
         &Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         },
     )
     .await
@@ -535,11 +581,13 @@ async fn recording_a_disposition_persists_the_child_version_only_when_accepted()
                 proposal.disposition,
                 Disposition::Accepted {
                     child_version_id: VersionId::new("ver-2"),
+                    accepted_run_id: BacktestRunId::new("run-child-2"),
                 },
                 "the accepted disposition reads back with its child version"
             );
         }
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 
     // Recording a disposition on a FAILED session has no proposal to move.
@@ -588,6 +636,7 @@ async fn a_settled_proposal_cannot_be_re_dispositioned() {
         &id,
         &Disposition::Accepted {
             child_version_id: VersionId::new("ver-2"),
+            accepted_run_id: BacktestRunId::new("run-child-2"),
         },
     )
     .await
@@ -601,6 +650,7 @@ async fn a_settled_proposal_cannot_be_re_dispositioned() {
             &id,
             &Disposition::Accepted {
                 child_version_id: VersionId::new("ver-3"),
+                accepted_run_id: BacktestRunId::new("run-child-3"),
             },
         )
         .await;
@@ -635,6 +685,7 @@ async fn replaying_the_same_accept_is_a_no_op() {
     let id = a_proposed_session(&repo, "sess-1").await;
     let accept = Disposition::Accepted {
         child_version_id: VersionId::new("ver-2"),
+        accepted_run_id: BacktestRunId::new("run-child-2"),
     };
 
     repo.record_disposition(&id, &accept)
@@ -650,6 +701,7 @@ async fn replaying_the_same_accept_is_a_no_op() {
     match &got.outcome {
         SessionOutcome::Proposed { proposal } => assert_eq!(proposal.disposition, accept),
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 
@@ -668,6 +720,7 @@ async fn accepting_a_root_version_as_a_child_is_refused() {
             &id,
             &Disposition::Accepted {
                 child_version_id: VersionId::new("ver-root"),
+                accepted_run_id: BacktestRunId::new("run-root"),
             },
         )
         .await;
@@ -691,6 +744,7 @@ async fn accepting_a_version_parented_elsewhere_is_refused() {
             &id,
             &Disposition::Accepted {
                 child_version_id: VersionId::new("ver-sibling"),
+                accepted_run_id: BacktestRunId::new("run-sibling"),
             },
         )
         .await;
@@ -714,6 +768,7 @@ async fn accepting_a_child_from_another_strategy_is_refused() {
             &id,
             &Disposition::Accepted {
                 child_version_id: VersionId::new("ver-foreign"),
+                accepted_run_id: BacktestRunId::new("run-foreign"),
             },
         )
         .await;
@@ -758,6 +813,7 @@ async fn concurrent_identical_accepts_both_succeed() {
     let (repo, pool, _tmp) = repo().await;
     let accept = Disposition::Accepted {
         child_version_id: VersionId::new("ver-2"),
+        accepted_run_id: BacktestRunId::new("run-child-2"),
     };
 
     for round in 0..20 {
@@ -893,6 +949,7 @@ async fn modified_and_proposed_are_refused_as_targets() {
             );
         }
         SessionOutcome::Failed { .. } => panic!("still a proposal session"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 
@@ -1024,4 +1081,202 @@ async fn list_sessions_for_run_returns_that_runs_turns() {
         .await
         .expect("list an unknown run");
     assert!(none.is_empty(), "an unknown run has no turns");
+}
+
+// ---------------------------------------------------------------------------
+// 6. The in-memory `CoachAcceptanceRepository` — a test adapter that MINTS the
+//    same way (r1.s4.w4)
+// ---------------------------------------------------------------------------
+
+/// An in-memory acceptance repo with one proposed turn registered.
+fn in_memory_repo() -> InMemoryCoachAcceptanceRepo<FakeClock, SeqIdSource> {
+    let repo =
+        InMemoryCoachAcceptanceRepo::new(FakeClock::at(NOW_MS), SeqIdSource::with_prefix("minted"));
+    repo.register_turn(MemoryCoachTurn {
+        session_id: CoachingSessionId::new("sess-1"),
+        strategy_id: StrategyId::new("strat-1"),
+        parent_version_id: VersionId::new("ver-1"),
+        llm_call_id: Some(LlmCallId::new("call-1")),
+        outcome: SessionOutcome::Proposed {
+            proposal: a_proposal(),
+        },
+    })
+    .expect("register the turn");
+    repo
+}
+
+/// A prepared acceptance with an EMPTY trade log. The in-memory adapter stores the
+/// prepared result rather than mapping it to columns, so the run's contents are not
+/// what this pair of tests is about — the identity and the provenance are.
+fn prepared_acceptance() -> PreparedCoachAcceptance {
+    let trades = Vec::new();
+    let starting_equity = Decimal::new(10_000, 0);
+    let equity_curve = pulse::EquityCurve::from_trades(0, starting_equity, &trades);
+    let summary = pulse::SummaryStats::from_trades(
+        &trades,
+        Decimal::ZERO,
+        Decimal::ZERO,
+        Decimal::ZERO,
+        &equity_curve,
+    );
+    PreparedCoachAcceptance {
+        session_id: CoachingSessionId::new("sess-1"),
+        child_dsl: rsi_oversold_strategy(),
+        prepared_run: PreparedBacktest {
+            inputs: pulse::BacktestInputs {
+                pair: pulse::Pair::new("BTCUSDT"),
+                primary: pulse::SnapshotSelection {
+                    timeframe: pulse::Timeframe::M15,
+                    data_version: pulse::DataVersion::new("v-primary"),
+                },
+                htf: None,
+                taker_fee_bps: Decimal::new(4, 0),
+                slippage_bps: Decimal::new(1, 0),
+                funding: pulse::FundingConfig::SnapshotRates,
+            },
+            result: pulse::BacktestResult {
+                trades,
+                net_pnl: Decimal::ZERO,
+                fees_total: Decimal::ZERO,
+                funding_total: Decimal::ZERO,
+                slippage_total: Decimal::ZERO,
+                regime_breakdown: pulse::RegimeBreakdown::default(),
+                skipped_entries: pulse::SkippedEntryCounts::default(),
+                engine_fingerprint: pulse::EngineFingerprint::current(),
+                summary: summary.clone(),
+                equity_curve,
+            },
+            summary,
+            starting_equity,
+        },
+    }
+}
+
+/// The in-memory adapter MINTS the child and run the same way the SQLite one does —
+/// from the injected `IdSource`, child first — and DERIVES provenance from the
+/// registered turn. A test double that took provenance from the caller would
+/// certify exactly the mismatch `PreparedCoachAcceptance`'s missing identity fields
+/// exist to make impossible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_mints_and_derives_the_same_way() {
+    let repo = in_memory_repo();
+
+    let outcome = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("commit");
+    assert_eq!(
+        outcome.child_version_id,
+        VersionId::new("minted-0"),
+        "the child id comes from the injected source, first"
+    );
+    assert_eq!(
+        outcome.accepted_run_id,
+        BacktestRunId::new("minted-1"),
+        "then the run id — the SQLite adapter's order"
+    );
+
+    let children = repo.accepted_children().expect("children");
+    assert_eq!(children.len(), 1, "one accept, one child");
+    let child = &children[0];
+    assert_eq!(child.strategy_id, StrategyId::new("strat-1"));
+    assert_eq!(child.parent_version_id, VersionId::new("ver-1"));
+    assert_eq!(child.created_by, pulse::CreatedBy::CoachLlm);
+    assert_eq!(child.creating_llm_call_ids, vec!["call-1".to_owned()]);
+    assert_eq!(child.created_at, now_rfc3339(), "from the injected clock");
+
+    // The proposal is settled with BOTH links, and the replay is a no-op.
+    let proposal = repo
+        .proposal(&CoachingSessionId::new("sess-1"))
+        .expect("read")
+        .expect("present");
+    assert_eq!(
+        proposal.disposition,
+        Disposition::Accepted {
+            child_version_id: outcome.child_version_id.clone(),
+            accepted_run_id: outcome.accepted_run_id.clone(),
+        }
+    );
+    let replay = repo
+        .commit_acceptance(prepared_acceptance())
+        .await
+        .expect("replaying an accept is idempotent");
+    assert_eq!(replay, outcome, "the same pair comes back");
+    assert_eq!(
+        repo.accepted_children().expect("children").len(),
+        1,
+        "and nothing new was minted"
+    );
+}
+
+/// The in-memory adapter refuses what the real one refuses: a failed accept on a
+/// settled proposal, and an accept on a turn that produced none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_memory_adapter_refuses_what_the_sqlite_one_refuses() {
+    let repo = in_memory_repo();
+    let id = CoachingSessionId::new("sess-1");
+    let failure = CoachAcceptFailure {
+        stage: AcceptFailureStage::Compile,
+        message: "the child DSL does not compile".to_owned(),
+        subject: None,
+    };
+
+    // On an open proposal it lands, and it is the LATEST outcome.
+    let proposal = repo
+        .record_accept_failure(&id, failure.clone())
+        .await
+        .expect("record on an open proposal");
+    assert_eq!(proposal.accept_failure.as_ref(), Some(&failure));
+    assert_eq!(
+        proposal.disposition,
+        Disposition::Proposed,
+        "a failed accept settles nothing"
+    );
+
+    // A successful accept clears it, in the same act.
+    repo.commit_acceptance(prepared_acceptance())
+        .await
+        .expect("commit");
+    let settled = repo.proposal(&id).expect("read").expect("present");
+    assert!(
+        settled.accept_failure.is_none(),
+        "a successful accept clears the stale failure"
+    );
+
+    // And now the proposal is terminal.
+    assert!(
+        repo.record_accept_failure(&id, failure.clone())
+            .await
+            .is_err(),
+        "an accepted proposal is not an attempt that can still fail"
+    );
+
+    // A turn that produced no proposal has nothing to accept.
+    let failed_turn =
+        InMemoryCoachAcceptanceRepo::new(FakeClock::at(NOW_MS), SeqIdSource::with_prefix("minted"));
+    failed_turn
+        .register_turn(MemoryCoachTurn {
+            session_id: CoachingSessionId::new("sess-1"),
+            strategy_id: StrategyId::new("strat-1"),
+            parent_version_id: VersionId::new("ver-1"),
+            llm_call_id: None,
+            outcome: SessionOutcome::Failed {
+                failure: CoachFailure::ZeroCalls,
+            },
+        })
+        .expect("register");
+    assert!(
+        failed_turn
+            .commit_acceptance(prepared_acceptance())
+            .await
+            .is_err(),
+        "a failed turn has no proposal to accept"
+    );
+    assert!(
+        failed_turn
+            .record_accept_failure(&id, failure)
+            .await
+            .is_err(),
+        "and no accept failure to record against it"
+    );
 }

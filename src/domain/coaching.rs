@@ -1,29 +1,39 @@
-//! The coaching session domain (r1.s2.w2, ADR-0021) — pure, zero-I/O value types.
+//! The coaching session domain (r1.s2.w2, ADR-0021; deepened by r1.s4.w4) — pure,
+//! zero-I/O value types.
 //!
-//! **Never silence.** A coach turn produces exactly one of two things: a
+//! **Never silence.** A FINISHED coach turn produces exactly one of two things: a
 //! [`Proposal`] (one typed [`Mutation`] plus a stated hypothesis) or a typed
 //! [`CoachFailure`]. That is a type-level property here, not a convention:
-//! [`SessionOutcome`] is an enum, so a session carrying both or neither is not
-//! representable. The session row is the audit trail (audit C3) — every turn
-//! outcome persists, and `llm_call_id` is `None` when no ledger row was correlated
-//! to the turn. That is NOT the same as "no provider call was made": a pre-call
-//! refusal such as [`CoachFailure::ContextOverflow`] never called, but a
+//! [`SessionOutcome`] is an enum, so a session carrying both is not representable.
+//! The session row is the audit trail (audit C3) — every turn outcome persists, and
+//! `llm_call_id` is `None` when no ledger row was correlated to the turn. That is
+//! NOT the same as "no provider call was made": a pre-call refusal such as
+//! [`CoachFailure::ContextOverflow`] never called, but a
 //! [`CoachFailure::ProviderTimeout`] or [`CoachFailure::TransportFailure`] can be
 //! an ATTEMPT that produced no priced row. The implication runs one way only.
 //!
+//! **A turn is CLAIMED before it is answered (r1.s4.w4).**
+//! [`SessionOutcome::Pending`] is the state a [`CoachSessionClaim`] writes before
+//! any provider call, keyed by an opaque [`CoachRequestFingerprint`], and
+//! [`InitialCoachOutcome`] is the one move out of it. The narrower two-state
+//! outcome was how a crash mid-turn left no row at all — silence reached by the
+//! type being too small, not too large. A claim nothing finished is finalized as a
+//! typed [`CoachFailure::Interrupted`], without a second provider call.
+//!
 //! **Validity is use-time, never stored (audit C4).** There is deliberately no
-//! `validated` field on [`Proposal`] and no such column in migration `0005`.
-//! Whether a stored mutation still applies is answered by calling
+//! `validated` field on [`Proposal`] and no such column in migration `0005` or
+//! `0008`. Whether a stored mutation still applies is answered by calling
 //! [`apply`](crate::domain::dsl::apply) at the moment of use — `r1.s4`'s
-//! modify-then-accept path re-runs it after the trader's edit.
+//! modify-then-accept path re-runs it after the trader's edit. A failed accept is a
+//! recorded [`CoachAcceptFailure`] on the proposal, which is a statement about one
+//! ATTEMPT, not a cached verdict about the mutation.
 //!
 //! **The disposition state machine.** `Proposed → Accepted | Rejected | Modified`,
-//! with [`Disposition::Accepted`] carrying the child version id **as its payload**
-//! rather than as a nullable field, so "a rejected proposal with a child version"
-//! cannot be constructed. `Accepted` and `Rejected` are terminal; `Modified` is a
-//! working state (`r1.s4` edits, then accepts); nothing returns to `Proposed`.
-//! `w2` constructs only `Proposed` — the rest is dormant until `r1.s4`, which
-//! exercises it without a second migration (grill L2).
+//! with [`Disposition::Accepted`] carrying the child version id **and its
+//! re-backtest run** as its payload rather than as nullable fields, so "a rejected
+//! proposal with a child version" and "an accepted proposal with no run" are both
+//! unconstructible. `Accepted` and `Rejected` are terminal; `Modified` is a working
+//! state (`r1.s4` edits, then accepts); nothing returns to `Proposed`.
 //!
 //! **The accept idempotency key is the session id.** `r1.s4`'s consistency model
 //! keys one child version per proposal by session id, and the schema enforces at
@@ -36,7 +46,10 @@ use thiserror::Error;
 
 use rust_decimal::Decimal;
 
-use super::backtest::{BacktestRunId, PersistedRun, RegimeBreakdown, SummaryStats, Trade};
+use super::backtest::{
+    BacktestInputs, BacktestResult, BacktestRunId, PersistedRun, RegimeBreakdown, SummaryStats,
+    Trade,
+};
 use super::dsl::{Mutation, MutationError, StrategyDsl};
 use super::llm_call::LlmCallId;
 use super::sizing::SkippedEntryCounts;
@@ -73,6 +86,12 @@ pub enum CoachingError {
     /// a proposal's clothes.
     #[error("a proposal's hypothesis must not be empty or whitespace-only")]
     EmptyHypothesis,
+    /// A [`CoachRequestFingerprint`] was empty or whitespace-only (r1.s4.w4). A
+    /// claim keyed on nothing is a row no later call can ever match, so the
+    /// single-flight guarantee the fingerprint exists to provide would silently
+    /// not hold — and `0008`'s `CHECK` refuses the shape anyway.
+    #[error("a coach request fingerprint must not be empty or whitespace-only")]
+    EmptyRequestFingerprint,
     /// A disposition transition the state machine does not allow.
     #[error("illegal disposition transition {from} -> {to}")]
     IllegalTransition {
@@ -130,6 +149,65 @@ impl From<Hypothesis> for String {
     }
 }
 
+/// The single-flight key for one coach turn — an **opaque** digest of everything
+/// the turn's request is made of (r1.s4.w4).
+///
+/// `w1` computes it: a lowercase SHA-256 over an explicit ordered feed in
+/// ADR-0010's length-prefixed style — one element each for the resolved prompt, the
+/// rendered context, every advertised tool definition in advertisement order, the
+/// prompt version, and every behaviour-affecting non-secret LLM setting in a fixed
+/// documented order. Generic serialized-map bytes are NOT canonical (a map's
+/// iteration order is not a contract), and credentials and price data are excluded.
+///
+/// **This type stores and compares the digest; it does not know those inputs.**
+/// That separation is the point: the persistence layer must be able to say "this is
+/// the same request" without acquiring an opinion about what a request is made of,
+/// which would put a second, drifting copy of `w1`'s feed order down here.
+///
+/// The only invariant it enforces is the one `0008`'s `CHECK` also enforces —
+/// non-empty after trimming — and `#[serde(try_from)]` so the invariant survives
+/// the read path too.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CoachRequestFingerprint(String);
+
+impl CoachRequestFingerprint {
+    /// Wrap a computed digest, trimming surrounding whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoachingError::EmptyRequestFingerprint`] when the digest is empty
+    /// or whitespace-only.
+    pub fn new(digest: impl Into<String>) -> Result<Self, CoachingError> {
+        let digest = digest.into();
+        let trimmed = digest.trim();
+        if trimmed.is_empty() {
+            return Err(CoachingError::EmptyRequestFingerprint);
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// Borrow the digest (for SQL binding / comparison).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CoachRequestFingerprint {
+    type Error = CoachingError;
+
+    fn try_from(digest: String) -> Result<Self, Self::Error> {
+        Self::new(digest)
+    }
+}
+
+impl From<CoachRequestFingerprint> for String {
+    fn from(fingerprint: CoachRequestFingerprint) -> Self {
+        fingerprint.0
+    }
+}
+
 /// The disposition state, without its payload — the tag a column stores, an error
 /// names, and a `CHECK` constraint enumerates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,19 +236,28 @@ impl fmt::Display for DispositionKind {
 
 /// What has become of a [`Proposal`].
 ///
-/// [`Disposition::Accepted`] carries the child version id as its **payload**, so
-/// `child_version_id` exists only on the state that can have one — the reason the
-/// `0005` column is nullable but the domain has no nullable field.
+/// [`Disposition::Accepted`] carries BOTH accepted ids as its **payload**, so they
+/// exist only on the state that can have them — the reason the `0005`/`0008`
+/// columns are nullable but the domain has no nullable field.
+///
+/// **`accepted_run_id` joined the payload in r1.s4.w4.** Release 1's rule is "no
+/// accepted proposal lacks its child *and no child lacks its run*", and while the
+/// run half lived outside the type an accepted proposal with no re-backtest was
+/// constructible. Migration `0008` made the pair non-NULL-together in the schema;
+/// this makes the same statement in the type, so the two cannot drift.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Disposition {
     /// The initial state — the only one `w2` ever constructs.
     Proposed,
-    /// Accepted, naming the child `StrategyVersion` `r1.s4` minted (ADR-0010:
-    /// this crate creates no child version in `r1.s2`).
+    /// Accepted, naming the child `StrategyVersion` and the re-backtest of that
+    /// child which `r1.s4` minted together (ADR-0010: this crate creates no child
+    /// version in `r1.s2`).
     Accepted {
         /// The child version the accept produced.
         child_version_id: VersionId,
+        /// The re-backtest run OF that child version.
+        accepted_run_id: BacktestRunId,
     },
     /// Rejected and recorded; no version was created.
     Rejected,
@@ -195,10 +282,95 @@ impl Disposition {
     #[must_use]
     pub fn child_version_id(&self) -> Option<&VersionId> {
         match self {
-            Self::Accepted { child_version_id } => Some(child_version_id),
+            Self::Accepted {
+                child_version_id, ..
+            } => Some(child_version_id),
             Self::Proposed | Self::Rejected | Self::Modified => None,
         }
     }
+
+    /// The re-backtest run this disposition names — `Some` only for
+    /// [`Disposition::Accepted`], and always `Some` exactly when
+    /// [`child_version_id`](Self::child_version_id) is.
+    #[must_use]
+    pub fn accepted_run_id(&self) -> Option<&BacktestRunId> {
+        match self {
+            Self::Accepted {
+                accepted_run_id, ..
+            } => Some(accepted_run_id),
+            Self::Proposed | Self::Rejected | Self::Modified => None,
+        }
+    }
+}
+
+/// Where an accept stopped — the same user-visible progression `w2`/`w3` report
+/// (r1.s4.w4), enumerated so a stage cannot be invented in prose.
+///
+/// **There is deliberately no `read_back` stage.** Once the child and the run are
+/// committed the accept SUCCEEDED; a read-back failure afterwards is a
+/// saved-but-unreadable accepted outcome carrying both ids (the `r1.s3`
+/// [`ReadBackStage`](crate::application::backtest::ReadBackStage) precedent), and
+/// it could not be stored here anyway — `0008` forbids an accepted row from
+/// carrying failure fields at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptFailureStage {
+    /// Re-applying the (possibly modified) mutation to the parent DSL.
+    Apply,
+    /// Loading the parent run's exact recorded inputs.
+    LoadInputs,
+    /// Loading the candle snapshots those inputs name.
+    LoadSnapshots,
+    /// Compiling the child DSL into an executable strategy.
+    Compile,
+    /// Running the deterministic backtest over the loaded snapshots.
+    Backtest,
+    /// The final write itself.
+    Persist,
+}
+
+impl fmt::Display for AcceptFailureStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+impl AcceptFailureStage {
+    /// The `snake_case` tag `0008`'s `CHECK` enumerates and the column stores.
+    ///
+    /// Written out rather than derived from serde so the column's vocabulary and
+    /// the schema's `CHECK` cannot drift apart silently: adding a variant fails to
+    /// compile here until both are updated (the `failure_kind` precedent).
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::LoadInputs => "load_inputs",
+            Self::LoadSnapshots => "load_snapshots",
+            Self::Compile => "compile",
+            Self::Backtest => "backtest",
+            Self::Persist => "persist",
+        }
+    }
+}
+
+/// A typed, recorded failure of one accept attempt (r1.s4.w4).
+///
+/// Recording it leaves the proposal's disposition where it was — `proposed` or
+/// `modified` — and stores no child and no run. It is the LATEST accept outcome on
+/// the existing mutable proposal projection, not a new append-only
+/// decision-attempt entity: a later valid modify clears it, and a successful accept
+/// clears it inside the atomic transaction that writes the child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[error("the accept failed at the `{stage}` stage: {message}")]
+pub struct CoachAcceptFailure {
+    /// Where in the accept progression it stopped.
+    pub stage: AcceptFailureStage,
+    /// What went wrong, stated for the trader rather than for a log.
+    pub message: String,
+    /// What the failure is ABOUT when it is about one thing — a DSL locator, a
+    /// data version, a snapshot id. `None` when the failure has no single subject.
+    pub subject: Option<String>,
 }
 
 /// The coach's single proposal for a turn: one typed [`Mutation`], the hypothesis
@@ -215,6 +387,16 @@ pub struct Proposal {
     pub hypothesis: Hypothesis,
     /// Where the proposal stands.
     pub disposition: Disposition,
+    /// The LATEST accept attempt's typed failure, when the most recent one failed
+    /// (r1.s4.w4). `None` on a proposal nobody has tried to accept, on one whose
+    /// stale failure a later valid modify cleared, and on an accepted one — an
+    /// accept that succeeded clears it in the same transaction, and `0008` forbids
+    /// an accepted or rejected row from carrying it at all.
+    ///
+    /// A projection of the latest attempt, NOT an attempt log: the coach rail shows
+    /// the trader why the last accept did not land, and a history of attempts is a
+    /// different feature with a different table.
+    pub accept_failure: Option<CoachAcceptFailure>,
 }
 
 impl Proposal {
@@ -338,15 +520,74 @@ pub enum CoachFailure {
         /// the request that produced it.
         detail: String,
     },
+    /// The coach answered with STRUCTURAL advice — "add an ADX filter", "trade the
+    /// other side" — which the `r1` parameter-only vocabulary cannot express as a
+    /// mutation (r1.s4.w4, `pulseai-labs/pulse-trader#131`).
+    ///
+    /// Distinct from [`CoachFailure::InapplicableMutation`], and the distinction is
+    /// the whole reason this variant exists: that one is a well-formed `SetParam`
+    /// that does not fit the DSL, this one is a coach declining to propose a
+    /// parameter change at all. Recording it as the other would tell the trader
+    /// their strategy rejected a tweak when in fact the coach never offered one —
+    /// a false reason in the audit trail, which is the same argument that added
+    /// `TransportFailure` rather than reusing one of the six.
+    ///
+    /// It is the honest failure ADR-0021's "the coach cannot restructure a strategy
+    /// in `r1`" consequence predicted, made storable.
+    #[error("the coach answered with structural advice this release cannot apply: {advice}")]
+    InapplicableAdvice {
+        /// The advice, preserved verbatim — it is the evidence for the feature-map
+        /// entry that eventually widens the vocabulary.
+        advice: String,
+    },
+    /// The parent run's exact inputs could not be resolved, so the child could not
+    /// be re-backtested on the same data (r1.s4.w4).
+    ///
+    /// A missing snapshot is not a coaching mistake and not a transport fault; it
+    /// is the one precondition of a comparable re-backtest going absent. Recorded
+    /// rather than approximated: re-running the child on DIFFERENT data would
+    /// produce a comparison that looks valid and is not.
+    #[error("the parent run's backtest inputs are not available: {detail}")]
+    MissingBacktestInputs {
+        /// Which input is missing, and where it was looked for.
+        detail: String,
+    },
+    /// A session was CLAIMED and the process that claimed it never finished the
+    /// turn (r1.s4.w4).
+    ///
+    /// Written by finalizing a stale claim left by an earlier process lifetime —
+    /// **without another provider call**. The turn genuinely ended without an
+    /// answer, and re-asking on the claimant's behalf would spend money on a turn
+    /// nobody is waiting for. It is the only failure recorded by a process that did
+    /// not itself attempt the call, which is exactly why it needs its own tag: any
+    /// other would claim knowledge of what the first process saw.
+    #[error("the coach turn was claimed and never finished: {detail}")]
+    Interrupted {
+        /// What is known about the abandoned claim.
+        detail: String,
+    },
 }
 
-/// Exactly one outcome per coach turn — a proposal or a typed failure.
+/// Exactly one outcome per FINISHED coach turn — a proposal or a typed failure —
+/// plus the claimed-but-unfinished state that precedes both.
 ///
-/// An enum rather than two `Option` fields: "both" and "neither" are the two
-/// states the never-silence guarantee forbids, and neither is representable here.
+/// An enum rather than two `Option` fields: "a proposal AND a failure" is the state
+/// the never-silence guarantee forbids, and it is not representable here.
+///
+/// **[`SessionOutcome::Pending`] joined in r1.s4.w4, and it does not weaken that.**
+/// Before `0008` a session row could only be written AFTER the provider call, which
+/// meant a crash mid-turn left no row at all — the silence release exit criterion 4
+/// forbids, arrived at by the type being too narrow rather than too wide. `Pending`
+/// is a CLAIM: the id is reserved, the request fingerprint is recorded, and the one
+/// legal move out of it is [`InitialCoachOutcome`] through `finish_session`, which
+/// settles it exactly once. What the guarantee now says is that a turn is never
+/// unrecorded and a FINISHED turn always states its one outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SessionOutcome {
+    /// The session id is claimed and the turn has not finished. No ledger call, no
+    /// proposal, no failure — those are what finishing produces.
+    Pending,
     /// The turn produced a proposal.
     Proposed {
         /// The coach's single proposal.
@@ -382,8 +623,117 @@ pub struct CoachingSession {
     pub created_at: String,
     /// The provider call this turn made, if any. `None` for a pre-call failure.
     pub llm_call_id: Option<LlmCallId>,
-    /// What the turn produced — a proposal or a typed failure, never neither.
+    /// What the turn produced — a proposal or a typed failure — or
+    /// [`SessionOutcome::Pending`] while the claim is still open.
     pub outcome: SessionOutcome,
+}
+
+/// The reservation one coach turn makes BEFORE it calls the provider (r1.s4.w4).
+///
+/// Claiming commits a `pending` row and returns; **no write transaction is held
+/// across the provider call**. That ordering is the point: the id, the run, the
+/// version and the request fingerprint are durable before any money is spent, so a
+/// crash mid-turn leaves a claim to finalize rather than a silence to explain.
+///
+/// `created_at` is supplied by the caller — the one place a coaching timestamp is
+/// not taken from the adapter's own clock — because a claim's time is the time the
+/// TURN began, which the caller established when it built the request the
+/// fingerprint covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoachSessionClaim {
+    /// The session id being reserved. Also `r1.s4`'s accept idempotency key.
+    pub session_id: CoachingSessionId,
+    /// The persisted run this turn coaches on.
+    pub backtest_run_id: BacktestRunId,
+    /// The version whose DSL a proposal would mutate.
+    pub strategy_version_id: VersionId,
+    /// The opaque digest of the whole request (see [`CoachRequestFingerprint`]).
+    pub request_fingerprint: CoachRequestFingerprint,
+    /// The injected RFC3339 UTC creation timestamp.
+    pub created_at: String,
+}
+
+/// What a [`CoachSessionClaim`] found — exactly three semantic results.
+///
+/// The third is the one that matters. A repository can see that a claim exists and
+/// is unfinished; it **cannot** see whether the process that made it is still
+/// running, so it returns the row unchanged and refuses to guess. `w1`'s
+/// process-local single-flight owner is what decides: a live in-flight call is
+/// reattached or the duplicate refused, and only a claim left by an EARLIER process
+/// lifetime is finalized through `finish_session` as a typed
+/// [`CoachFailure::Interrupted`] — without another provider call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoachSessionClaimResult {
+    /// This call inserted the pending row and owns the one provider attempt.
+    Claimed,
+    /// The same fingerprint already reached `proposed`/`failed`; this is the
+    /// idempotent result, and no second call should be made.
+    Existing(CoachingSession),
+    /// The same fingerprint is still `pending`, returned unchanged.
+    ExistingPending(CoachingSession),
+}
+
+/// The one settling move out of [`SessionOutcome::Pending`] (r1.s4.w4).
+///
+/// It carries the ledger correlation alongside the outcome because they are learned
+/// together: a turn that got a usable response names its `llm_call`, a pre-call
+/// refusal names none, and a timeout or transport fault may name none for an
+/// attempt that did happen (audit C3). Settling is once-only and cannot attach a
+/// second proposal or route a later disposition around `record_disposition`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialCoachOutcome {
+    /// The provider call this turn made, if a ledger row was correlated to it.
+    pub llm_call_id: Option<LlmCallId>,
+    /// The initial outcome — [`SessionOutcome::Proposed`] or
+    /// [`SessionOutcome::Failed`]. [`SessionOutcome::Pending`] is not a settlement
+    /// and is refused by the repository.
+    pub outcome: SessionOutcome,
+}
+
+/// The deterministic result an accept has already computed, ready for one write
+/// (r1.s4.w4).
+///
+/// Candidate validation, snapshot loading and the backtest itself all happen BEFORE
+/// this value exists, so the atomic transaction that consumes it does no CPU work
+/// and holds no lock across any of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedBacktest {
+    /// The exact parent inputs the child was re-run on (`0006`'s provenance).
+    pub inputs: BacktestInputs,
+    /// The engine's result, trades in chronological order.
+    pub result: BacktestResult,
+    /// The derived headline statistics.
+    pub summary: SummaryStats,
+    /// The equity the run started from.
+    pub starting_equity: Decimal,
+}
+
+/// Everything one accept's final write needs — **and no identity** (r1.s4.w4).
+///
+/// There is deliberately no `StrategyVersionId`, no `BacktestRunId` and no
+/// timestamp here. The adapter mints all three inside the transaction and derives
+/// the strategy, the parent version, [`CreatedBy::CoachLlm`] and the creating call
+/// id from the CLAIMED SESSION ROW, so a caller cannot supply mismatched
+/// provenance — not even by accident, because it has nowhere to put it.
+///
+/// [`CreatedBy::CoachLlm`]: crate::domain::strategy::CreatedBy::CoachLlm
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedCoachAcceptance {
+    /// The session whose proposal is being accepted.
+    pub session_id: CoachingSessionId,
+    /// The validated child candidate exactly as `apply()` produced it.
+    pub child_dsl: StrategyDsl,
+    /// The deterministic re-backtest of that candidate.
+    pub prepared_run: PreparedBacktest,
+}
+
+/// What one committed accept produced: the minted child and its re-backtest run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedCoachOutcome {
+    /// The child `StrategyVersion` the accept minted.
+    pub child_version_id: VersionId,
+    /// The run of that child version.
+    pub accepted_run_id: BacktestRunId,
 }
 
 /// Fixed-size MFE/MAE aggregates over a run's trades.

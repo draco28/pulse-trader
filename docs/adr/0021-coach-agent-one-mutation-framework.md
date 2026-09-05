@@ -119,12 +119,18 @@ needs already present and dormant: disposition (`proposed` / `accepted` /
 `rejected` / `modified`), a nullable `child_version_id`, an accept idempotency key,
 and a nullable `coaching_sessions.llm_call_id` (audit C3). `llm_call` gains a
 nullable `prompt_version` (composer rows stay `NULL`). `w2` writes only the
-`proposed` state; `r1.s4` exercises the rest **without a second migration**. The
+`proposed` state; `r1.s4` exercises the rest. The
 session/proposal state machine the columns encode is
 `proposed → accepted → child version → run`, with accept idempotent on the session
 id, and with every failure state a recorded row of its own. The dormant columns are
 schema stability for a consumer committed in this same release — the
 `SweepableValue::Sweep` precedent — not a shell.
+
+*(This decision originally added "**without a second migration**" to the sentence
+above. `r1.s4.w4` shipped `0008_coaching_lifecycle` and struck the claim; the
+Consequences entry "Dormant columns shipped — and `0008` is what they cost" records
+what was found and why the four missing states could not be reached from `0005`.
+`0005` itself is untouched, per ADR-0018.)*
 
 The **session row is the audit trail** (audit C3). An `LlmCall` row exists if and
 only if a provider call was actually made, so a pre-call failure (an oversized DSL,
@@ -212,10 +218,59 @@ the child `StrategyVersion` on accept is `r1.s4`'s path.
 - **A turn's failure is a row, not a log line.** Never-silence is a storage
   guarantee: `w3` cannot complete a turn without `w2`'s session recording, which is
   why the rounds are serial.
-- **Dormant columns ship unread.** `0005` carries disposition state nothing reads
-  until `r1.s4`. That is a deliberate, bounded bet on a consumer committed in this
-  release; if `r1.s4` slipped out of `r1`, these columns would become a shell and
-  should be revisited rather than defended.
+- **Dormant columns shipped — and `0008` is what they cost.** *(Amended at
+  `r1.s4.w4`, 2026-09-05, with evidence. The original entry read: "`0005` carries
+  disposition state nothing reads until `r1.s4`. That is a deliberate, bounded bet
+  on a consumer committed in this release; if `r1.s4` slipped out of `r1`, these
+  columns would become a shell and should be revisited rather than defended." The
+  bet's stated risk — a slipped consumer leaving a shell — is not what happened.
+  `r1.s4` arrived on schedule and the columns turned out to be the wrong shape,
+  which is the failure mode a dormant-column bet does not protect against: nothing
+  exercises them, so nothing discovers the gap until the consumer is built.)*
+
+  Planning `r1.s4` found **four states `0005` cannot represent**, each verified
+  against the merged file rather than argued:
+
+  1. **A session id claimed before the provider call.** `outcome IN
+     ('proposed','failed')` has no pre-call state, so a turn could only be recorded
+     after the call — and a crash inside that window leaves the silent turn release
+     exit criterion 4 forbids.
+  2. **Two honest failures the seven-tag taxonomy cannot name** —
+     `inapplicable_advice` (structural advice the `r1` parameter-only vocabulary
+     cannot express, `#131`) and `missing_backtest_inputs`. Recording either as one
+     of the seven would put a false reason in the audit trail, which is the exact
+     argument that added `TransportFailure` rather than reusing a neighbour.
+  3. **An accepted proposal's run.** `0005` stores `child_version_id` and has no
+     column for the re-backtest OF that child, so "no child lacks its run" was
+     unrepresentable rather than merely unenforced.
+  4. **A failed accept.** An accept that dies at apply/compile/backtest had nowhere
+     to be recorded, leaving a reader to infer it from a missing child.
+
+  `migrations/0008_coaching_lifecycle` adds them by rebuilding the two tables
+  forward. `0005` is applied history and is **not** edited (ADR-0018), the
+  migration's pre-flight VERIFIES the dormant-row claim rather than trusting it —
+  an existing accepted-with-child/no-run row fails the migration rather than having
+  a run link invented for it — and the down migration refuses transactionally for
+  any of the four new states rather than coercing one into an old tag.
+
+  What that cost buys, for the next dormant-column bet: columns nothing exercises
+  are not validated by shipping, only by a consumer. When the consumer is more than
+  one spine away, the cheaper honest move is to ship the schema the current consumer
+  needs and pay for the migration later — which is what happened here anyway, minus
+  the confidence.
+
+- **An accepted proposal names its child AND that child's run, atomically**
+  (`r1.s4.w4`). This is the decision above made stronger, not reversed. `0008`'s
+  `CHECK`s make both links non-NULL exactly when the disposition is `accepted`, a
+  trigger proves the run belongs to the child and the child descends from the
+  coached version, and a second trigger pins the transition matrix so a settled
+  proposal cannot be un-settled by a column-presence-only write. In the domain,
+  `Disposition::Accepted` carries both ids as its payload. One transaction writes
+  the child, its run, its trades and the proposal's links, or none of them: the
+  release rule "no accepted proposal lacks its child and no child lacks its run or
+  a recorded failure" is now unreachable-by-construction rather than a convention
+  the rail is trusted to keep.
+
 - **Worth re-checking at `r1.s4`:** whether `SetParam` alone produces mutations
   traders actually accept in real sessions, and #124's token posture once the
   coach's larger prompts hit `glm-5.3-flash`.

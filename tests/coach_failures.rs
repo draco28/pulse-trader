@@ -30,13 +30,14 @@ use std::time::Duration;
 
 use pulse::{
     BacktestInputs, BacktestResult, BacktestRunId, BacktestRunRepository, Coach, CoachCliOutcome,
-    CoachFailure, CoachTurnError, CoachWiring, CoachingRepository, CoachingSession,
-    CoachingSessionId, CreatedBy, DataError, DataVersion, Db, Disposition, EngineFingerprint,
-    FakeClock, FundingConfig, LlmCallCapture, LlmCallId, LlmConfig, LlmError, LlmProvider,
-    LlmResponse, MIGRATOR, Message, MutationError, NewVersion, Pair, PersistedRun, Redactor,
-    RegimeBreakdown, SessionOutcome, SkippedEntryCounts, SnapshotSelection, SqliteBacktestRunRepo,
-    SqliteCoachingRepo, SqliteLlmCallRepo, SqliteStrategyRepo, StrategyDsl, StrategyRepository,
-    SummaryStats, Timeframe, TokenUsage, ToolCall, ToolDefinition, run_coach_with,
+    CoachFailure, CoachSessionClaim, CoachSessionClaimResult, CoachTurnError, CoachWiring,
+    CoachingRepository, CoachingSession, CoachingSessionId, CreatedBy, DataError, DataVersion, Db,
+    Disposition, EngineFingerprint, FakeClock, FundingConfig, InitialCoachOutcome, LlmCallCapture,
+    LlmCallId, LlmConfig, LlmError, LlmProvider, LlmResponse, MIGRATOR, Message, MutationError,
+    NewVersion, Pair, PersistedRun, Redactor, RegimeBreakdown, SessionOutcome, SkippedEntryCounts,
+    SnapshotSelection, SqliteBacktestRunRepo, SqliteCoachingRepo, SqliteLlmCallRepo,
+    SqliteStrategyRepo, StrategyDsl, StrategyRepository, SummaryStats, Timeframe, TokenUsage,
+    ToolCall, ToolDefinition, run_coach_with,
 };
 
 /// The input provenance a fresh `save_run` now requires (r1.s3.w2, #110). These
@@ -336,6 +337,7 @@ fn failure_of(outcome: &CoachCliOutcome) -> &CoachFailure {
     match &outcome.outcome_ref() {
         SessionOutcome::Failed { failure } => failure,
         SessionOutcome::Proposed { .. } => panic!("expected a recorded failure, got a proposal"),
+        SessionOutcome::Pending => panic!("expected a settled turn, got an open claim"),
     }
 }
 
@@ -1083,6 +1085,28 @@ async fn a_local_fault_is_surfaced_rather_than_recorded_as_a_transport_failure()
 struct RefusingCoachingRepo;
 
 impl CoachingRepository for RefusingCoachingRepo {
+    // r1.s4.w4: the claim half refuses too. This fixture's whole job is "the store
+    // is unwritable"; a claim that quietly SUCCEEDED here would let a turn believe
+    // it had reserved a session id on a database that cannot hold one.
+    fn claim_session(
+        &self,
+        _claim: CoachSessionClaim,
+    ) -> impl Future<Output = Result<CoachSessionClaimResult, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
+    fn finish_session(
+        &self,
+        _session_id: &CoachingSessionId,
+        _outcome: InitialCoachOutcome,
+    ) -> impl Future<Output = Result<CoachingSession, DataError>> {
+        std::future::ready(Err(DataError::Db(
+            "coaching_sessions is unwritable".to_owned(),
+        )))
+    }
+
     fn save_session(
         &self,
         _session: &CoachingSession,

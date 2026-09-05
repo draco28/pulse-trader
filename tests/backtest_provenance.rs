@@ -115,14 +115,19 @@ const PROVENANCE_COLUMNS: [&str; 8] = [
     "funding_config",
 ];
 
-/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*` — the "older
-/// binary" that shipped `0007` while `0006` was still a reserved gap.
+/// Copy the shipped `migrations/` set into `dir`, SKIPPING `0006_*` and `0008_*` —
+/// the "older binary" that shipped `0007` while `0006` was still a reserved gap.
+///
+/// r1.s4.w4 added `0008` to the skip list. A binary that predates `0006` predates
+/// `0008` by two spines, and including it would also move the fixture's maximum
+/// applied version to 8 — which would silently destroy the property the next
+/// assertion states: that `0006` arrives BELOW the maximum already in the database.
 fn shipped_set_without_0006(dir: &Path) {
     let shipped = manifest("migrations");
     for entry in std::fs::read_dir(&shipped).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.starts_with("0006_") {
+        if name.starts_with("0006_") || name.starts_with("0008_") {
             continue;
         }
         std::fs::copy(&path, dir.join(&name)).unwrap();
@@ -361,10 +366,17 @@ async fn migration_0006_applies_through_the_startup_path_despite_0007() {
     let db = Db::with_path(&db_path).await.unwrap();
     let applied = applied_versions(db.pool()).await;
     assert!(applied.contains(&6), "0006 is now applied: {applied:?}");
+    // r1.s4.w4: the same startup run also applies `0008`, which the fixture
+    // withheld, so the maximum DOES move now — to 8. The property this test owns is
+    // that `0006` applied at all despite sorting below the maximum the database
+    // already held; the isolated "filling a gap moves no maximum" case lives in
+    // `migrate.rs`'s `a_later_lower_numbered_migration_applies_through_the_startup_path`,
+    // which withholds `0008` precisely so it can still state it.
+    assert!(applied.contains(&8), "0008 rides along: {applied:?}");
     assert_eq!(
         applied.iter().copied().max(),
-        Some(7),
-        "filling a reserved gap does not move the embedded max"
+        Some(8),
+        "0006 is recorded at its own version, below the maximum 0008 sets"
     );
 
     let after = columns_of(db.pool(), "backtest_run").await;

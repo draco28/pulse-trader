@@ -326,6 +326,14 @@ fn print_outcome(outcome: &CoachCliOutcome) {
             println!("\nRECORDED FAILURE");
             println!("  {failure}");
         }
+        // r1.s4.w4: `pulse coach` runs one turn to completion, so it never prints a
+        // claim. Printing "(none)" here would be the wrong shape of honest — the
+        // turn this command reports on either produced something or recorded why
+        // not, and a pending row on THIS path is a wiring fault worth naming.
+        SessionOutcome::Pending => {
+            println!("\nSTILL PENDING");
+            println!("  the turn was claimed and never settled — this is a wiring fault");
+        }
     }
 }
 
